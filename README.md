@@ -32,10 +32,11 @@ The allowlist is case-insensitive. The write must identify its repository explic
 
 `github-identity-guard-required` checks agent `bash` calls for `git commit` and `git push`. If the working repository lacks a configured Git Identity Guard runner, it blocks the command; it never installs a guard implicitly.
 
-Install Git Identity Guard in each repository before committing or pushing. Use the installer supplied by your Git Identity Guard plugin:
+Install [Git Identity Guard](https://github.com/hiiamtrong/git-identity-guard) in each repository before committing or pushing:
 
 ```bash
-/path/to/git-identity-guard install \
+git clone --depth 1 https://github.com/hiiamtrong/git-identity-guard.git ~/.local/share/git-identity-guard
+~/.local/share/git-identity-guard/scripts/git-identity-guard install \
   --user <github-login> \
   --email <verified-git-email> \
   --name <git-author-name>

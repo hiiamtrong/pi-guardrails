@@ -1,5 +1,5 @@
 {
-  "name": "pi-github-write-confirm",
+  "name": "pi-guardrails",
   "version": "1.0.0",
   "description": "Pi extension that permits GitHub reads and confirms remote writes",
   "type": "module",

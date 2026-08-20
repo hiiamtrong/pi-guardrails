@@ -48,7 +48,7 @@ Git Identity Guard installs local `pre-commit` and `pre-push` hooks. This Pi ext
 Install globally as a Pi package:
 
 ```bash
-pi install git:github.com/hiiamtrong/pi-github-write-confirm
+pi install git:github.com/hiiamtrong/pi-guardrails
 ```
 
 Or install from a checkout:

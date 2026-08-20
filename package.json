@@ -13,6 +13,6 @@
     "test": "node --experimental-strip-types --test"
   },
   "pi": {
-    "extensions": ["./extensions/github-write-confirm.ts"]
+    "extensions": ["./extensions/github-write-confirm.ts", "./extensions/github-identity-guard-required.ts"]
   }
 }

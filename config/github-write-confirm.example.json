@@ -1,0 +1,4 @@
+{
+  "$schema": "./github-write-confirm.schema.json",
+  "writeAllowlist": []
+}

@@ -10,6 +10,7 @@ type ToolCallEvent = {
         command?: unknown;
         code?: unknown;
         language?: unknown;
+        commands?: { command: string }[];
     };
 };
 type ToolCallResult = { block: true; reason: string } | undefined;
@@ -29,9 +30,12 @@ writeFileSync(
     JSON.stringify({ writeAllowlist: ["hiiamtrong/allowed-repo"] }),
 );
 process.env.PI_GITHUB_WRITE_CONFIRM_CONFIG = configPath;
-const { default: extension } = await import(
-    `../extensions/github-write-confirm.ts?test=${Date.now()}`
-);
+const {
+    default: extension,
+    githubWriteAction,
+    guardedGitAction,
+    guardedGitRuntimeAction,
+} = await import(`../extensions/github-write-confirm.ts?test=${Date.now()}`);
 
 test.after(() => rmSync(configDir, { recursive: true, force: true }));
 
@@ -61,6 +65,36 @@ function createGate({ hasUI = true, confirmed = true }: GateOptions = {}) {
         },
     };
 }
+
+test("summarizes blocked actions without exposing arguments", () => {
+    assert.equal(
+        githubWriteAction({
+            toolName: "bash",
+            input: { command: "gh issue lock 123 --reason spam" },
+        }),
+        "gh issue lock",
+    );
+    assert.equal(
+        githubWriteAction({
+            toolName: "bash",
+            input: { command: "curl -X POST api.github.com/repos/owner/repo" },
+        }),
+        "curl GitHub request",
+    );
+    const apiAction = githubWriteAction({
+        toolName: "bash",
+        input: { command: "gh api -f token=SUPERSECRET /user" },
+    });
+    assert.equal(apiAction, "gh api");
+    assert.doesNotMatch(apiAction ?? "", /SUPERSECRET/i);
+    assert.equal(guardedGitAction("/usr/bin/git push origin main"), "git push");
+    assert.equal(
+        guardedGitRuntimeAction(
+            "execFileSync('/usr/bin/git', ['commit', '-m', 'secret'])",
+        ),
+        "git commit",
+    );
+});
 
 test("permits GitHub reads without confirmation", async () => {
     const gate = createGate();
@@ -167,6 +201,7 @@ test("confirms GitHub writes and blocks them without UI", async () => {
     assert.equal(blocked.confirms, 0);
     assert.ok(blocked.result);
     assert.equal(blocked.result.block, true);
+    assert.match(blocked.result.reason, /Action: gh api\./);
 });
 
 test("confirms GitHub HTTP writes", async () => {
@@ -239,6 +274,16 @@ test("classifies raw shell ctx_execute code", async () => {
     assert.equal(read.result, undefined);
 });
 
+test("shows the blocked action in the Bash confirmation dialog", async () => {
+    const { confirmation } = await createGate({ confirmed: false }).run({
+        toolName: "bash",
+        input: { command: "gh pr merge 12 --merge" },
+    });
+    assert.equal(confirmation?.title, "GitHub write confirmation");
+    assert.match(confirmation?.message ?? "", /Action: gh pr merge\./);
+    assert.match(confirmation?.message ?? "", /Command:\ngh pr merge 12/);
+});
+
 test("shows the ctx_execute code in the confirmation prompt", async () => {
     const gate = createGate({ confirmed: false });
     const code =
@@ -248,6 +293,10 @@ test("shows the ctx_execute code in the confirmation prompt", async () => {
         input: { code },
     });
     assert.equal(confirmation?.title, "GitHub write confirmation");
+    assert.match(
+        confirmation?.message ?? "",
+        /Action: gh runtime invocation\./,
+    );
     assert.match(confirmation?.message ?? "", /Code:\n/);
     assert.match(confirmation?.message ?? "", /gh', \['pr', 'comment'/);
 });

@@ -54,6 +54,7 @@ test("blocks commit and push when the repository lacks Git Identity Guard", () =
   ]) {
     const result = handler(event, { cwd: repo });
     assert.equal(result?.block, true);
+    assert.match(result?.reason ?? "", /Action: git (?:commit|push)\./);
   }
   rmSync(repo, { recursive: true, force: true });
 });
@@ -77,7 +78,38 @@ test("blocks GitHub writes without Git Identity Guard", () => {
   ]) {
     const result = handler(event, { cwd: repo });
     assert.equal(result?.block, true);
+    assert.match(result?.reason ?? "", /Action: gh /);
   }
+  rmSync(repo, { recursive: true, force: true });
+});
+
+test("names the action when the authenticated GitHub account is wrong", () => {
+  const repo = mkdtempSync(join(tmpdir(), "github-identity-action-"));
+  execFileSync("git", ["init", repo], { stdio: "ignore" });
+  const runner = join(repo, "guard");
+  writeFileSync(runner, "#!/bin/sh\nexit 1\n", { mode: 0o755 });
+  execFileSync("git", [
+    "-C",
+    repo,
+    "config",
+    "identity.guard.user",
+    "expected-user",
+  ]);
+  execFileSync("git", [
+    "-C",
+    repo,
+    "config",
+    "identity.guard.email",
+    "expected@example.com",
+  ]);
+  execFileSync("git", ["-C", repo, "config", "identity.guard.runner", runner]);
+
+  const result = createHandler()(
+    { toolName: "bash", input: { command: "gh issue lock 123" } },
+    { cwd: repo },
+  );
+  assert.match(result?.reason ?? "", /Action: gh issue lock\./);
+  assert.match(result?.reason ?? "", /authenticated gh account/);
   rmSync(repo, { recursive: true, force: true });
 });
 
@@ -105,7 +137,7 @@ test("blocks GitHub MCP review-thread resolution because its token identity is u
   assert.deepEqual(result, {
     block: true,
     reason:
-      "GitHub MCP write blocked: Git Identity Guard cannot verify the MCP token account. Use a guarded gh command instead.",
+      "GitHub MCP write blocked. Action: mcp__github__resolve_review_thread. Git Identity Guard cannot verify the MCP token account. Use a guarded gh command instead.",
   });
 });
 

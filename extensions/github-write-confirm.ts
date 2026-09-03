@@ -373,10 +373,18 @@ function gitSubcommand(invocation: ShellInvocation): string | undefined {
   return undefined;
 }
 
+export function guardedGitAction(command: string): string | undefined {
+  for (const invocation of shellInvocations(command, "git")) {
+    const subcommand = gitSubcommand(invocation);
+    if (subcommand && ["commit", "push"].includes(subcommand)) {
+      return `git ${subcommand}`;
+    }
+  }
+  return undefined;
+}
+
 export function isGuardedGitCommand(command: string): boolean {
-  return shellInvocations(command, "git").some((invocation) =>
-    ["commit", "push"].includes(gitSubcommand(invocation) ?? ""),
-  );
+  return guardedGitAction(command) !== undefined;
 }
 
 function hasUnsafeApiArguments(tokens: string[]): boolean {
@@ -558,16 +566,19 @@ function isGithubRuntimeCode(code: string): boolean {
   );
 }
 
-export function isGuardedGitRuntimeCode(code: string): boolean {
-  return (
-    runtimeShellCommands(code).some(isGuardedGitCommand) ||
-    /\b(?:execFile|execFileSync|spawn|spawnSync)\s*\(\s*["'](?:[^"']*\/)?git["'][\s\S]{0,240}["'](?:commit|push)["']/i.test(
-      code,
-    ) ||
-    /\bsubprocess\.(?:Popen|call|check_call|check_output|run)\s*\(\s*\[\s*["'](?:[^"']*\/)?git["'][\s\S]{0,240}["'](?:commit|push)["']/i.test(
-      code,
-    )
+export function guardedGitRuntimeAction(code: string): string | undefined {
+  const shellAction = runtimeShellCommands(code)
+    .map(guardedGitAction)
+    .find((action) => action !== undefined);
+  if (shellAction) return shellAction;
+  const match = code.match(
+    /\b(?:execFile|execFileSync|spawn|spawnSync|subprocess\.(?:Popen|call|check_call|check_output|run))\s*\(\s*(?:\[\s*)?["'](?:[^"']*\/)?git["'][\s\S]{0,240}["'](commit|push)["']/i,
   );
+  return match ? `git ${match[1].toLowerCase()}` : undefined;
+}
+
+export function isGuardedGitRuntimeCode(code: string): boolean {
+  return guardedGitRuntimeAction(code) !== undefined;
 }
 
 function isGitPushRuntimeCode(code: string): boolean {
@@ -702,6 +713,63 @@ function repoFromInput(input: ToolInput | undefined): string | undefined {
   return undefined;
 }
 
+function githubActionFromCommand(command: string): string | undefined {
+  if (isGitPush(command)) return "git push";
+  const ghInvocation = shellInvocations(command, "gh").find(
+    (invocation) => !isReadOnlyGhInvocation(invocation),
+  );
+  if (ghInvocation) {
+    const parsed = ghCommand(ghInvocation);
+    if (parsed.command === "api") return "gh api";
+    return ["gh", parsed.command, parsed.subcommand].filter(Boolean).join(" ");
+  }
+  const httpInvocation = githubHttpInvocations(command).find(
+    (invocation) => !isReadOnlyGithubHttpInvocation(invocation),
+  );
+  if (httpInvocation) {
+    const executable = httpInvocation.tokens[httpInvocation.executableIndex]
+      .split("/")
+      .at(-1);
+    return `${executable ?? "HTTP client"} GitHub request`;
+  }
+  return undefined;
+}
+
+export function githubWriteAction(event: ToolCallEvent): string | undefined {
+  const toolName = typeof event.toolName === "string" ? event.toolName : "";
+  if (toolName.toLowerCase().includes("github")) return toolName;
+  if (isCtxExecuteTool(toolName)) {
+    const code = event.input?.code;
+    if (typeof code !== "string") return undefined;
+    if (event.input?.language === "shell") return githubActionFromCommand(code);
+    if (isGitPushRuntimeCode(code)) return "git push";
+    const shellAction = runtimeShellCommands(code)
+      .map(githubActionFromCommand)
+      .find((action) => action !== undefined);
+    if (shellAction) return shellAction;
+    if (
+      runtimeExecutables(code).some((executable) =>
+        /(?:^|\/)gh(?:\.exe)?$/i.test(executable),
+      )
+    ) {
+      return "gh runtime invocation";
+    }
+    return /https?:\/\/(?:(?:api|uploads)\.)?github\.com(?:[/:]|["'`]|$)/i.test(
+      code,
+    )
+      ? "GitHub HTTP request"
+      : undefined;
+  }
+  if (isCtxBatchExecuteTool(toolName)) {
+    return batchCommands(event.input)
+      .map(githubActionFromCommand)
+      .find((action) => action !== undefined);
+  }
+  return typeof event.input?.command === "string"
+    ? githubActionFromCommand(event.input.command)
+    : undefined;
+}
+
 export function githubWriteReason(event: ToolCallEvent): string | undefined {
   const toolName = typeof event.toolName === "string" ? event.toolName : "";
   if (toolName.toLowerCase().includes("github"))
@@ -763,6 +831,7 @@ export default function (pi: ExtensionApi): void {
   pi.on("tool_call", async (event, ctx) => {
     const reason = githubWriteReason(event);
     if (!reason) return undefined;
+    const action = githubWriteAction(event) ?? "unknown GitHub write";
 
     const targetRepo = targetGithubRepo(event);
     if (targetRepo && loadWriteAllowlist().has(targetRepo)) return undefined;
@@ -770,7 +839,7 @@ export default function (pi: ExtensionApi): void {
     if (!ctx.hasUI || !ctx.ui?.confirm) {
       return {
         block: true,
-        reason: `Blocked ${reason}: no interactive confirmation is available.`,
+        reason: `Blocked ${reason}. Action: ${action}. No interactive confirmation is available.`,
       };
     }
 
@@ -790,10 +859,13 @@ export default function (pi: ExtensionApi): void {
     const repoLabel = targetRepo ? `\n\nRepository: ${targetRepo}` : "";
     const allowed = await ctx.ui.confirm(
       "GitHub write confirmation",
-      `${reason}.${repoLabel}\n\n${request ? `${request.label}:\n${request.value}\n\n` : ""}Allow this remote write?`,
+      `${reason}.\n\nAction: ${action}.${repoLabel}\n\n${request ? `${request.label}:\n${request.value}\n\n` : ""}Allow this remote write?`,
     );
     return allowed
       ? undefined
-      : { block: true, reason: `Blocked ${reason}: user did not confirm.` };
+      : {
+          block: true,
+          reason: `Blocked ${reason}. Action: ${action}. User did not confirm.`,
+        };
   });
 }

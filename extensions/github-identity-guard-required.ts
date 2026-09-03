@@ -2,9 +2,10 @@ import { execFileSync } from "node:child_process";
 import { existsSync } from "node:fs";
 import { join } from "node:path";
 import {
+  githubWriteAction,
   githubWriteReason,
-  isGuardedGitCommand,
-  isGuardedGitRuntimeCode,
+  guardedGitAction,
+  guardedGitRuntimeAction,
 } from "./github-write-confirm.ts";
 
 type ToolInput = {
@@ -118,23 +119,26 @@ export default function (pi: ExtensionApi): void {
     const githubReason = githubWriteReason(event);
     const isGithubMcpMutation =
       toolName.toLowerCase().includes("github") && githubReason !== undefined;
-    const requiresGitIdentity =
-      (toolName === "bash" &&
-        typeof value === "string" &&
-        isGuardedGitCommand(value)) ||
-      (isCtxBatch && commands.some(isGuardedGitCommand)) ||
-      (isCtxExecute &&
-        typeof value === "string" &&
-        (event.input?.language === "shell"
-          ? isGuardedGitCommand(value)
-          : isGuardedGitRuntimeCode(value)));
+    const gitAction =
+      toolName === "bash" && typeof value === "string"
+        ? guardedGitAction(value)
+        : isCtxBatch
+          ? commands
+              .map(guardedGitAction)
+              .find((action) => action !== undefined)
+          : isCtxExecute && typeof value === "string"
+            ? event.input?.language === "shell"
+              ? guardedGitAction(value)
+              : guardedGitRuntimeAction(value)
+            : undefined;
+    const requiresGitIdentity = gitAction !== undefined;
     const requiresGithubIdentity = githubReason !== undefined;
     if (!requiresGitIdentity && !requiresGithubIdentity) return;
+    const action = githubWriteAction(event) ?? gitAction ?? toolName;
     if (isGithubMcpMutation) {
       return {
         block: true,
-        reason:
-          "GitHub MCP write blocked: Git Identity Guard cannot verify the MCP token account. Use a guarded gh command instead.",
+        reason: `GitHub MCP write blocked. Action: ${action}. Git Identity Guard cannot verify the MCP token account. Use a guarded gh command instead.`,
       };
     }
 
@@ -142,17 +146,16 @@ export default function (pi: ExtensionApi): void {
       typeof event.input?.cwd === "string" ? event.input.cwd : ctx.cwd;
     const repo = repositoryPath(cwd);
     if (!repo || !hasIdentityGuard(repo)) {
+      const kind = requiresGithubIdentity ? "GitHub write" : "Git write";
       return {
         block: true,
-        reason:
-          "GitHub write blocked: install Git Identity Guard for this repository before continuing.",
+        reason: `${kind} blocked. Action: ${action}. Install Git Identity Guard for this repository before continuing.`,
       };
     }
     if (requiresGithubIdentity && !githubIdentityMatches(repo)) {
       return {
         block: true,
-        reason:
-          "GitHub write blocked: the authenticated gh account does not match identity.guard.user.",
+        reason: `GitHub write blocked. Action: ${action}. The authenticated gh account does not match identity.guard.user.`,
       };
     }
     return undefined;

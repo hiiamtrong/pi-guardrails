@@ -20,7 +20,7 @@ type ExtensionContext = { cwd: string };
 const execFileAsync = promisify(execFile);
 const CODE_FILE =
   /\.(?:c|cc|cpp|cs|go|h|java|js|jsx|mjs|php|py|rb|rs|sh|sql|swift|ts|tsx|yaml|yml|zsh)$/i;
-const COMMENT_LINE = /(?:^|\s)(?:#|\/\/|\/\*|\*)/m;
+const COMMENT_LINE = /(?:^|\s)(?:#|\/\/|\/\*)|^\s*\*(?:\s|\/)/;
 const SUPPRESSION_COMMENT =
   /(?:#\s*(?:type:\s*ignore|noqa|pylint:\s*disable|pragma:\s*no\s*cover)|\/\/\s*@ts-(?:ignore|expect-error)|\/\/\s*eslint-disable)\b/i;
 const FUTURE_ANNOTATIONS = /^\s*from\s+__future__\s+import\s+annotations\s*$/m;
@@ -39,12 +39,29 @@ export function extractReviewCandidate(
             typeof edit.newText === "string" ? [edit.newText] : [],
           )
         : [];
-  const text = additions.join("\n");
-  return COMMENT_LINE.test(text) ||
-    SUPPRESSION_COMMENT.test(text) ||
-    FUTURE_ANNOTATIONS.test(text)
-    ? text
-    : undefined;
+  const lines = additions.join("\n").split("\n");
+  const selected = new Set<number>();
+  for (let index = 0; index < lines.length; index += 1) {
+    const line = lines[index];
+    if (
+      !COMMENT_LINE.test(line) &&
+      !SUPPRESSION_COMMENT.test(line) &&
+      !FUTURE_ANNOTATIONS.test(line)
+    ) {
+      continue;
+    }
+    for (const candidate of [index - 1, index, index + 1]) {
+      if (candidate >= 0 && candidate < lines.length) selected.add(candidate);
+    }
+  }
+  if (!selected.size) return undefined;
+  const candidate = [...selected]
+    .sort((left, right) => left - right)
+    .map((index) => lines[index])
+    .join("\n");
+  return candidate.length > 12_000
+    ? `${candidate.slice(0, 12_000)}\n[truncated]`
+    : candidate;
 }
 
 function reviewPrompt(path: string, proposedText: string): string {

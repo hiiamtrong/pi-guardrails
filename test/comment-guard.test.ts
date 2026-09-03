@@ -38,12 +38,24 @@ test("sends type suppressions and future annotations to the reviewer", () => {
 });
 
 test("ignores changes without comments and documentation files", () => {
+  for (const newText of [
+    "const value = 1;\n",
+    `export const MAX_INDEX_BYTES = 25 ${String.fromCharCode(42)} 1024;\n`,
+  ]) {
+    assert.equal(
+      extractReviewCandidate({
+        toolName: "edit",
+        input: { path: "src/value.ts", edits: [{ newText }] },
+      }),
+      undefined,
+    );
+  }
   assert.equal(
     extractReviewCandidate({
-      toolName: "edit",
+      toolName: "write",
       input: {
-        path: "src/value.ts",
-        edits: [{ newText: "const value = 1;\n" }],
+        path: "script.sh",
+        content: `${String.fromCharCode(42)}'/files?'${String.fromCharCode(42)}) echo ok ;;\n`,
       },
     }),
     undefined,
@@ -55,4 +67,16 @@ test("ignores changes without comments and documentation files", () => {
     }),
     undefined,
   );
+});
+
+test("sends only nearby context from large files", () => {
+  const candidate = extractReviewCandidate({
+    toolName: "write",
+    input: {
+      path: "src/large.ts",
+      content: `${"const value = 1;\n".repeat(5_000)}// Verified compatibility rationale\nreturn value;\n`,
+    },
+  });
+  assert.match(candidate ?? "", /compatibility rationale/);
+  assert.ok((candidate?.length ?? 0) < 1_000);
 });

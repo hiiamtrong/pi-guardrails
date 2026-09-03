@@ -41,7 +41,10 @@ test("ignores changes without comments and documentation files", () => {
   assert.equal(
     extractReviewCandidate({
       toolName: "edit",
-      input: { path: "src/value.ts", edits: [{ newText: "const value = 1;\n" }] },
+      input: {
+        path: "src/value.ts",
+        edits: [{ newText: "const value = 1;\n" }],
+      },
     }),
     undefined,
   );

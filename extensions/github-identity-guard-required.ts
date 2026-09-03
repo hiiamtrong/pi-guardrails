@@ -20,10 +20,7 @@ type ExtensionContext = { cwd: string };
 type ExtensionApi = {
   on: (
     event: "tool_call",
-    handler: (
-      event: ToolCallEvent,
-      ctx: ExtensionContext,
-    ) => ToolCallResult,
+    handler: (event: ToolCallEvent, ctx: ExtensionContext) => ToolCallResult,
   ) => void;
 };
 
@@ -141,7 +138,8 @@ export default function (pi: ExtensionApi): void {
       };
     }
 
-    const cwd = typeof event.input?.cwd === "string" ? event.input.cwd : ctx.cwd;
+    const cwd =
+      typeof event.input?.cwd === "string" ? event.input.cwd : ctx.cwd;
     const repo = repositoryPath(cwd);
     if (!repo || !hasIdentityGuard(repo)) {
       return {

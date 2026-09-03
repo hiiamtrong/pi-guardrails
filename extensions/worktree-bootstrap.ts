@@ -24,14 +24,19 @@ type ExtensionContext = {
 type ExtensionApi = {
   registerCommand: (
     name: string,
-    options: { description: string; handler: (args: string, ctx: ExtensionContext) => Promise<void> },
+    options: {
+      description: string;
+      handler: (args: string, ctx: ExtensionContext) => Promise<void>;
+    },
   ) => void;
 };
 
 const CONFIG_PREFIX = "piGuardrails.worktreeBootstrap";
 const HOOK_MARKER = "pi-guardrails-worktree-bootstrap";
 const ORIGINAL_HOOK_SUFFIX = ".pi-guardrails-original";
-const extensionDirectory = dirname(realpathSync(fileURLToPath(import.meta.url)));
+const extensionDirectory = dirname(
+  realpathSync(fileURLToPath(import.meta.url)),
+);
 const hookRunner = join(extensionDirectory, "worktree-bootstrap-hook.mjs");
 
 export type SetupArguments = {
@@ -112,7 +117,9 @@ export function parseSetupArguments(input: string): SetupArguments {
 
   const files = values.map(normalizeCopyPath);
   if (!files.length) {
-    throw new Error("Provide at least one ignored file or directory to bootstrap.");
+    throw new Error(
+      "Provide at least one ignored file or directory to bootstrap.",
+    );
   }
   return { source, files };
 }
@@ -124,7 +131,14 @@ export function hookDirectory(repoRoot: string): string {
       "Refusing to modify a configured core.hooksPath; it may be shared across repositories.",
     );
   }
-  return join(runGit(repoRoot, ["rev-parse", "--path-format=absolute", "--git-common-dir"]), "hooks");
+  return join(
+    runGit(repoRoot, [
+      "rev-parse",
+      "--path-format=absolute",
+      "--git-common-dir",
+    ]),
+    "hooks",
+  );
 }
 
 function shellQuote(value: string): string {
@@ -147,7 +161,8 @@ exit "$bootstrap_status"
 }
 
 function installHook(repoRoot: string): string {
-  if (!existsSync(hookRunner)) throw new Error(`Missing hook runner: ${hookRunner}`);
+  if (!existsSync(hookRunner))
+    throw new Error(`Missing hook runner: ${hookRunner}`);
 
   const directory = hookDirectory(repoRoot);
   const hookPath = join(directory, "post-checkout");
@@ -160,7 +175,9 @@ function installHook(repoRoot: string): string {
     return hookPath;
   }
   if (hasOriginal && existsSync(backupPath)) {
-    throw new Error(`Refusing to overwrite existing backup hook: ${backupPath}`);
+    throw new Error(
+      `Refusing to overwrite existing backup hook: ${backupPath}`,
+    );
   }
 
   writeFileSync(temporaryPath, hookContent(hookPath), {
@@ -189,23 +206,44 @@ function removeHook(repoRoot: string): void {
   const hookPath = join(hookDirectory(repoRoot), "post-checkout");
   const backupPath = `${hookPath}${ORIGINAL_HOOK_SUFFIX}`;
 
-  if (existsSync(hookPath) && readFileSync(hookPath, "utf8").includes(HOOK_MARKER)) {
+  if (
+    existsSync(hookPath) &&
+    readFileSync(hookPath, "utf8").includes(HOOK_MARKER)
+  ) {
     unlinkSync(hookPath);
     if (existsSync(backupPath)) renameSync(backupPath, hookPath);
   }
 
   for (const key of ["source", "file"]) {
-    tryGit(repoRoot, ["config", "--local", "--unset-all", `${CONFIG_PREFIX}.${key}`]);
+    tryGit(repoRoot, [
+      "config",
+      "--local",
+      "--unset-all",
+      `${CONFIG_PREFIX}.${key}`,
+    ]);
   }
 }
 
 function getStatus(repoRoot: string): string {
-  const source = tryGit(repoRoot, ["config", "--local", "--get", `${CONFIG_PREFIX}.source`]);
-  const files = tryGit(repoRoot, ["config", "--local", "--get-all", `${CONFIG_PREFIX}.file`])
-    ?.split("\n")
-    .filter(Boolean) ?? [];
+  const source = tryGit(repoRoot, [
+    "config",
+    "--local",
+    "--get",
+    `${CONFIG_PREFIX}.source`,
+  ]);
+  const files =
+    tryGit(repoRoot, [
+      "config",
+      "--local",
+      "--get-all",
+      `${CONFIG_PREFIX}.file`,
+    ])
+      ?.split("\n")
+      .filter(Boolean) ?? [];
   const hookPath = join(hookDirectory(repoRoot), "post-checkout");
-  const installed = existsSync(hookPath) && readFileSync(hookPath, "utf8").includes(HOOK_MARKER);
+  const installed =
+    existsSync(hookPath) &&
+    readFileSync(hookPath, "utf8").includes(HOOK_MARKER);
 
   return [
     `worktree bootstrap: ${installed ? "enabled" : "disabled"}`,
@@ -215,7 +253,11 @@ function getStatus(repoRoot: string): string {
   ].join("\n");
 }
 
-function notify(ctx: ExtensionContext, message: string, level: "info" | "warning" | "error" = "info"): void {
+function notify(
+  ctx: ExtensionContext,
+  message: string,
+  level: "info" | "warning" | "error" = "info",
+): void {
   if (ctx.hasUI && ctx.ui?.notify) ctx.ui.notify(message, level);
   else console.log(message);
 }
@@ -238,7 +280,9 @@ function runSyncBack(repoRoot: string, dryRun: boolean): SyncPlan {
   try {
     return JSON.parse(output) as SyncPlan;
   } catch {
-    throw new Error("Worktree bootstrap returned an invalid sync-back response.");
+    throw new Error(
+      "Worktree bootstrap returned an invalid sync-back response.",
+    );
   }
 }
 
@@ -248,16 +292,26 @@ async function syncBack(ctx: ExtensionContext): Promise<void> {
   try {
     plan = runSyncBack(repoRoot, true);
   } catch (error) {
-    notify(ctx, `Unable to plan sync-back: ${error instanceof Error ? error.message : String(error)}`, "error");
+    notify(
+      ctx,
+      `Unable to plan sync-back: ${error instanceof Error ? error.message : String(error)}`,
+      "error",
+    );
     return;
   }
 
   if (plan.conflicts.length || plan.deletions.length) {
     const details = [
       ...plan.conflicts.map(({ file, reason }) => `${file}: ${reason}`),
-      ...plan.deletions.map((file) => `${file}: deleted in worktree (manual review required)`),
+      ...plan.deletions.map(
+        (file) => `${file}: deleted in worktree (manual review required)`,
+      ),
     ];
-    notify(ctx, `Sync-back stopped without changes:\n${details.join("\n")}`, "warning");
+    notify(
+      ctx,
+      `Sync-back stopped without changes:\n${details.join("\n")}`,
+      "warning",
+    );
     return;
   }
   if (!plan.updates.length) {
@@ -281,7 +335,11 @@ async function syncBack(ctx: ExtensionContext): Promise<void> {
     const synced = Array.isArray(result.synced) ? result.synced : [];
     notify(ctx, `Sync-back completed:\n${synced.join("\n")}`);
   } catch (error) {
-    notify(ctx, `Sync-back failed: ${error instanceof Error ? error.message : String(error)}`, "error");
+    notify(
+      ctx,
+      `Sync-back failed: ${error instanceof Error ? error.message : String(error)}`,
+      "error",
+    );
   }
 }
 
@@ -303,16 +361,31 @@ async function configure(args: string, ctx: ExtensionContext): Promise<void> {
 
   const hookPath = installHook(repoRoot);
   runGit(repoRoot, ["config", "--local", `${CONFIG_PREFIX}.source`, source]);
-  tryGit(repoRoot, ["config", "--local", "--unset-all", `${CONFIG_PREFIX}.file`]);
+  tryGit(repoRoot, [
+    "config",
+    "--local",
+    "--unset-all",
+    `${CONFIG_PREFIX}.file`,
+  ]);
   for (const file of setup.files) {
-    runGit(repoRoot, ["config", "--local", "--add", `${CONFIG_PREFIX}.file`, file]);
+    runGit(repoRoot, [
+      "config",
+      "--local",
+      "--add",
+      `${CONFIG_PREFIX}.file`,
+      file,
+    ]);
   }
-  notify(ctx, `Worktree bootstrap enabled.\n${getStatus(repoRoot)}\nHook: ${hookPath}`);
+  notify(
+    ctx,
+    `Worktree bootstrap enabled.\n${getStatus(repoRoot)}\nHook: ${hookPath}`,
+  );
 }
 
 export default function (pi: ExtensionApi): void {
   pi.registerCommand("worktree-bootstrap", {
-    description: "Configure personal ignored-file bootstrap for new Git worktrees",
+    description:
+      "Configure personal ignored-file bootstrap for new Git worktrees",
     handler: async (args, ctx) => {
       const [action, ...rest] = splitArguments(args);
       const repoRoot = runGit(ctx.cwd, ["rev-parse", "--show-toplevel"]);

@@ -18,12 +18,16 @@ type ToolCallEvent = { toolName?: unknown; input?: ToolInput };
 type ExtensionContext = { cwd: string };
 
 const execFileAsync = promisify(execFile);
-const CODE_FILE = /\.(?:c|cc|cpp|cs|go|h|java|js|jsx|mjs|php|py|rb|rs|sh|sql|swift|ts|tsx|yaml|yml|zsh)$/i;
+const CODE_FILE =
+  /\.(?:c|cc|cpp|cs|go|h|java|js|jsx|mjs|php|py|rb|rs|sh|sql|swift|ts|tsx|yaml|yml|zsh)$/i;
 const COMMENT_LINE = /(?:^|\s)(?:#|\/\/|\/\*|\*)/m;
-const SUPPRESSION_COMMENT = /(?:#\s*(?:type:\s*ignore|noqa|pylint:\s*disable|pragma:\s*no\s*cover)|\/\/\s*@ts-(?:ignore|expect-error)|\/\/\s*eslint-disable)\b/i;
+const SUPPRESSION_COMMENT =
+  /(?:#\s*(?:type:\s*ignore|noqa|pylint:\s*disable|pragma:\s*no\s*cover)|\/\/\s*@ts-(?:ignore|expect-error)|\/\/\s*eslint-disable)\b/i;
 const FUTURE_ANNOTATIONS = /^\s*from\s+__future__\s+import\s+annotations\s*$/m;
 
-export function extractReviewCandidate(event: ToolCallEvent): string | undefined {
+export function extractReviewCandidate(
+  event: ToolCallEvent,
+): string | undefined {
   const path = event.input?.path;
   if (typeof path !== "string" || !CODE_FILE.test(path)) return undefined;
 
@@ -36,7 +40,9 @@ export function extractReviewCandidate(event: ToolCallEvent): string | undefined
           )
         : [];
   const text = additions.join("\n");
-  return COMMENT_LINE.test(text) || SUPPRESSION_COMMENT.test(text) || FUTURE_ANNOTATIONS.test(text)
+  return COMMENT_LINE.test(text) ||
+    SUPPRESSION_COMMENT.test(text) ||
+    FUTURE_ANNOTATIONS.test(text)
     ? text
     : undefined;
 }
@@ -54,11 +60,21 @@ ${proposedText}
 \`\`\``;
 }
 
-async function review(path: string, proposedText: string, cwd: string): Promise<string> {
+async function review(
+  path: string,
+  proposedText: string,
+  cwd: string,
+): Promise<string> {
   const executable = process.env.PI_COMMENT_REVIEWER_EXECUTABLE ?? "pi";
   const { stdout } = await execFileAsync(
     executable,
-    ["--no-extensions", "--tools", "read,grep,find,ls", "-p", reviewPrompt(path, proposedText)],
+    [
+      "--no-extensions",
+      "--tools",
+      "read,grep,find,ls",
+      "-p",
+      reviewPrompt(path, proposedText),
+    ],
     { cwd, timeout: 120_000, maxBuffer: 64 * 1024 },
   );
   return stdout.trim();

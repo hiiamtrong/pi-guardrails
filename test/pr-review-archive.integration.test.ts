@@ -49,11 +49,14 @@ test.after(() => {
 
 test("syncs review evidence and preserves it when refresh fails", async () => {
   let handler:
-    | ((args: string, ctx: {
-        cwd: string;
-        hasUI?: boolean;
-        ui?: { notify?: (message: string) => void };
-      }) => Promise<void>)
+    | ((
+        args: string,
+        ctx: {
+          cwd: string;
+          hasUI?: boolean;
+          ui?: { notify?: (message: string) => void };
+        },
+      ) => Promise<void>)
     | undefined;
   extension({
     registerCommand(
@@ -73,11 +76,11 @@ test("syncs review evidence and preserves it when refresh fails", async () => {
     hasUI: true,
     ui: { notify: (message: string) => notifications.push(message) },
   };
-  await handler(
-    "sync --repo owner/repo --authors reviewer --limit 1",
-    context,
+  await handler("sync --repo owner/repo --authors reviewer --limit 1", context);
+  assert.match(
+    notifications.at(-1) ?? "",
+    /Archived 1 PRs and 1 human comments/,
   );
-  assert.match(notifications.at(-1) ?? "", /Archived 1 PRs and 1 human comments/);
   assert.equal(
     execFileSync("sqlite3", [database, "SELECT body FROM review_comments;"], {
       encoding: "utf8",
@@ -86,10 +89,7 @@ test("syncs review evidence and preserves it when refresh fails", async () => {
   );
 
   process.env.FAKE_GH_FAIL = "1";
-  await handler(
-    "sync --repo owner/repo --authors reviewer --limit 1",
-    context,
-  );
+  await handler("sync --repo owner/repo --authors reviewer --limit 1", context);
   assert.match(notifications.at(-1) ?? "", /failed/i);
   assert.equal(
     execFileSync("sqlite3", [database, "SELECT body FROM review_comments;"], {

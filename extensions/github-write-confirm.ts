@@ -343,6 +343,42 @@ function shellInvocations(
   });
 }
 
+function gitSubcommand(invocation: ShellInvocation): string | undefined {
+  const valueOptions = new Set([
+    "-C",
+    "-c",
+    "--config-env",
+    "--git-dir",
+    "--namespace",
+    "--work-tree",
+  ]);
+  for (
+    let index = invocation.executableIndex + 1;
+    index < invocation.tokens.length;
+    index += 1
+  ) {
+    const token = invocation.tokens[index];
+    if (valueOptions.has(token)) {
+      index += 1;
+      continue;
+    }
+    if (
+      token.startsWith("-C") ||
+      token.startsWith("-c") ||
+      [...valueOptions].some((option) => token.startsWith(`${option}=`))
+    )
+      continue;
+    if (!token.startsWith("-")) return token.toLowerCase();
+  }
+  return undefined;
+}
+
+export function isGuardedGitCommand(command: string): boolean {
+  return shellInvocations(command, "git").some((invocation) =>
+    ["commit", "push"].includes(gitSubcommand(invocation) ?? ""),
+  );
+}
+
 function hasUnsafeApiArguments(tokens: string[]): boolean {
   let method: string | undefined;
   let hasPayload = false;
@@ -436,7 +472,11 @@ function isReadOnlyGhInvocation(invocation: ShellInvocation): boolean {
     return !hasUnsafeApiArguments(
       invocation.tokens.slice(parsed.commandIndex + 1),
     );
-  if (["search", "status"].includes(parsed.command)) return true;
+  if (
+    ["search", "status"].includes(parsed.command) ||
+    (parsed.command === "auth" && parsed.subcommand === "switch")
+  )
+    return true;
   return (
     parsed.subcommand === undefined ||
     READ_ONLY_GH_SUBCOMMANDS.has(parsed.subcommand)
@@ -515,6 +555,18 @@ function isGithubRuntimeCode(code: string): boolean {
       /(?:^|\/)gh(?:\.exe)?$/i.test(executable),
     ) ||
     /https?:\/\/(?:(?:api|uploads)\.)?github\.com(?:[/:]|["'`]|$)/i.test(code)
+  );
+}
+
+export function isGuardedGitRuntimeCode(code: string): boolean {
+  return (
+    runtimeShellCommands(code).some(isGuardedGitCommand) ||
+    /\b(?:execFile|execFileSync|spawn|spawnSync)\s*\(\s*["'](?:[^"']*\/)?git["'][\s\S]{0,240}["'](?:commit|push)["']/i.test(
+      code,
+    ) ||
+    /\bsubprocess\.(?:Popen|call|check_call|check_output|run)\s*\(\s*\[\s*["'](?:[^"']*\/)?git["'][\s\S]{0,240}["'](?:commit|push)["']/i.test(
+      code,
+    )
   );
 }
 

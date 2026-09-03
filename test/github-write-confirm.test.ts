@@ -78,6 +78,7 @@ test("ignores local paths that contain GitHub names", async () => {
         "git add plugins/git-identity-guard/bin/gh",
         'cd ~/.pi/agent/git/github.com/example/tool && rg -n "security" tests | head -120',
         "env echo /tmp/gh",
+        "which sqlite3 && which gh",
         'echo "note; gh pr merge 12"',
     ]) {
         const { result, confirms } = await gate.run({

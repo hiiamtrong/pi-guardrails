@@ -11,9 +11,10 @@
   },
   "keywords": ["pi-package", "pi-extension", "github", "security"],
   "scripts": {
-    "test": "node --experimental-strip-types --test"
+    "test": "node --experimental-strip-types --test",
+    "typecheck": "tsc --noEmit"
   },
   "pi": {
-    "extensions": ["./extensions/github-write-confirm.ts", "./extensions/github-identity-guard-required.ts"]
+    "extensions": ["./extensions/comment-guard.ts", "./extensions/github-write-confirm.ts", "./extensions/github-identity-guard-required.ts", "./extensions/pr-review-archive.ts", "./extensions/worktree-bootstrap.ts"]
   }
 }

@@ -236,7 +236,7 @@ test("confirms GitHub MCP review-thread resolution", async () => {
     assert.equal(confirms, 1);
 });
 
-test("confirms ctx_execute GitHub commands because their effects cannot be proven read-only", async () => {
+test("confirms mutating ctx_execute GitHub commands", async () => {
     for (const code of [
         "execFileSync('gh', ['pr', 'comment', '12', '--body', 'hello'])",
         "execFileSync('/usr/bin/gh', ['pr', 'merge', '12'])",
@@ -244,6 +244,10 @@ test("confirms ctx_execute GitHub commands because their effects cannot be prove
         "subprocess.run(['gh', 'pr', 'merge', '12'])",
         "subprocess.run('gh pr merge 12', shell=True)",
         "os.system('gh pr merge 12')",
+        "execFileSync('gh', ['pr'].concat([action, '12']))",
+        "subprocess.run(['gh', 'pr'] + [action, '12'])",
+        "spawn('gh', ['pr', 'view', '1', ';', 'gh', 'pr', 'merge', '2'], {shell: true})",
+        "execSync('gh pr list | xargs gh pr merge 12')",
         "execSync('git push origin main')",
     ]) {
         const { result, confirms } = await createGate({ confirmed: false }).run(
@@ -255,6 +259,27 @@ test("confirms ctx_execute GitHub commands because their effects cannot be prove
         assert.equal(confirms, 1);
         assert.ok(result);
         assert.equal(result.block, true);
+    }
+});
+
+test("permits statically read-only ctx_execute GitHub subprocesses", async () => {
+    for (const code of [
+        "execFileSync('gh', ['pr', 'list', '--repo', 'swaglive/swag-op-console-server'])",
+        "execSync('gh pr view 12')",
+        `import subprocess, json
+p = subprocess.run(
+    ['gh', 'pr', 'list', '--repo', 'swaglive/swag-op-console-server', '--state', 'open', '--limit', '100', '--json', 'number,title,headRefName'],
+    capture_output=True,
+    text=True,
+)
+print(json.loads(p.stdout))`,
+    ]) {
+        const { result, confirms } = await createGate().run({
+            toolName: "ctx_execute",
+            input: { code },
+        });
+        assert.equal(confirms, 0, code);
+        assert.equal(result, undefined, code);
     }
 });
 
@@ -306,7 +331,7 @@ test("blocks ctx_execute GitHub commands without UI", async () => {
     const { result, confirms } = await gate.run({
         toolName: "ctx_execute",
         input: {
-            code: "execFileSync('gh', ['repo', 'view', 'hiiamtrong/demo'])",
+            code: "subprocess.run(['gh', action, 'hiiamtrong/demo'])",
         },
     });
     assert.equal(confirms, 0);

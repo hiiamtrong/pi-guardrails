@@ -493,7 +493,14 @@ function isReadOnlyGhInvocation(invocation: ShellInvocation): boolean {
 
 function isReadOnlyGhCommand(command: string): boolean {
   const invocations = shellInvocations(command, "gh");
-  return invocations.length > 0 && invocations.every(isReadOnlyGhInvocation);
+  const ghTokens = splitShellWords(command).filter((token) =>
+    /(?:^|\/)gh(?:\.exe)?$/i.test(token),
+  );
+  return (
+    invocations.length > 0 &&
+    invocations.length === ghTokens.length &&
+    invocations.every(isReadOnlyGhInvocation)
+  );
 }
 
 function githubHttpInvocations(command: string): ShellInvocation[] {
@@ -554,6 +561,74 @@ function runtimeExecutables(code: string): string[] {
       /\b(?:Command::new|exec\.Command|execFile|execFileSync|spawn|spawnSync|subprocess\.(?:Popen|call|check_call|check_output|run))\s*\(\s*(?:\[\s*)?(["'])([^"']+)\1/g,
     ),
   ].map((match) => match[2]);
+}
+
+function quotedArguments(value: string): string[] | undefined {
+  const arguments_: string[] = [];
+  const pattern = /(["'])((?:\\.|(?!\1)[\s\S])*)\1/g;
+  let remainder = "";
+  let end = 0;
+  for (const match of value.matchAll(pattern)) {
+    remainder += value.slice(end, match.index);
+    arguments_.push(match[2].replace(/\\(["'\\])/g, "$1"));
+    end = (match.index ?? 0) + match[0].length;
+  }
+  remainder += value.slice(end);
+  return arguments_.length > 0 && /^[\s,]*$/.test(remainder)
+    ? arguments_
+    : undefined;
+}
+
+function runtimeGhInvocations(code: string): ShellInvocation[] {
+  const invocations: ShellInvocation[] = [];
+  for (const match of code.matchAll(
+    /\b(?:execFile|execFileSync|spawn|spawnSync)\s*\(\s*(["'])([^"']*\/?gh(?:\.exe)?)\1\s*,\s*\[([\s\S]*?)\]\s*\)/gi,
+  )) {
+    const arguments_ = quotedArguments(match[3]);
+    if (arguments_)
+      invocations.push({
+        tokens: [match[2], ...arguments_],
+        executableIndex: 0,
+      });
+  }
+  for (const match of code.matchAll(
+    /\bsubprocess\.(?:Popen|call|check_call|check_output|run)\s*\(\s*\[\s*(["'])([^"']*\/?gh(?:\.exe)?)\1\s*,?([\s\S]*?)\]([\s\S]*?)\)/gi,
+  )) {
+    const arguments_ = quotedArguments(match[3]);
+    const options = match[4];
+    const hasOnlyStaticOptions =
+      /^(?:\s*,\s*[A-Za-z_]\w*\s*=\s*(?:True|False|None|["'][^"']*["']|\d+))*\s*,?\s*$/.test(
+        options,
+      );
+    if (arguments_ && hasOnlyStaticOptions && !/\bshell\s*=/.test(options))
+      invocations.push({
+        tokens: [match[2], ...arguments_],
+        executableIndex: 0,
+      });
+  }
+  return invocations;
+}
+
+function hasOnlyReadOnlyGithubRuntimeCommands(code: string): boolean {
+  const shellCommands = runtimeShellCommands(code).filter(isGithubCommand);
+  if (
+    shellCommands.some(
+      (command) =>
+        !isReadOnlyGhCommand(command) && !isReadOnlyGithubHttpCommand(command),
+    )
+  )
+    return false;
+
+  const ghExecutables = runtimeExecutables(code).filter((executable) =>
+    /(?:^|\/)gh(?:\.exe)?$/i.test(executable),
+  );
+  const ghInvocations = runtimeGhInvocations(code);
+  return (
+    shellCommands.length + ghExecutables.length > 0 &&
+    ghInvocations.length === ghExecutables.length &&
+    ghInvocations.every(isReadOnlyGhInvocation) &&
+    !/https?:\/\/(?:(?:api|uploads)\.)?github\.com(?:[/:]|["'`]|$)/i.test(code)
+  );
 }
 
 function isGithubRuntimeCode(code: string): boolean {
@@ -789,6 +864,7 @@ export function githubWriteReason(event: ToolCallEvent): string | undefined {
     }
     if (isGitPushRuntimeCode(code))
       return "git push may mutate a GitHub remote";
+    if (hasOnlyReadOnlyGithubRuntimeCommands(code)) return undefined;
     return isGithubRuntimeCode(code)
       ? "ctx_execute can issue GitHub writes and cannot be proven read-only"
       : undefined;

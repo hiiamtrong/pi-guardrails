@@ -12,8 +12,8 @@ The GitHub write and identity gates fail closed when the required condition cann
 
 ## GitHub write confirmation
 
-- Allows known read-only `gh` commands and GET-only `gh api` calls.
-- Confirms `gh` mutations, GitHub API POST/PUT/PATCH/DELETE calls, `git push`, and GitHub MCP mutation tools such as review-thread resolution.
+- Allows known read-only `gh` commands and GET-only `gh api` calls, including static string argv passed to supported `ctx_execute` subprocess APIs.
+- Confirms `gh` mutations, dynamic subprocess argv, GitHub API POST/PUT/PATCH/DELETE calls, `git push`, and GitHub MCP mutation tools such as review-thread resolution.
 - Defaults to confirmation when an action cannot be proven read-only.
 - Redacts GitHub tokens from the confirmation preview.
 

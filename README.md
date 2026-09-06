@@ -85,6 +85,8 @@ Reload Pi with `/reload` or restart it after installation.
 
 Only human-authored discussion, review, and inline comments are archived. Terminal control sequences are removed before archived content is displayed.
 
+After each `sync`, newly archived comments of at least 80 characters are handed to the agent as a follow-up message asking it to store the durable ones with `memory_add`, so the guidance stays searchable in later sessions. Comment text is delimited and marked as untrusted data. A per-repository watermark keeps a later `sync` from proposing the same comments again.
+
 ## Personal worktree bootstrap
 
 `/worktree-bootstrap` keeps its configuration in the repository's local Git configuration and installs only a local `post-checkout` hook. Neither is tracked or pushed. It does **not** set `core.hooksPath`, so existing Git Identity Guard hooks remain active. For isolation, it refuses setup when `core.hooksPath` is already configured because that directory may be shared by other repositories.

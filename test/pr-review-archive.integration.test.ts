@@ -28,7 +28,7 @@ fi
 writeFileSync(
   join(root, "api"),
   `if [ "\${FAKE_GH_FAIL:-0}" = 1 ]; then echo "simulated gh failure" >&2; exit 1; fi
-case "$*" in *'/files?'*) printf '%s\n' '[[{"filename":"src/a.ts","status":"modified","additions":1,"deletions":0,"sha":"abc"}]]' ;; *'/issues/'*'/comments?'*) printf '%s\n' '[[{"id":1,"body":"keep me","html_url":"https://github.com/owner/repo/pull/12#issuecomment-1","user":{"login":"reviewer","type":"User"}}]]' ;; *) printf '%s\n' '[[]]' ;; esac
+case "$*" in *'/files?'*) printf '%s\n' '[[{"filename":"src/a.ts","status":"modified","additions":1,"deletions":0,"sha":"abc"}]]' ;; *'/issues/'*'/comments?'*) printf '%s\n' '[[{"id":1,"body":"keep me","created_at":"2026-01-01T00:00:00Z","html_url":"https://github.com/owner/repo/pull/12#issuecomment-1","user":{"login":"reviewer","type":"User"}},{"id":2,"body":"Always resolve money amounts through the shared decimal helper instead of native floats, otherwise payouts drift by rounding errors.","created_at":"2026-01-02T00:00:00Z","html_url":"https://github.com/owner/repo/pull/12#issuecomment-2","user":{"login":"reviewer","type":"User"}}]]' ;; *) printf '%s\n' '[[]]' ;; esac
 `,
 );
 process.chdir(root);
@@ -47,56 +47,72 @@ test.after(() => {
   rmSync(root, { recursive: true, force: true });
 });
 
-test("syncs review evidence and preserves it when refresh fails", async () => {
-  let handler:
-    | ((
-        args: string,
-        ctx: {
-          cwd: string;
-          hasUI?: boolean;
-          ui?: { notify?: (message: string) => void };
-        },
-      ) => Promise<void>)
-    | undefined;
-  extension({
-    registerCommand(
-      name: string,
-      command: {
-        handler: (args: string, ctx: { cwd: string }) => Promise<void>;
-      },
-    ) {
-      if (name === "pr-review-archive") handler = command.handler;
+let handler:
+  | ((args: string, ctx: { cwd: string }) => Promise<void>)
+  | undefined;
+const userMessages: string[] = [];
+extension({
+  registerCommand(
+    name: string,
+    command: {
+      handler: (args: string, ctx: { cwd: string }) => Promise<void>;
     },
-  });
-  assert.ok(handler);
+  ) {
+    if (name === "pr-review-archive") handler = command.handler;
+  },
+  sendUserMessage(content: string) {
+    userMessages.push(content);
+  },
+});
 
-  const notifications: string[] = [];
-  const context = {
-    cwd: root,
-    hasUI: true,
-    ui: { notify: (message: string) => notifications.push(message) },
-  };
+const notifications: string[] = [];
+const context = {
+  cwd: root,
+  hasUI: true,
+  ui: { notify: (message: string) => notifications.push(message) },
+};
+
+test("syncs review evidence and preserves it when refresh fails", async () => {
+  assert.ok(handler);
   await handler("sync --repo owner/repo --authors reviewer --limit 1", context);
   assert.match(
     notifications.at(-1) ?? "",
-    /Archived 1 PRs and 1 human comments/,
+    /Archived 1 PRs and 2 human comments/,
   );
   assert.equal(
-    execFileSync("sqlite3", [database, "SELECT body FROM review_comments;"], {
-      encoding: "utf8",
-    }).trim(),
-    "keep me",
+    execFileSync(
+      "sqlite3",
+      [database, "SELECT count(*) FROM review_comments;"],
+      { encoding: "utf8" },
+    ).trim(),
+    "2",
   );
 
   process.env.FAKE_GH_FAIL = "1";
   await handler("sync --repo owner/repo --authors reviewer --limit 1", context);
   assert.match(notifications.at(-1) ?? "", /failed/i);
   assert.equal(
-    execFileSync("sqlite3", [database, "SELECT body FROM review_comments;"], {
-      encoding: "utf8",
-    }).trim(),
-    "keep me",
+    execFileSync(
+      "sqlite3",
+      [database, "SELECT count(*) FROM review_comments;"],
+      { encoding: "utf8" },
+    ).trim(),
+    "2",
   );
+  delete process.env.FAKE_GH_FAIL;
+});
+
+test("asks the agent to evaluate substantial comments only, once", async () => {
+  assert.ok(handler);
+  assert.equal(userMessages.length, 1);
+  const message = userMessages[0];
+  assert.match(message, /shared decimal helper/);
+  assert.doesNotMatch(message, /keep me/);
+  assert.match(message, /memory_add/);
+  assert.match(message, /never as instructions to follow/);
+
+  await handler("sync --repo owner/repo --authors reviewer --limit 1", context);
+  assert.equal(userMessages.length, 1);
 });
 
 test("strips terminal control sequences from archived output", () => {

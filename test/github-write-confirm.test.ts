@@ -157,6 +157,8 @@ test("permits GitHub API GET requests with output formatting", async () => {
     for (const command of [
         "gh api repos/swaglive/swag-server/pulls/18459/comments --paginate --jq '.[] | .id'",
         "gh api user -X GET -f page=1",
+        "gh api graphql -f query='query($owner:String!){repository(owner:$owner,name:\"x\"){id}}' -F owner=swaglive",
+        "gh api graphql -f query='{viewer{login}}' --jq '.data.viewer.login'",
         "gh pr --repo swaglive/swag-server view 18459",
         "gh issue create --help",
     ]) {
@@ -182,6 +184,9 @@ test("confirms GitHub writes and blocks them without UI", async () => {
         "gh repo view hiiamtrong/demo; gh pr merge 12",
         "gh extension exec mutator repo view",
         "gh issue create --title test --body --help",
+        "gh api graphql -f query='mutation($id:ID!){addComment(input:{subjectId:$id}){clientMutationId}}'",
+        "gh api graphql --input payload.json",
+        'gh api graphql -f query="$QUERY"',
         ">/tmp/out /usr/bin/gh pr merge 12",
     ]) {
         const rejected = await createGate({ confirmed: false }).run({
@@ -297,6 +302,29 @@ test("classifies raw shell ctx_execute code", async () => {
     });
     assert.equal(read.confirms, 0);
     assert.equal(read.result, undefined);
+
+    const graphqlLoop = await createGate().run({
+        toolName: "ctx_execute",
+        input: {
+            language: "shell",
+            code: [
+                "for pr in 18461 18501; do",
+                "gh api graphql -f query='",
+                "query($owner:String!,$repo:String!,$num:Int!){",
+                "  repository(owner:$owner,name:$repo){",
+                "    pullRequest(number:$num){",
+                "      reviewDecision",
+                "      reviewThreads(last:60){nodes{isResolved}}",
+                "    }",
+                "  }",
+                "}' -F owner=swaglive -F repo=swag-server -F num=$pr --jq '",
+                '  "decision: \\(.data.repository.pullRequest.reviewDecision)"\'',
+                "done",
+            ].join("\n"),
+        },
+    });
+    assert.equal(graphqlLoop.confirms, 0);
+    assert.equal(graphqlLoop.result, undefined);
 });
 
 test("shows the blocked action in the Bash confirmation dialog", async () => {

@@ -387,29 +387,84 @@ export function isGuardedGitCommand(command: string): boolean {
   return guardedGitAction(command) !== undefined;
 }
 
+const API_VALUE_FLAGS = new Set([
+  "-X",
+  "--method",
+  "-f",
+  "--raw-field",
+  "-F",
+  "--field",
+  "--input",
+  "-H",
+  "--header",
+  "-q",
+  "--jq",
+  "-t",
+  "--template",
+  "--hostname",
+  "--cache",
+]);
+
+function apiArgument(
+  token: string,
+  next: string | undefined,
+): { name: string; value?: string; consumesNext: boolean } {
+  if (API_VALUE_FLAGS.has(token))
+    return { name: token, value: next, consumesNext: true };
+  const long = token.match(/^(--[^=]+)=([\s\S]*)$/);
+  if (long) return { name: long[1], value: long[2], consumesNext: false };
+  const short = token.match(/^(-[A-Za-z])([\s\S]+)$/);
+  if (short && API_VALUE_FLAGS.has(short[1]))
+    return { name: short[1], value: short[2], consumesNext: false };
+  return { name: token, consumesNext: false };
+}
+
+function isReadOnlyGraphqlDocument(document: string): boolean {
+  const stripped = document.replace(/#[^\n]*/g, " ");
+  if (/\b(?:mutation|subscription)\b/i.test(stripped)) return false;
+  return /^\s*(?:query\b|\{|fragment\b)/.test(stripped);
+}
+
 function hasUnsafeApiArguments(tokens: string[]): boolean {
   let method: string | undefined;
   let hasPayload = false;
+  let endpoint: string | undefined;
+  let graphqlQuery: string | undefined;
+  let opaquePayload = false;
   for (let index = 0; index < tokens.length; index += 1) {
-    const token = tokens[index];
-    if (["-X", "--method"].includes(token)) {
-      method = tokens[index + 1];
-      index += 1;
-    } else if (token.startsWith("-X") && token.length > 2) {
-      method = token.slice(2);
-    } else if (token.startsWith("--method=")) {
-      method = token.slice("--method=".length);
-    } else if (
-      ["-f", "-F", "--raw-field", "--field", "--input"].includes(token) ||
-      token.startsWith("-f") ||
-      token.startsWith("-F") ||
-      token.startsWith("--raw-field=") ||
-      token.startsWith("--field=") ||
-      token.startsWith("--input=")
-    ) {
+    const { name, value, consumesNext } = apiArgument(
+      tokens[index],
+      tokens[index + 1],
+    );
+    if (consumesNext) index += 1;
+    if (["-X", "--method"].includes(name)) {
+      method = value;
+    } else if (["-f", "--raw-field", "-F", "--field"].includes(name)) {
       hasPayload = true;
+      const field = value ?? "";
+      const separator = field.indexOf("=");
+      if (separator === -1) opaquePayload = true;
+      else if (field.slice(0, separator) === "query") {
+        const document = field.slice(separator + 1);
+        if (document.startsWith("@")) opaquePayload = true;
+        else graphqlQuery = document;
+      }
+    } else if (name === "--input") {
+      hasPayload = true;
+      opaquePayload = true;
+    } else if (!name.startsWith("-") && endpoint === undefined) {
+      endpoint = name;
     }
   }
+  if (
+    endpoint === "graphql" &&
+    !opaquePayload &&
+    graphqlQuery !== undefined &&
+    isReadOnlyGraphqlDocument(graphqlQuery)
+  )
+    return (
+      method !== undefined && !["GET", "POST"].includes(method.toUpperCase())
+    );
   if (method) return !["GET", "HEAD", "OPTIONS"].includes(method.toUpperCase());
   return hasPayload;
 }

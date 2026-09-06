@@ -199,10 +199,7 @@ test("ignores changes without comments and documentation files", () => {
     ["example.py", `value = 8 ${slash}${slash} 2\n`],
     ["sample.c", `${hash}include <stdio.h>\n`],
     ["sample.cpp", `auto text = R"(value ${slash}${slash} text)";\n`],
-    [
-      "sample.rs",
-      `let text = r${hash}"value ${slash}${slash} text"${hash};\n`,
-    ],
+    ["sample.rs", `let text = r${hash}"value ${slash}${slash} text"${hash};\n`],
     ["script.sh", `printf '%s' 'value ${hash} text'\n`],
     ["query.sql", "SELECT '--not a comment';\n"],
     [

@@ -322,13 +322,7 @@ async function review(
   const executable = process.env.PI_COMMENT_REVIEWER_EXECUTABLE ?? "pi";
   const { stdout } = await execFileAsync(
     executable,
-    [
-      "--no-extensions",
-      "--tools",
-      "read,grep,find,ls",
-      "-p",
-      reviewPrompt(path, proposedText),
-    ],
+    ["--tools", "read,grep,find,ls", "-p", reviewPrompt(path, proposedText)],
     { cwd, timeout: 120_000, maxBuffer: 64 * 1024 },
   );
   return stdout.trim();

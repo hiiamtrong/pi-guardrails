@@ -1,3 +1,4 @@
+import { execFile } from "node:child_process";
 import { readFileSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
@@ -958,6 +959,47 @@ export function targetGithubRepo(event: ToolCallEvent): string | undefined {
   );
 }
 
+function notifyPendingConfirmation(action: string, repo?: string): void {
+  if (
+    process.platform !== "darwin" ||
+    process.env.PI_GITHUB_WRITE_CONFIRM_NOTIFY === "0"
+  )
+    return;
+  const notice = repo ? `${action} → ${repo}` : action;
+  execFile(
+    "open",
+    [
+      "-a",
+      "terminal-notifier",
+      "--args",
+      "-title",
+      "Waiting for your confirmation",
+      "-message",
+      notice,
+      "-sound",
+      "Ping",
+    ],
+    (error) => {
+      if (!error) return;
+      execFile(
+        "osascript",
+        [
+          "-e",
+          "on run {noticeText, noticeTitle}",
+          "-e",
+          'display notification noticeText with title noticeTitle sound name "Ping"',
+          "-e",
+          "end run",
+          "--",
+          notice,
+          "Waiting for your confirmation",
+        ],
+        () => {},
+      );
+    },
+  );
+}
+
 export default function (pi: ExtensionApi): void {
   pi.on("tool_call", async (event, ctx) => {
     const reason = githubWriteReason(event);
@@ -988,6 +1030,7 @@ export default function (pi: ExtensionApi): void {
               }
             : undefined;
     const repoLabel = targetRepo ? `\n\nRepository: ${targetRepo}` : "";
+    notifyPendingConfirmation(action, targetRepo);
     const allowed = await ctx.ui.confirm(
       "GitHub write confirmation",
       `${reason}.\n\nAction: ${action}.${repoLabel}\n\n${request ? `${request.label}:\n${request.value}\n\n` : ""}Allow this remote write?`,

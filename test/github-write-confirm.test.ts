@@ -30,6 +30,7 @@ writeFileSync(
     JSON.stringify({ writeAllowlist: ["hiiamtrong/allowed-repo"] }),
 );
 process.env.PI_GITHUB_WRITE_CONFIRM_CONFIG = configPath;
+process.env.PI_GITHUB_WRITE_CONFIRM_NOTIFY = "0";
 const {
     default: extension,
     githubWriteAction,

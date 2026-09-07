@@ -1,5 +1,4 @@
-import { execFile } from "node:child_process";
-import { promisify } from "node:util";
+import { spawn } from "node:child_process";
 
 type ToolCallResult = { block: true; reason: string } | undefined;
 type ExtensionAPI = {
@@ -15,9 +14,14 @@ type ExtensionAPI = {
 type Edit = { newText?: unknown };
 type ToolInput = { path?: unknown; content?: unknown; edits?: unknown };
 type ToolCallEvent = { toolName?: unknown; input?: ToolInput };
-type ExtensionContext = { cwd: string };
+type ExtensionContext = {
+  cwd: string;
+  hasUI?: boolean;
+  ui?: {
+    notify?: (message: string, level?: "info" | "warning" | "error") => void;
+  };
+};
 
-const execFileAsync = promisify(execFile);
 const CODE_FILE =
   /\.(?:c|cc|cpp|cs|cxx|go|h|hpp|hxx|java|js|jsx|mjs|php|py|rb|rs|sh|sql|swift|ts|tsx|yaml|yml|zsh)$/i;
 const HASH_COMMENT_FILE = /\.(?:php|py|rb|sh|yaml|yml|zsh)$/i;
@@ -314,16 +318,59 @@ ${proposedText}
 \`\`\``;
 }
 
+function runReviewer(
+  command: string,
+  args: string[],
+  cwd: string,
+  timeoutMs: number,
+  maxBuffer: number,
+): Promise<string> {
+  return new Promise((resolve, reject) => {
+    // stdin must be closed (not inherited/piped): a nested `pi` process sharing
+    // the parent session's terminal otherwise blocks forever waiting on stdin EOF.
+    const child = spawn(command, args, {
+      cwd,
+      stdio: ["ignore", "pipe", "pipe"],
+      detached: true,
+    });
+    let stdout = "";
+    let stderr = "";
+    const timer = setTimeout(() => {
+      child.kill("SIGTERM");
+      reject(new Error(`Command timed out after ${timeoutMs}ms`));
+    }, timeoutMs);
+    child.stdout.on("data", (chunk) => {
+      if (stdout.length < maxBuffer) stdout += chunk;
+    });
+    child.stderr.on("data", (chunk) => {
+      if (stderr.length < maxBuffer) stderr += chunk;
+    });
+    child.on("error", (error) => {
+      clearTimeout(timer);
+      reject(error);
+    });
+    child.on("close", (code) => {
+      clearTimeout(timer);
+      if (code === 0) resolve(stdout);
+      else
+        reject(new Error(`Command failed with exit code ${code}: ${stderr}`));
+    });
+  });
+}
+
 async function review(
   path: string,
   proposedText: string,
-  cwd: string,
+  ctx: ExtensionContext,
 ): Promise<string> {
+  if (ctx.hasUI) ctx.ui?.notify?.(`Reviewing comment in ${path}...`, "info");
   const executable = process.env.PI_COMMENT_REVIEWER_EXECUTABLE ?? "pi";
-  const { stdout } = await execFileAsync(
+  const stdout = await runReviewer(
     executable,
     ["--tools", "read,grep,find,ls", "-p", reviewPrompt(path, proposedText)],
-    { cwd, timeout: 120_000, maxBuffer: 64 * 1024 },
+    ctx.cwd,
+    120_000,
+    64 * 1024,
   );
   return stdout.trim();
 }
@@ -335,7 +382,7 @@ export default function (pi: ExtensionAPI): void {
     if (!proposedText || typeof path !== "string") return;
 
     try {
-      const verdict = await review(path, proposedText, ctx.cwd);
+      const verdict = await review(path, proposedText, ctx);
       if (/^APPROVE\b/i.test(verdict)) return;
       return {
         block: true,

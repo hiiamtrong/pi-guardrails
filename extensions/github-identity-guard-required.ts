@@ -6,6 +6,7 @@ import {
   githubWriteReason,
   guardedGitAction,
   guardedGitRuntimeAction,
+  hasGhAuthSwitchCommand,
 } from "./github-write-confirm.ts";
 
 type ToolInput = {
@@ -135,6 +136,15 @@ export default function (pi: ExtensionApi): void {
     const requiresGithubIdentity = githubReason !== undefined;
     if (!requiresGitIdentity && !requiresGithubIdentity) return;
     const action = githubWriteAction(event) ?? gitAction ?? toolName;
+    const combinesAuthSwitch =
+      (typeof value === "string" && hasGhAuthSwitchCommand(value)) ||
+      commands.some((command) => hasGhAuthSwitchCommand(command));
+    if (combinesAuthSwitch) {
+      return {
+        block: true,
+        reason: `GitHub write blocked. Action: ${action}. Run \`gh auth switch\` as its own command first, then retry this one separately: this identity check runs against the account active before your command executes, so combining the switch and the write in one invocation can never pass.`,
+      };
+    }
     if (isGithubMcpMutation) {
       return {
         block: true,

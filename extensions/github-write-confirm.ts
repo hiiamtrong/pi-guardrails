@@ -388,6 +388,26 @@ export function isGuardedGitCommand(command: string): boolean {
   return guardedGitAction(command) !== undefined;
 }
 
+function ghSubcommandChain(invocation: ShellInvocation): string[] {
+  const chain: string[] = [];
+  for (
+    let index = invocation.executableIndex + 1;
+    index < invocation.tokens.length && chain.length < 2;
+    index += 1
+  ) {
+    const token = invocation.tokens[index];
+    if (!token.startsWith("-")) chain.push(token.toLowerCase());
+  }
+  return chain;
+}
+
+export function hasGhAuthSwitchCommand(command: string): boolean {
+  return shellInvocations(command, "gh").some((invocation) => {
+    const [first, second] = ghSubcommandChain(invocation);
+    return first === "auth" && (second === "switch" || second === "login");
+  });
+}
+
 const API_VALUE_FLAGS = new Set([
   "-X",
   "--method",

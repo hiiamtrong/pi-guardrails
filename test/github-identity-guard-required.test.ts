@@ -129,6 +129,47 @@ test("permits gh auth switch so the correct account can be selected", () => {
   rmSync(repo, { recursive: true, force: true });
 });
 
+test("blocks a git push combined with gh auth switch in the same command", () => {
+  const repo = mkdtempSync(
+    join(tmpdir(), "github-identity-guard-combined-switch-"),
+  );
+  execFileSync("git", ["init", repo], { stdio: "ignore" });
+  const result = createHandler()(
+    {
+      toolName: "bash",
+      input: {
+        command: "gh auth switch --user hiiamtrong\ngit push origin main",
+      },
+    },
+    { cwd: repo },
+  );
+  assert.equal(result?.block, true);
+  assert.match(result?.reason ?? "", /Run `gh auth switch` as its own command/);
+  rmSync(repo, { recursive: true, force: true });
+});
+
+test("blocks a GitHub write combined with gh auth switch across ctx_batch_execute commands", () => {
+  const repo = mkdtempSync(
+    join(tmpdir(), "github-identity-guard-combined-batch-"),
+  );
+  execFileSync("git", ["init", repo], { stdio: "ignore" });
+  const result = createHandler()(
+    {
+      toolName: "ctx_batch_execute",
+      input: {
+        commands: [
+          { command: "gh auth switch --user hiiamtrong" },
+          { command: "gh pr comment 1 --body test" },
+        ],
+      },
+    },
+    { cwd: repo },
+  );
+  assert.equal(result?.block, true);
+  assert.match(result?.reason ?? "", /Run `gh auth switch` as its own command/);
+  rmSync(repo, { recursive: true, force: true });
+});
+
 test("blocks GitHub MCP review-thread resolution because its token identity is unverifiable", () => {
   const result = createHandler()(
     { toolName: "mcp__github__resolve_review_thread", input: {} },

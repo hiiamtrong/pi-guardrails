@@ -30,33 +30,54 @@ const CONFIG_PATH =
   join(homedir(), ".pi", "agent", "github-write-confirm.json");
 
 const READ_ONLY_GH_COMMANDS = new Set([
+  "agent-task",
+  "alias",
   "api",
+  "attestation",
   "auth",
+  "browse",
   "cache",
+  "codespace",
+  "completion",
   "config",
+  "discussion",
+  "extension",
   "gist",
+  "gpg-key",
   "issue",
   "label",
+  "licenses",
+  "org",
   "pr",
   "project",
   "release",
   "repo",
+  "ruleset",
   "run",
   "search",
   "secret",
+  "skill",
+  "ssh-key",
   "status",
   "variable",
   "workflow",
 ]);
 const READ_ONLY_GH_SUBCOMMANDS = new Set([
+  "check",
   "checks",
   "clone",
   "diff",
   "download",
   "get",
   "list",
+  "logs",
+  "ports",
+  "preview",
+  "search",
   "status",
   "token",
+  "trusted-root",
+  "verify",
   "view",
   "watch",
 ]);
@@ -557,7 +578,7 @@ function isReadOnlyGhInvocation(invocation: ShellInvocation): boolean {
       invocation.tokens.slice(parsed.commandIndex + 1),
     );
   if (
-    ["search", "status"].includes(parsed.command) ||
+    ["browse", "completion", "search", "status"].includes(parsed.command) ||
     (parsed.command === "auth" && parsed.subcommand === "switch")
   )
     return true;

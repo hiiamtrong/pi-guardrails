@@ -107,6 +107,48 @@ test("permits GitHub reads without confirmation", async () => {
     assert.equal(confirms, 0);
 });
 
+test("permits newly whitelisted read-only gh commands without confirmation", async () => {
+    const gate = createGate();
+    for (const command of [
+        "gh ssh-key list",
+        "gh gpg-key list",
+        "gh org list",
+        "gh ruleset list",
+        "gh ruleset view 1",
+        "gh ruleset check main",
+        "gh discussion list",
+        "gh discussion view 1",
+        "gh codespace list",
+        "gh codespace view",
+        "gh codespace logs",
+        "gh codespace ports",
+        "gh agent-task list",
+        "gh agent-task view 1",
+        "gh skill list",
+        "gh skill search terraform",
+        "gh skill preview github/awesome-copilot demo",
+        "gh alias list",
+        "gh extension list",
+        "gh extension search foo",
+        "gh attestation verify artifact.tar.gz --owner example",
+        "gh attestation download artifact.tar.gz --owner example",
+        "gh attestation trusted-root",
+        "gh licenses",
+        "gh browse",
+        "gh browse 123",
+        "gh browse main.go:312 --blame",
+        "gh completion -s bash",
+        "gh completion -s zsh",
+    ]) {
+        const { result, confirms } = await gate.run({
+            toolName: "bash",
+            input: { command },
+        });
+        assert.equal(result, undefined, `expected "${command}" to be read-only`);
+        assert.equal(confirms, 0);
+    }
+});
+
 test("ignores local paths that contain GitHub names", async () => {
     const gate = createGate();
     for (const command of [
@@ -184,6 +226,15 @@ test("confirms GitHub writes and blocks them without UI", async () => {
         "if gh pr merge 12; then :; fi",
         "gh repo view hiiamtrong/demo; gh pr merge 12",
         "gh extension exec mutator repo view",
+        "gh extension install owner/gh-tool",
+        "gh ssh-key add ~/.ssh/id_ed25519.pub",
+        "gh gpg-key delete 1",
+        "gh codespace create",
+        "gh codespace stop",
+        "gh skill install owner/repo",
+        "gh alias set co 'pr checkout'",
+        "gh discussion create --title x --body y",
+        "gh agent-task create 'do something'",
         "gh issue create --title test --body --help",
         "gh api graphql -f query='mutation($id:ID!){addComment(input:{subjectId:$id}){clientMutationId}}'",
         "gh api graphql --input payload.json",

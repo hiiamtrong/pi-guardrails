@@ -15,6 +15,6 @@
     "typecheck": "tsc --noEmit"
   },
   "pi": {
-    "extensions": ["./extensions/comment-guard.ts", "./extensions/github-write-confirm.ts", "./extensions/github-identity-guard-required.ts", "./extensions/pr-review-archive.ts", "./extensions/worktree-bootstrap.ts"]
+    "extensions": ["./extensions/comment-guard.ts", "./extensions/github-write-confirm.ts", "./extensions/github-identity-guard-required.ts", "./extensions/pr-review-archive.ts", "./extensions/worktree-bootstrap.ts", "./extensions/ponytail-review-on-settle.ts"]
   }
 }

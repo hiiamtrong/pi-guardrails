@@ -1,4 +1,5 @@
 import { spawn } from "node:child_process";
+import { askNoul } from "./jev.ts";
 
 type ToolCallResult = { block: true; reason: string } | undefined;
 type ExtensionAPI = {
@@ -358,11 +359,43 @@ function runReviewer(
   });
 }
 
+const JEV_QUESTIONS = {
+  documentsWhy:
+    "Every comment in `change` documents a non-obvious reason (a constraint, compatibility, security, or operational concern) that the surrounding code does not make clear",
+  restatesCode:
+    "At least one comment in `change` only repeats what the adjacent code already says, adding no information beyond it",
+  unverifiedSuppression:
+    "`change` adds a type or linter suppression (such as `type: ignore`, `noqa`, `@ts-ignore`, `eslint-disable`) or `from __future__ import annotations` without naming the concrete tool error it works around",
+};
+
+export function jevVerdict(
+  answers: Record<string, number>,
+): "APPROVE" | "REJECT" | undefined {
+  const { documentsWhy, restatesCode, unverifiedSuppression } = answers;
+  if (restatesCode >= 0.8 || unverifiedSuppression >= 0.8 || documentsWhy <= 0.2)
+    return "REJECT";
+  if (documentsWhy >= 0.8 && restatesCode <= 0.2 && unverifiedSuppression <= 0.2)
+    return "APPROVE";
+  return undefined;
+}
+
 async function review(
   path: string,
   proposedText: string,
   ctx: ExtensionContext,
 ): Promise<string> {
+  try {
+    const answers = await askNoul({ path, change: proposedText }, JEV_QUESTIONS);
+    const verdict = jevVerdict(answers);
+    const scores = Object.entries(answers)
+      .map(([id, noul]) => `${id}=${noul.toFixed(2)}`)
+      .join(", ");
+    if (verdict) return `${verdict}\nJev: ${scores}`;
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    if (ctx.hasUI)
+      ctx.ui?.notify?.(`Jev unavailable, using Pi reviewer: ${message}`, "warning");
+  }
   if (ctx.hasUI) ctx.ui?.notify?.(`Reviewing comment in ${path}...`, "info");
   const executable = process.env.PI_COMMENT_REVIEWER_EXECUTABLE ?? "pi";
   const stdout = await runReviewer(

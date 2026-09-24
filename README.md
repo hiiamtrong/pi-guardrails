@@ -1,8 +1,9 @@
 # Pi GitHub Guards
 
-A Pi package with five workflow and security extensions:
+A Pi package with six workflow and security extensions:
 
 - **`comment-guard`** reviews new code comments, suppressions, and Python future annotations before they are written.
+- **`ponytail-review-on-settle`** runs `/skill:ponytail-review` after a turn that edited code, unless the edits were trivial.
 - **`github-write-confirm`** permits GitHub reads and requires confirmation for GitHub remote writes.
 - **`github-identity-guard-required`** blocks agent-initiated Git/GitHub writes until Git Identity Guard is installed in the current repository.
 - **`pr-review-archive`** archives human PR review evidence in a local SQLite database.
@@ -63,6 +64,7 @@ ln -sf "$PWD/extensions/github-write-confirm.ts" ~/.pi/agent/extensions/github-w
 ln -sf "$PWD/extensions/github-identity-guard-required.ts" ~/.pi/agent/extensions/github-identity-guard-required.ts
 ln -sf "$PWD/extensions/pr-review-archive.ts" ~/.pi/agent/extensions/pr-review-archive.ts
 ln -sf "$PWD/extensions/worktree-bootstrap.ts" ~/.pi/agent/extensions/worktree-bootstrap.ts
+ln -sf "$PWD/extensions/ponytail-review-on-settle.ts" ~/.pi/agent/extensions/ponytail-review-on-settle.ts
 cp config/github-write-confirm.example.json ~/.pi/agent/github-write-confirm.json
 ```
 
@@ -70,7 +72,19 @@ Reload Pi with `/reload` or restart it after installation.
 
 ## Comment review
 
-`comment-guard` invokes a read-only Pi reviewer before accepting comments in code files. It also reviews type/linter suppression comments and `from __future__ import annotations`, and blocks the write if the reviewer cannot run.
+`comment-guard` reviews comments in code files before accepting them. It also reviews type/linter suppression comments and `from __future__ import annotations`, and blocks the write if no reviewer can run.
+
+When a TypeSafe key is configured (see [Jev decisions](#jev-decisions)), Jev scores each change first and approves or rejects it only when all scores are confident (≥ 0.8 or ≤ 0.2). Uncertain cases and Jev failures fall back to the read-only Pi reviewer.
+
+## Ponytail review on settle
+
+`ponytail-review-on-settle` sends `/skill:ponytail-review` once a turn settles after editing code files. With Jev configured, it first sends each edit's `before`/`after` text and skips the review when Jev is at least 0.8 confident the edits only change wording, names, formatting, or literal values. Jev failures and changes over 60,000 characters always get reviewed.
+
+## Jev decisions
+
+Both extensions call the [TypeSafe System One API](https://docs.typesafe.ai/api) with model `jev-latest`. They read `TYPESAFE_API_KEY` and `TYPESAFE_BASE_URL` (default `https://api.typesafe.ai`) from the environment, or from `~/.pi/agent/mcp-env.json` when `TYPESAFE_API_KEY` is unset. To route through OpenRouter, set `TYPESAFE_BASE_URL` to `https://openrouter.ai/api` and use an OpenRouter key. Set `TYPESAFE_API_KEY=` (empty) to disable Jev.
+
+Jev receives the proposed code text, so only enable it for code you may send to TypeSafe (and OpenRouter, if used).
 
 ## PR review archive
 

@@ -1,9 +1,21 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-const { extractReviewCandidate } = await import(
+const { extractReviewCandidate, jevVerdict } = await import(
   `../extensions/comment-guard.ts?test=${Date.now()}`
 );
+
+test("Jev decides only confident cases and defers the rest to the Pi reviewer", () => {
+  const verdict = (documentsWhy: number, restatesCode = 0, unverifiedSuppression = 0) =>
+    jevVerdict({ documentsWhy, restatesCode, unverifiedSuppression });
+
+  assert.equal(verdict(0.9), "APPROVE");
+  assert.equal(verdict(0.1), "REJECT");
+  assert.equal(verdict(0.9, 0.85), "REJECT");
+  assert.equal(verdict(0.9, 0, 0.8), "REJECT");
+  assert.equal(verdict(0.5), undefined);
+  assert.equal(verdict(0.9, 0.5), undefined);
+});
 
 test("sends new code comments to the reviewer", () => {
   for (const newText of [

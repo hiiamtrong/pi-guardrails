@@ -1,9 +1,10 @@
 # Pi GitHub Guards
 
-A Pi package with six workflow and security extensions:
+A Pi package with seven workflow and security extensions:
 
 - **`comment-guard`** reviews new code comments, suppressions, and Python future annotations before they are written.
 - **`ponytail-review-on-settle`** runs `/skill:ponytail-review` after a turn that edited code, unless the edits were trivial.
+- **`test-gaps-on-settle`** asks the agent to cover missing happy-path and abnormal cases after it writes or edits a test file.
 - **`github-write-confirm`** permits GitHub reads and requires confirmation for GitHub remote writes.
 - **`github-identity-guard-required`** blocks agent-initiated Git/GitHub writes until Git Identity Guard is installed in the current repository.
 - **`pr-review-archive`** archives human PR review evidence in a local SQLite database.
@@ -65,6 +66,7 @@ ln -sf "$PWD/extensions/github-identity-guard-required.ts" ~/.pi/agent/extension
 ln -sf "$PWD/extensions/pr-review-archive.ts" ~/.pi/agent/extensions/pr-review-archive.ts
 ln -sf "$PWD/extensions/worktree-bootstrap.ts" ~/.pi/agent/extensions/worktree-bootstrap.ts
 ln -sf "$PWD/extensions/ponytail-review-on-settle.ts" ~/.pi/agent/extensions/ponytail-review-on-settle.ts
+ln -sf "$PWD/extensions/test-gaps-on-settle.ts" ~/.pi/agent/extensions/test-gaps-on-settle.ts
 cp config/github-write-confirm.example.json ~/.pi/agent/github-write-confirm.json
 ```
 
@@ -80,11 +82,26 @@ When a TypeSafe key is configured (see [Jev decisions](#jev-decisions)), Jev sco
 
 `ponytail-review-on-settle` sends `/skill:ponytail-review` once a turn settles after editing code files. With Jev configured, it first sends each edit's `before`/`after` text and skips the review when Jev is at least 0.8 confident the edits only change wording, names, formatting, or literal values. Jev failures and changes over 60,000 characters always get reviewed.
 
+## Test gaps on settle
+
+`test-gaps-on-settle` runs after any turn in which the agent writes or edits a test file, whether you asked for tests or the agent added them on its own. You do not need to invoke it.
+
+1. It finds the code under test from the test file: relative imports for JS/TS, imported modules under the repository root or `src/` for Python, and `foo.go` for `foo_test.go`.
+2. It builds candidate cases: every `throw`/`raise`/`errors.New`/`fmt.Errorf` message in that code, plus a fixed checklist (happy path, empty input, null/None, values at and just past a limit, zero or negative numbers, malformed input, failing dependencies, duplicates).
+3. Jev keeps the checklist cases relevant to the code (≥ 0.5); error paths are always kept.
+4. Jev scores whether a test calls the code for each case **and asserts** the result or error. Cases scoring ≤ 0.2 are reported.
+
+The report arrives as a `[test-gaps]` follow-up message listing the missing cases, so the agent adds those tests or states in one line why a case cannot happen. Each case is reported at most once per test file per session, so a case the agent rejects is not raised again.
+
+Example: you ask "write tests for `parseAge` in `src/age.ts`" and the agent writes only `parseAge("30")`. When the turn ends, the extension reports the untested `"age is required"` / `"age is unrealistic"` errors, empty and malformed input, and values at and past the 150 limit.
+
+Recognized test files: `*.test.*`, `*.spec.*` (JS/TS), `test_*.py`, `*_test.py`, and `*_test.go`. Test files whose code under test cannot be resolved, or whose source and tests exceed 60,000 characters, are skipped silently, as is the whole check when Jev fails.
+
 ## Jev decisions
 
-Both extensions call the [TypeSafe System One API](https://docs.typesafe.ai/api) with model `jev-latest`. They read `TYPESAFE_API_KEY` and `TYPESAFE_BASE_URL` (default `https://api.typesafe.ai`) from the environment, or from `~/.pi/agent/mcp-env.json` when `TYPESAFE_API_KEY` is unset. To route through OpenRouter, set `TYPESAFE_BASE_URL` to `https://openrouter.ai/api` and use an OpenRouter key. Set `TYPESAFE_API_KEY=` (empty) to disable Jev.
+All three Jev-backed extensions call the [TypeSafe System One API](https://docs.typesafe.ai/api) with model `jev-latest`. They read `TYPESAFE_API_KEY` and `TYPESAFE_BASE_URL` (default `https://api.typesafe.ai`) from the environment, or from `~/.pi/agent/mcp-env.json` when `TYPESAFE_API_KEY` is unset. To route through OpenRouter, set `TYPESAFE_BASE_URL` to `https://openrouter.ai/api` and use an OpenRouter key. Set `TYPESAFE_API_KEY=` (empty) to disable Jev.
 
-Jev receives the proposed code text, so only enable it for code you may send to TypeSafe (and OpenRouter, if used).
+Jev receives the proposed code text, and `test-gaps-on-settle` sends whole test files and the source files they import, so only enable it for code you may send to TypeSafe (and OpenRouter, if used).
 
 ## PR review archive
 

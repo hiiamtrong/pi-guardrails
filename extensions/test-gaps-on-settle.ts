@@ -75,15 +75,18 @@ export async function findGaps(sources: Record<string, string>, tests: string): 
     ...errorPaths(Object.values(sources).join("\n")),
     ...CHECKLIST.filter((_, i) => applies[`c${i}`] >= 0.5),
   ];
+  if (relevant.length === 0) return [];
 
-  const covered = await askNoul(
+  // Asking only about the assertion, not "calls and asserts" together, keeps
+  // Jev from half-crediting tests that call the code but ignore the outcome.
+  const asserted = await askNoul(
     { sources, tests },
     ids(
-      (c) => `A test in \`tests\` calls the code in \`sources\` for this case and asserts the result or the thrown error: ${c}`,
+      (c) => `\`tests\` contains an assertion (such as assert, expect, assert.throws, pytest.raises, or t.Fatalf on a wrong value) that checks the outcome of calling the code in \`sources\` with input matching this case: ${c}`,
       relevant,
     ),
   );
-  return relevant.filter((_, i) => covered[`c${i}`] <= 0.2);
+  return relevant.filter((_, i) => asserted[`c${i}`] <= 0.4);
 }
 
 export default function (pi: ExtensionAPI): void {

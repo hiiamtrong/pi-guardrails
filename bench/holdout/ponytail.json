@@ -1,0 +1,21 @@
+[
+  { "id": "rename-class", "expected": "skip", "edits": [
+    { "path": "src/billing.ts", "before": "export class InvoiceMgr {", "after": "export class InvoiceService {" },
+    { "path": "src/app.ts", "before": "const invoices = new InvoiceMgr(db);", "after": "const invoices = new InvoiceService(db);" }] },
+  { "id": "py-variable-typo", "expected": "skip", "edits": [{ "path": "app/cart.py", "before": ["recieved = order.items", "return len(recieved)"], "after": ["received = order.items", "return len(received)"] }] },
+  { "id": "go-error-wording", "expected": "skip", "edits": [{ "path": "store/user.go", "before": "\treturn errors.New(\"cant find user\")", "after": "\treturn errors.New(\"user not found\")" }] },
+  { "id": "url-constant", "expected": "skip", "edits": [{ "path": "src/config.ts", "before": "export const DOCS_URL = \"https://docs.example.com/v1\";", "after": "export const DOCS_URL = \"https://docs.example.com/v2\";" }] },
+  { "id": "py-line-wrap", "expected": "skip", "edits": [{ "path": "app/mail.py", "before": "send(to=user.email, subject=\"Welcome\", body=render(\"welcome\", user=user), reply_to=SUPPORT)", "after": ["send(", "    to=user.email,", "    subject=\"Welcome\",", "    body=render(\"welcome\", user=user),", "    reply_to=SUPPORT,", ")"] }] },
+  { "id": "enum-string-value", "expected": "skip", "edits": [{ "path": "src/status.ts", "before": "export const PENDING = \"pending\";", "after": "export const PENDING = \"PENDING\";" }] },
+  { "id": "go-rename-constant", "expected": "skip", "edits": [{ "path": "jobs/worker.go", "before": ["const n = 4", "", "func start() { spawn(n) }"], "after": ["const workerCount = 4", "", "func start() { spawn(workerCount) }"] }] },
+
+  { "id": "add-validation", "expected": "review", "edits": [{ "path": "src/transfer.ts", "before": "export function transfer(amount: number) {", "after": ["export function transfer(amount: number) {", "  if (!Number.isFinite(amount) || amount <= 0) throw new RangeError(\"amount must be positive\");"] }] },
+  { "id": "sync-to-async", "expected": "review", "edits": [{ "path": "src/config.ts", "before": ["export function loadConfig() {", "  return JSON.parse(readFileSync(path, \"utf8\"));", "}"], "after": ["export async function loadConfig() {", "  return JSON.parse(await readFile(path, \"utf8\"));", "}"] }] },
+  { "id": "lodash-for-one-call", "expected": "review", "edits": [{ "path": "src/names.ts", "before": "const unique = [...new Set(names)];", "after": ["import uniq from \"lodash/uniq\";", "const unique = uniq(names);"] }] },
+  { "id": "abstract-class", "expected": "review", "edits": [{ "path": "src/export.ts", "before": "export function toCsv(rows: Row[]) {", "after": ["export abstract class Exporter {", "  abstract export(rows: Row[]): string;", "}", "", "export class CsvExporter extends Exporter {", "  export(rows: Row[]) { return toCsv(rows); }", "}", "", "export function toCsv(rows: Row[]) {"] }] },
+  { "id": "env-flag", "expected": "review", "edits": [{ "path": "app/settings.py", "before": "DEBUG = False", "after": "DEBUG = os.environ.get(\"APP_DEBUG\", \"\").lower() in (\"1\", \"true\", \"yes\")" }] },
+  { "id": "remove-try-catch", "expected": "review", "edits": [{ "path": "src/cache.ts", "before": ["try {", "  return JSON.parse(raw);", "} catch {", "  return undefined;", "}"], "after": "return JSON.parse(raw);" }] },
+  { "id": "and-to-or", "expected": "review", "edits": [{ "path": "src/access.ts", "before": "if (user.isActive && user.isVerified) {", "after": "if (user.isActive || user.isVerified) {" }] },
+  { "id": "add-batch-loop", "expected": "review", "edits": [{ "path": "app/sync.py", "before": "api.upload(records)", "after": ["for start in range(0, len(records), 500):", "    api.upload(records[start:start + 500])"] }] },
+  { "id": "interface-two-impls", "expected": "review", "edits": [{ "path": "src/notify.ts", "before": "export const notify = (msg: string) => slack.post(msg);", "after": ["export interface Notifier { notify(msg: string): Promise<void> }", "export class SlackNotifier implements Notifier { notify(msg: string) { return slack.post(msg); } }", "export class EmailNotifier implements Notifier { notify(msg: string) { return mail.send(msg); } }", "export const notify = (msg: string) => new SlackNotifier().notify(msg);"] }] }
+]

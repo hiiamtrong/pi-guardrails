@@ -20,7 +20,7 @@ type Edit = { path: string; before?: string; after: string };
 const CODE_FILE =
   /\.(?:c|cc|cpp|cs|cxx|go|h|hpp|hxx|java|js|jsx|mjs|php|py|rb|rs|sh|sql|swift|ts|tsx)$/i;
 const TRIVIAL =
-  "Each edit in `edits` only changes wording, names, formatting, or literal values between `before` and `after`, without adding new logic";
+  "Each edit in `edits` only changes wording, names, formatting, or literal values between `before` and `after`, without adding or changing any logic, condition, operator, or control flow";
 
 export function isReviewableEdit(event: ToolCallEvent): string | undefined {
   if (event.toolName !== "write" && event.toolName !== "edit") return undefined;

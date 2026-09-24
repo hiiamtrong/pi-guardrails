@@ -1,0 +1,483 @@
+[
+  {
+    "id": "parseAge", "file": "src/age.ts",
+    "source": [
+      "export function parseAge(input: string): number {",
+      "  const text = input.trim();",
+      "  if (text === \"\") throw new Error(\"age is required\");",
+      "  if (!/^\\d+$/.test(text)) throw new Error(\"age must be a whole number\");",
+      "  const age = Number(text);",
+      "  if (age > 150) throw new Error(\"age is unrealistic\");",
+      "  return age;",
+      "}"
+    ],
+    "relevance": { "happy": "yes", "empty": "yes", "null": "either", "limit": "yes", "past_limit": "yes", "negative": "yes", "malformed": "yes", "dependency": "no", "duplicates": "no" },
+    "suites": [
+      { "variant": "happy", "covers": ["happy"], "tests": [
+        "import assert from \"node:assert/strict\";", "import test from \"node:test\";", "import { parseAge } from \"../src/age.ts\";", "",
+        "test(\"parses a typical age\", () => assert.equal(parseAge(\"30\"), 30));"] },
+      { "variant": "errors", "covers": ["happy", "empty", "malformed", "past_limit", "err:age is required", "err:whole number", "err:unrealistic"], "tests": [
+        "import assert from \"node:assert/strict\";", "import test from \"node:test\";", "import { parseAge } from \"../src/age.ts\";", "",
+        "test(\"parses a typical age\", () => assert.equal(parseAge(\"30\"), 30));",
+        "test(\"rejects empty input\", () => assert.throws(() => parseAge(\"\"), /age is required/));",
+        "test(\"rejects non-numeric input\", () => assert.throws(() => parseAge(\"abc\"), /whole number/));",
+        "test(\"rejects ages above 150\", () => assert.throws(() => parseAge(\"151\"), /unrealistic/));"] },
+      { "variant": "full", "covers": ["happy", "empty", "null", "limit", "past_limit", "negative", "malformed", "err:age is required", "err:whole number", "err:unrealistic"], "tests": [
+        "import assert from \"node:assert/strict\";", "import test from \"node:test\";", "import { parseAge } from \"../src/age.ts\";", "",
+        "test(\"parses a typical age\", () => assert.equal(parseAge(\"30\"), 30));",
+        "test(\"trims whitespace\", () => assert.equal(parseAge(\"  42 \"), 42));",
+        "test(\"rejects empty input\", () => assert.throws(() => parseAge(\"\"), /age is required/));",
+        "test(\"rejects non-numeric input\", () => assert.throws(() => parseAge(\"abc\"), /whole number/));",
+        "test(\"accepts the limits 0 and 150\", () => {", "  assert.equal(parseAge(\"0\"), 0);", "  assert.equal(parseAge(\"150\"), 150);", "});",
+        "test(\"rejects ages above 150\", () => assert.throws(() => parseAge(\"151\"), /unrealistic/));",
+        "test(\"rejects negative and decimal numbers\", () => {", "  assert.throws(() => parseAge(\"-5\"), /whole number/);", "  assert.throws(() => parseAge(\"4.5\"), /whole number/);", "});",
+        "test(\"rejects null at runtime\", () => assert.throws(() => parseAge(null as unknown as string), TypeError));"] },
+      { "variant": "noassert", "covers": [], "tests": [
+        "import test from \"node:test\";", "import { parseAge } from \"../src/age.ts\";", "",
+        "test(\"smoke\", () => {", "  parseAge(\"30\");", "  parseAge(\"150\");", "  try { parseAge(\"\"); } catch {}", "  try { parseAge(\"abc\"); } catch {}", "  try { parseAge(\"151\"); } catch {}", "});"] },
+      { "variant": "mixed", "covers": ["happy", "limit", "past_limit", "negative", "err:unrealistic", "err:whole number"], "either": ["malformed"], "tests": [
+        "import assert from \"node:assert/strict\";", "import test from \"node:test\";", "import { parseAge } from \"../src/age.ts\";", "",
+        "test(\"parses a typical age\", () => assert.equal(parseAge(\"30\"), 30));",
+        "test(\"accepts 150\", () => assert.equal(parseAge(\"150\"), 150));",
+        "test(\"rejects 151\", () => assert.throws(() => parseAge(\"151\"), /unrealistic/));",
+        "test(\"rejects negative numbers\", () => assert.throws(() => parseAge(\"-1\"), /whole number/));"] }
+    ]
+  },
+  {
+    "id": "slugify", "file": "src/slug.ts",
+    "source": [
+      "export function slugify(title: string): string {",
+      "  return title",
+      "    .toLowerCase()",
+      "    .trim()",
+      "    .replace(/[^a-z0-9]+/g, \"-\")",
+      "    .replace(/^-|-$/g, \"\");",
+      "}"
+    ],
+    "relevance": { "happy": "yes", "empty": "yes", "null": "either", "limit": "no", "past_limit": "no", "negative": "no", "malformed": "yes", "dependency": "no", "duplicates": "either" },
+    "suites": [
+      { "variant": "happy", "covers": ["happy"], "tests": [
+        "import assert from \"node:assert/strict\";", "import test from \"node:test\";", "import { slugify } from \"../src/slug.ts\";", "",
+        "test(\"slugifies a title\", () => assert.equal(slugify(\"Hello World\"), \"hello-world\"));"] },
+      { "variant": "errors", "covers": ["happy", "empty"], "tests": [
+        "import assert from \"node:assert/strict\";", "import test from \"node:test\";", "import { slugify } from \"../src/slug.ts\";", "",
+        "test(\"slugifies a title\", () => assert.equal(slugify(\"Hello World\"), \"hello-world\"));",
+        "test(\"returns empty for empty input\", () => assert.equal(slugify(\"\"), \"\"));"] },
+      { "variant": "full", "covers": ["happy", "empty", "malformed", "duplicates", "null"], "tests": [
+        "import assert from \"node:assert/strict\";", "import test from \"node:test\";", "import { slugify } from \"../src/slug.ts\";", "",
+        "test(\"slugifies a title\", () => assert.equal(slugify(\"Hello World\"), \"hello-world\"));",
+        "test(\"returns empty for empty input\", () => assert.equal(slugify(\"\"), \"\"));",
+        "test(\"drops symbols and accents\", () => {", "  assert.equal(slugify(\"!!!\"), \"\");", "  assert.equal(slugify(\"Déjà vu\"), \"d-j-vu\");", "});",
+        "test(\"collapses repeated separators\", () => assert.equal(slugify(\"a -- b\"), \"a-b\"));",
+        "test(\"throws on null\", () => assert.throws(() => slugify(null as unknown as string), TypeError));"] },
+      { "variant": "noassert", "covers": [], "tests": [
+        "import test from \"node:test\";", "import { slugify } from \"../src/slug.ts\";", "",
+        "test(\"smoke\", () => {", "  slugify(\"Hello World\");", "  slugify(\"\");", "  slugify(\"!!!\");", "});"] },
+      { "variant": "mixed", "covers": ["happy", "malformed"], "tests": [
+        "import assert from \"node:assert/strict\";", "import test from \"node:test\";", "import { slugify } from \"../src/slug.ts\";", "",
+        "test(\"slugifies a title\", () => assert.equal(slugify(\"Hello World\"), \"hello-world\"));",
+        "test(\"strips punctuation\", () => assert.equal(slugify(\"C++ & Rust!\"), \"c-rust\"));"] }
+    ]
+  },
+  {
+    "id": "chunk", "file": "src/chunk.ts",
+    "source": [
+      "export function chunk<T>(items: T[], size: number): T[][] {",
+      "  if (!Number.isInteger(size) || size <= 0) throw new RangeError(\"size must be a positive integer\");",
+      "  const out: T[][] = [];",
+      "  for (let i = 0; i < items.length; i += size) out.push(items.slice(i, i + size));",
+      "  return out;",
+      "}"
+    ],
+    "relevance": { "happy": "yes", "empty": "yes", "null": "either", "limit": "yes", "past_limit": "yes", "negative": "yes", "malformed": "yes", "dependency": "no", "duplicates": "no" },
+    "suites": [
+      { "variant": "happy", "covers": ["happy"], "tests": [
+        "import assert from \"node:assert/strict\";", "import test from \"node:test\";", "import { chunk } from \"../src/chunk.ts\";", "",
+        "test(\"splits into chunks\", () => assert.deepEqual(chunk([1, 2, 3, 4, 5], 2), [[1, 2], [3, 4], [5]]));"] },
+      { "variant": "errors", "covers": ["happy", "negative", "err:positive integer"], "tests": [
+        "import assert from \"node:assert/strict\";", "import test from \"node:test\";", "import { chunk } from \"../src/chunk.ts\";", "",
+        "test(\"splits into chunks\", () => assert.deepEqual(chunk([1, 2, 3, 4, 5], 2), [[1, 2], [3, 4], [5]]));",
+        "test(\"rejects a zero size\", () => assert.throws(() => chunk([1], 0), /positive integer/));"] },
+      { "variant": "full", "covers": ["happy", "empty", "limit", "past_limit", "negative", "malformed", "err:positive integer"], "tests": [
+        "import assert from \"node:assert/strict\";", "import test from \"node:test\";", "import { chunk } from \"../src/chunk.ts\";", "",
+        "test(\"splits into chunks\", () => assert.deepEqual(chunk([1, 2, 3, 4, 5], 2), [[1, 2], [3, 4], [5]]));",
+        "test(\"returns no chunks for an empty array\", () => assert.deepEqual(chunk([], 3), []));",
+        "test(\"size equal to length gives one chunk\", () => assert.deepEqual(chunk([1, 2, 3], 3), [[1, 2, 3]]));",
+        "test(\"size larger than length gives one chunk\", () => assert.deepEqual(chunk([1, 2], 5), [[1, 2]]));",
+        "test(\"rejects zero, negative, and fractional sizes\", () => {",
+        "  assert.throws(() => chunk([1], 0), /positive integer/);",
+        "  assert.throws(() => chunk([1], -1), /positive integer/);",
+        "  assert.throws(() => chunk([1], 1.5), /positive integer/);",
+        "});"] },
+      { "variant": "noassert", "covers": [], "tests": [
+        "import test from \"node:test\";", "import { chunk } from \"../src/chunk.ts\";", "",
+        "test(\"smoke\", () => {", "  chunk([1, 2, 3], 2);", "  chunk([], 2);", "  try { chunk([1], 0); } catch {}", "});"] },
+      { "variant": "mixed", "covers": ["happy", "empty", "past_limit"], "tests": [
+        "import assert from \"node:assert/strict\";", "import test from \"node:test\";", "import { chunk } from \"../src/chunk.ts\";", "",
+        "test(\"splits into chunks\", () => assert.deepEqual(chunk([1, 2, 3, 4, 5], 2), [[1, 2], [3, 4], [5]]));",
+        "test(\"returns no chunks for an empty array\", () => assert.deepEqual(chunk([], 3), []));",
+        "test(\"size larger than length gives one chunk\", () => assert.deepEqual(chunk([1, 2], 5), [[1, 2]]));"] }
+    ]
+  },
+  {
+    "id": "fetchUser", "file": "src/users.ts",
+    "source": [
+      "type Http = { get(url: string): Promise<{ status: number; body: unknown }> };",
+      "",
+      "export async function fetchUser(http: Http, id: string) {",
+      "  if (!/^[a-z0-9-]+$/.test(id)) throw new Error(\"invalid user id\");",
+      "  const res = await http.get(\"/users/\" + id);",
+      "  if (res.status === 404) throw new Error(\"user not found\");",
+      "  if (res.status !== 200) throw new Error(\"unexpected status\");",
+      "  return res.body as { id: string; name: string };",
+      "}"
+    ],
+    "relevance": { "happy": "yes", "empty": "yes", "null": "either", "limit": "no", "past_limit": "no", "negative": "no", "malformed": "yes", "dependency": "yes", "duplicates": "no" },
+    "suites": [
+      { "variant": "happy", "covers": ["happy"], "tests": [
+        "import assert from \"node:assert/strict\";", "import test from \"node:test\";", "import { fetchUser } from \"../src/users.ts\";", "",
+        "const http = (status: number, body: unknown = {}) => ({ get: async () => ({ status, body }) });", "",
+        "test(\"returns the user body\", async () => {",
+        "  assert.deepEqual(await fetchUser(http(200, { id: \"u1\", name: \"Ann\" }), \"u1\"), { id: \"u1\", name: \"Ann\" });",
+        "});"] },
+      { "variant": "errors", "covers": ["happy", "malformed", "err:invalid user id", "err:user not found", "err:unexpected status"], "tests": [
+        "import assert from \"node:assert/strict\";", "import test from \"node:test\";", "import { fetchUser } from \"../src/users.ts\";", "",
+        "const http = (status: number, body: unknown = {}) => ({ get: async () => ({ status, body }) });", "",
+        "test(\"returns the user body\", async () => {",
+        "  assert.deepEqual(await fetchUser(http(200, { id: \"u1\", name: \"Ann\" }), \"u1\"), { id: \"u1\", name: \"Ann\" });",
+        "});",
+        "test(\"maps 404 to not found\", async () => {", "  await assert.rejects(fetchUser(http(404), \"u1\"), /user not found/);", "});",
+        "test(\"rejects other statuses\", async () => {", "  await assert.rejects(fetchUser(http(500), \"u1\"), /unexpected status/);", "});",
+        "test(\"rejects malformed ids\", async () => {", "  await assert.rejects(fetchUser(http(200), \"BAD ID!\"), /invalid user id/);", "});"] },
+      { "variant": "full", "covers": ["happy", "empty", "malformed", "dependency", "err:invalid user id", "err:user not found", "err:unexpected status"], "tests": [
+        "import assert from \"node:assert/strict\";", "import test from \"node:test\";", "import { fetchUser } from \"../src/users.ts\";", "",
+        "const http = (status: number, body: unknown = {}) => ({ get: async () => ({ status, body }) });", "",
+        "test(\"returns the user body\", async () => {",
+        "  assert.deepEqual(await fetchUser(http(200, { id: \"u1\", name: \"Ann\" }), \"u1\"), { id: \"u1\", name: \"Ann\" });",
+        "});",
+        "test(\"maps 404 to not found\", async () => {", "  await assert.rejects(fetchUser(http(404), \"u1\"), /user not found/);", "});",
+        "test(\"rejects other statuses\", async () => {", "  await assert.rejects(fetchUser(http(500), \"u1\"), /unexpected status/);", "});",
+        "test(\"rejects malformed and empty ids\", async () => {",
+        "  await assert.rejects(fetchUser(http(200), \"BAD ID!\"), /invalid user id/);",
+        "  await assert.rejects(fetchUser(http(200), \"\"), /invalid user id/);",
+        "});",
+        "test(\"propagates network failures\", async () => {",
+        "  const failing = { get: async () => { throw new Error(\"socket hang up\"); } };",
+        "  await assert.rejects(fetchUser(failing, \"u1\"), /socket hang up/);",
+        "});"] },
+      { "variant": "noassert", "covers": [], "tests": [
+        "import test from \"node:test\";", "import { fetchUser } from \"../src/users.ts\";", "",
+        "const http = (status: number, body: unknown = {}) => ({ get: async () => ({ status, body }) });", "",
+        "test(\"smoke\", async () => {", "  await fetchUser(http(200), \"u1\");", "  await fetchUser(http(404), \"u1\").catch(() => {});", "});"] },
+      { "variant": "mixed", "covers": ["happy", "dependency"], "tests": [
+        "import assert from \"node:assert/strict\";", "import test from \"node:test\";", "import { fetchUser } from \"../src/users.ts\";", "",
+        "const http = (status: number, body: unknown = {}) => ({ get: async () => ({ status, body }) });", "",
+        "test(\"returns the user body\", async () => {",
+        "  assert.deepEqual(await fetchUser(http(200, { id: \"u1\", name: \"Ann\" }), \"u1\"), { id: \"u1\", name: \"Ann\" });",
+        "});",
+        "test(\"propagates network failures\", async () => {",
+        "  const failing = { get: async () => { throw new Error(\"socket hang up\"); } };",
+        "  await assert.rejects(fetchUser(failing, \"u1\"), /socket hang up/);",
+        "});"] }
+    ]
+  },
+  {
+    "id": "dedupe_emails", "file": "emails.py",
+    "source": [
+      "import re",
+      "",
+      "EMAIL = re.compile(r\"^[^@\\s]+@[^@\\s]+\\.[a-z]+$\")",
+      "",
+      "",
+      "def dedupe_emails(emails: list[str]) -> list[str]:",
+      "    seen = []",
+      "    for raw in emails:",
+      "        email = raw.strip().lower()",
+      "        if not EMAIL.match(email):",
+      "            raise ValueError(\"invalid email: \" + raw)",
+      "        if email not in seen:",
+      "            seen.append(email)",
+      "    return seen"
+    ],
+    "relevance": { "happy": "yes", "empty": "yes", "null": "either", "limit": "no", "past_limit": "no", "negative": "no", "malformed": "yes", "dependency": "no", "duplicates": "yes" },
+    "suites": [
+      { "variant": "happy", "covers": ["happy"], "tests": [
+        "from emails import dedupe_emails", "", "",
+        "def test_keeps_a_valid_email():", "    assert dedupe_emails([\"a@x.com\"]) == [\"a@x.com\"]"] },
+      { "variant": "errors", "covers": ["happy", "malformed", "err:invalid email"], "tests": [
+        "import pytest", "", "from emails import dedupe_emails", "", "",
+        "def test_keeps_a_valid_email():", "    assert dedupe_emails([\"a@x.com\"]) == [\"a@x.com\"]", "", "",
+        "def test_rejects_invalid_email():", "    with pytest.raises(ValueError, match=\"invalid email\"):", "        dedupe_emails([\"not-an-email\"])"] },
+      { "variant": "full", "covers": ["happy", "empty", "malformed", "duplicates", "err:invalid email"], "tests": [
+        "import pytest", "", "from emails import dedupe_emails", "", "",
+        "def test_keeps_a_valid_email():", "    assert dedupe_emails([\"a@x.com\"]) == [\"a@x.com\"]", "", "",
+        "def test_empty_list():", "    assert dedupe_emails([]) == []", "", "",
+        "def test_dedupes_case_and_whitespace():", "    assert dedupe_emails([\"A@x.com\", \" a@x.com \"]) == [\"a@x.com\"]", "", "",
+        "def test_rejects_invalid_email():", "    with pytest.raises(ValueError, match=\"invalid email\"):", "        dedupe_emails([\"not-an-email\"])"] },
+      { "variant": "noassert", "covers": [], "tests": [
+        "from emails import dedupe_emails", "", "",
+        "def test_smoke():", "    dedupe_emails([\"a@x.com\", \"a@x.com\"])", "    dedupe_emails([])"] },
+      { "variant": "mixed", "covers": ["happy", "duplicates"], "tests": [
+        "from emails import dedupe_emails", "", "",
+        "def test_keeps_a_valid_email():", "    assert dedupe_emails([\"a@x.com\"]) == [\"a@x.com\"]", "", "",
+        "def test_dedupes_case_and_whitespace():", "    assert dedupe_emails([\"A@x.com\", \" a@x.com \"]) == [\"a@x.com\"]"] }
+    ]
+  },
+  {
+    "id": "transfer", "file": "bank.py",
+    "source": [
+      "def transfer(balance: int, amount: int) -> int:",
+      "    if amount <= 0:",
+      "        raise ValueError(\"amount must be positive\")",
+      "    if amount > balance:",
+      "        raise ValueError(\"insufficient funds\")",
+      "    return balance - amount"
+    ],
+    "relevance": { "happy": "yes", "empty": "no", "null": "either", "limit": "yes", "past_limit": "yes", "negative": "yes", "malformed": "either", "dependency": "no", "duplicates": "no" },
+    "suites": [
+      { "variant": "happy", "covers": ["happy"], "tests": [
+        "from bank import transfer", "", "",
+        "def test_transfer():", "    assert transfer(100, 30) == 70"] },
+      { "variant": "errors", "covers": ["happy", "negative", "err:must be positive", "err:insufficient funds"], "either": ["past_limit"], "tests": [
+        "import pytest", "", "from bank import transfer", "", "",
+        "def test_transfer():", "    assert transfer(100, 30) == 70", "", "",
+        "def test_rejects_zero_amount():", "    with pytest.raises(ValueError, match=\"must be positive\"):", "        transfer(100, 0)", "", "",
+        "def test_rejects_overdraft():", "    with pytest.raises(ValueError, match=\"insufficient funds\"):", "        transfer(100, 200)"] },
+      { "variant": "full", "covers": ["happy", "limit", "past_limit", "negative", "err:must be positive", "err:insufficient funds"], "tests": [
+        "import pytest", "", "from bank import transfer", "", "",
+        "def test_transfer():", "    assert transfer(100, 30) == 70", "", "",
+        "def test_transfer_whole_balance():", "    assert transfer(100, 100) == 0", "", "",
+        "@pytest.mark.parametrize(\"amount\", [0, -5])",
+        "def test_rejects_non_positive_amounts(amount):", "    with pytest.raises(ValueError, match=\"must be positive\"):", "        transfer(100, amount)", "", "",
+        "def test_rejects_one_over_balance():", "    with pytest.raises(ValueError, match=\"insufficient funds\"):", "        transfer(100, 101)"] },
+      { "variant": "noassert", "covers": [], "tests": [
+        "from bank import transfer", "", "",
+        "def test_smoke():", "    transfer(100, 30)", "    try:", "        transfer(100, 0)", "    except ValueError:", "        pass"] },
+      { "variant": "mixed", "covers": ["happy", "limit"], "tests": [
+        "from bank import transfer", "", "",
+        "def test_transfer():", "    assert transfer(100, 30) == 70", "", "",
+        "def test_transfer_whole_balance():", "    assert transfer(100, 100) == 0"] }
+    ]
+  },
+  {
+    "id": "parse_config", "file": "config.py",
+    "source": [
+      "import json",
+      "",
+      "",
+      "def parse_config(text: str) -> dict:",
+      "    if not text.strip():",
+      "        raise ValueError(\"config is empty\")",
+      "    data = json.loads(text)",
+      "    if not isinstance(data, dict):",
+      "        raise ValueError(\"config must be a JSON object\")",
+      "    return {\"port\": int(data.get(\"port\", 8080)), \"debug\": bool(data.get(\"debug\", False))}"
+    ],
+    "relevance": { "happy": "yes", "empty": "yes", "null": "either", "limit": "no", "past_limit": "no", "negative": "either", "malformed": "yes", "dependency": "no", "duplicates": "no" },
+    "suites": [
+      { "variant": "happy", "covers": ["happy"], "tests": [
+        "from config import parse_config", "", "",
+        "def test_parses_port():", "    assert parse_config('{\"port\": 9000}') == {\"port\": 9000, \"debug\": False}"] },
+      { "variant": "errors", "covers": ["happy", "empty", "err:config is empty", "err:JSON object"], "either": ["malformed"], "tests": [
+        "import pytest", "", "from config import parse_config", "", "",
+        "def test_parses_port():", "    assert parse_config('{\"port\": 9000}') == {\"port\": 9000, \"debug\": False}", "", "",
+        "def test_rejects_blank_text():", "    with pytest.raises(ValueError, match=\"config is empty\"):", "        parse_config(\"   \")", "", "",
+        "def test_rejects_non_object():", "    with pytest.raises(ValueError, match=\"JSON object\"):", "        parse_config(\"[1, 2]\")"] },
+      { "variant": "full", "covers": ["happy", "empty", "malformed", "err:config is empty", "err:JSON object"], "tests": [
+        "import json", "", "import pytest", "", "from config import parse_config", "", "",
+        "def test_parses_port():", "    assert parse_config('{\"port\": 9000}') == {\"port\": 9000, \"debug\": False}", "", "",
+        "def test_applies_defaults():", "    assert parse_config(\"{}\") == {\"port\": 8080, \"debug\": False}", "", "",
+        "def test_rejects_blank_text():", "    with pytest.raises(ValueError, match=\"config is empty\"):", "        parse_config(\"   \")", "", "",
+        "def test_rejects_invalid_json():", "    with pytest.raises(json.JSONDecodeError):", "        parse_config(\"{\")", "", "",
+        "def test_rejects_non_object():", "    with pytest.raises(ValueError, match=\"JSON object\"):", "        parse_config(\"[1, 2]\")"] },
+      { "variant": "noassert", "covers": [], "tests": [
+        "from config import parse_config", "", "",
+        "def test_smoke():", "    parse_config('{\"port\": 9000}')", "    try:", "        parse_config(\"\")", "    except ValueError:", "        pass"] },
+      { "variant": "mixed", "covers": ["happy", "malformed"], "tests": [
+        "import json", "", "import pytest", "", "from config import parse_config", "", "",
+        "def test_parses_port():", "    assert parse_config('{\"port\": 9000}') == {\"port\": 9000, \"debug\": False}", "", "",
+        "def test_rejects_invalid_json():", "    with pytest.raises(json.JSONDecodeError):", "        parse_config(\"{\")"] }
+    ]
+  },
+  {
+    "id": "Divide", "file": "calc/calc.go",
+    "source": [
+      "package calc",
+      "",
+      "import \"errors\"",
+      "",
+      "func Divide(a, b int) (int, error) {",
+      "\tif b == 0 {",
+      "\t\treturn 0, errors.New(\"division by zero\")",
+      "\t}",
+      "\treturn a / b, nil",
+      "}"
+    ],
+    "relevance": { "happy": "yes", "empty": "no", "null": "no", "limit": "either", "past_limit": "no", "negative": "yes", "malformed": "no", "dependency": "no", "duplicates": "no" },
+    "suites": [
+      { "variant": "happy", "covers": ["happy"], "tests": [
+        "package calc", "", "import \"testing\"", "",
+        "func TestDivide(t *testing.T) {",
+        "\tif got, err := Divide(10, 2); err != nil || got != 5 {",
+        "\t\tt.Fatalf(\"Divide(10, 2) = %d, %v\", got, err)",
+        "\t}", "}"] },
+      { "variant": "errors", "covers": ["happy", "negative", "err:division by zero"], "tests": [
+        "package calc", "", "import \"testing\"", "",
+        "func TestDivide(t *testing.T) {",
+        "\tif got, err := Divide(10, 2); err != nil || got != 5 {",
+        "\t\tt.Fatalf(\"Divide(10, 2) = %d, %v\", got, err)",
+        "\t}", "}", "",
+        "func TestDivideByZero(t *testing.T) {",
+        "\tif _, err := Divide(1, 0); err == nil || err.Error() != \"division by zero\" {",
+        "\t\tt.Fatalf(\"want division by zero, got %v\", err)",
+        "\t}", "}"] },
+      { "variant": "full", "covers": ["happy", "negative", "err:division by zero"], "tests": [
+        "package calc", "", "import \"testing\"", "",
+        "func TestDivide(t *testing.T) {",
+        "\tcases := []struct{ a, b, want int }{{10, 2, 5}, {7, 2, 3}, {-9, 3, -3}}",
+        "\tfor _, c := range cases {",
+        "\t\tif got, err := Divide(c.a, c.b); err != nil || got != c.want {",
+        "\t\t\tt.Fatalf(\"Divide(%d, %d) = %d, %v\", c.a, c.b, got, err)",
+        "\t\t}",
+        "\t}", "}", "",
+        "func TestDivideByZero(t *testing.T) {",
+        "\tif _, err := Divide(1, 0); err == nil || err.Error() != \"division by zero\" {",
+        "\t\tt.Fatalf(\"want division by zero, got %v\", err)",
+        "\t}", "}"] },
+      { "variant": "noassert", "covers": [], "tests": [
+        "package calc", "", "import \"testing\"", "",
+        "func TestSmoke(t *testing.T) {", "\tDivide(10, 2)", "\tDivide(1, 0)", "}"] },
+      { "variant": "mixed", "covers": ["happy"], "either": ["negative"], "tests": [
+        "package calc", "", "import \"testing\"", "",
+        "func TestDivide(t *testing.T) {",
+        "\tif got, err := Divide(10, 2); err != nil || got != 5 {",
+        "\t\tt.Fatalf(\"Divide(10, 2) = %d, %v\", got, err)",
+        "\t}",
+        "\tif got, err := Divide(-9, 3); err != nil || got != -3 {",
+        "\t\tt.Fatalf(\"Divide(-9, 3) = %d, %v\", got, err)",
+        "\t}", "}"] }
+    ]
+  },
+  {
+    "id": "ParsePort", "file": "netutil/port.go",
+    "source": [
+      "package netutil",
+      "",
+      "import (",
+      "\t\"fmt\"",
+      "\t\"strconv\"",
+      ")",
+      "",
+      "func ParsePort(s string) (int, error) {",
+      "\tp, err := strconv.Atoi(s)",
+      "\tif err != nil {",
+      "\t\treturn 0, fmt.Errorf(\"invalid port %q\", s)",
+      "\t}",
+      "\tif p < 1 || p > 65535 {",
+      "\t\treturn 0, fmt.Errorf(\"port out of range: %d\", p)",
+      "\t}",
+      "\treturn p, nil",
+      "}"
+    ],
+    "relevance": { "happy": "yes", "empty": "yes", "null": "no", "limit": "yes", "past_limit": "yes", "negative": "yes", "malformed": "yes", "dependency": "no", "duplicates": "no" },
+    "suites": [
+      { "variant": "happy", "covers": ["happy"], "tests": [
+        "package netutil", "", "import \"testing\"", "",
+        "func TestParsePort(t *testing.T) {",
+        "\tif p, err := ParsePort(\"8080\"); err != nil || p != 8080 {",
+        "\t\tt.Fatalf(\"ParsePort(8080) = %d, %v\", p, err)",
+        "\t}", "}"] },
+      { "variant": "errors", "covers": ["happy", "malformed", "err:invalid port", "err:out of range"], "either": ["past_limit"], "tests": [
+        "package netutil", "", "import (", "\t\"strings\"", "\t\"testing\"", ")", "",
+        "func TestParsePort(t *testing.T) {",
+        "\tif p, err := ParsePort(\"8080\"); err != nil || p != 8080 {",
+        "\t\tt.Fatalf(\"ParsePort(8080) = %d, %v\", p, err)",
+        "\t}", "}", "",
+        "func TestParsePortErrors(t *testing.T) {",
+        "\tif _, err := ParsePort(\"abc\"); err == nil || !strings.Contains(err.Error(), \"invalid port\") {",
+        "\t\tt.Fatalf(\"want invalid port, got %v\", err)",
+        "\t}",
+        "\tif _, err := ParsePort(\"70000\"); err == nil || !strings.Contains(err.Error(), \"out of range\") {",
+        "\t\tt.Fatalf(\"want out of range, got %v\", err)",
+        "\t}", "}"] },
+      { "variant": "full", "covers": ["happy", "empty", "limit", "past_limit", "negative", "malformed", "err:invalid port", "err:out of range"], "tests": [
+        "package netutil", "", "import \"testing\"", "",
+        "func TestParsePortValid(t *testing.T) {",
+        "\tfor _, s := range []string{\"1\", \"8080\", \"65535\"} {",
+        "\t\tif _, err := ParsePort(s); err != nil {",
+        "\t\t\tt.Fatalf(\"ParsePort(%q) failed: %v\", s, err)",
+        "\t\t}",
+        "\t}", "}", "",
+        "func TestParsePortInvalid(t *testing.T) {",
+        "\tfor _, s := range []string{\"\", \"abc\", \"0\", \"65536\", \"-1\"} {",
+        "\t\tif _, err := ParsePort(s); err == nil {",
+        "\t\t\tt.Fatalf(\"ParsePort(%q) should fail\", s)",
+        "\t\t}",
+        "\t}", "}"] },
+      { "variant": "noassert", "covers": [], "tests": [
+        "package netutil", "", "import \"testing\"", "",
+        "func TestSmoke(t *testing.T) {", "\tParsePort(\"8080\")", "\tParsePort(\"abc\")", "\tParsePort(\"70000\")", "}"] },
+      { "variant": "mixed", "covers": ["happy", "limit"], "tests": [
+        "package netutil", "", "import \"testing\"", "",
+        "func TestParsePortLimits(t *testing.T) {",
+        "\tfor _, s := range []string{\"1\", \"8080\", \"65535\"} {",
+        "\t\tif _, err := ParsePort(s); err != nil {",
+        "\t\t\tt.Fatalf(\"ParsePort(%q) failed: %v\", s, err)",
+        "\t\t}",
+        "\t}", "}"] }
+    ]
+  },
+  {
+    "id": "withRetry", "file": "src/retry.ts",
+    "source": [
+      "export async function withRetry<T>(fn: () => Promise<T>, attempts: number): Promise<T> {",
+      "  if (attempts < 1) throw new RangeError(\"attempts must be at least 1\");",
+      "  let lastError: unknown;",
+      "  for (let i = 0; i < attempts; i++) {",
+      "    try {",
+      "      return await fn();",
+      "    } catch (error) {",
+      "      lastError = error;",
+      "    }",
+      "  }",
+      "  throw lastError;",
+      "}"
+    ],
+    "relevance": { "happy": "yes", "empty": "no", "null": "no", "limit": "either", "past_limit": "either", "negative": "yes", "malformed": "no", "dependency": "yes", "duplicates": "no" },
+    "suites": [
+      { "variant": "happy", "covers": ["happy"], "tests": [
+        "import assert from \"node:assert/strict\";", "import test from \"node:test\";", "import { withRetry } from \"../src/retry.ts\";", "",
+        "test(\"returns the first successful result\", async () => assert.equal(await withRetry(async () => 42, 3), 42));"] },
+      { "variant": "errors", "covers": ["happy", "negative", "err:at least 1"], "tests": [
+        "import assert from \"node:assert/strict\";", "import test from \"node:test\";", "import { withRetry } from \"../src/retry.ts\";", "",
+        "test(\"returns the first successful result\", async () => assert.equal(await withRetry(async () => 42, 3), 42));",
+        "test(\"rejects zero attempts\", async () => {", "  await assert.rejects(withRetry(async () => 1, 0), /at least 1/);", "});"] },
+      { "variant": "full", "covers": ["happy", "negative", "limit", "past_limit", "dependency", "err:at least 1"], "tests": [
+        "import assert from \"node:assert/strict\";", "import test from \"node:test\";", "import { withRetry } from \"../src/retry.ts\";", "",
+        "test(\"returns the first successful result\", async () => assert.equal(await withRetry(async () => 42, 3), 42));",
+        "test(\"rejects zero attempts\", async () => {", "  await assert.rejects(withRetry(async () => 1, 0), /at least 1/);", "});",
+        "test(\"succeeds on the last attempt\", async () => {",
+        "  let calls = 0;",
+        "  const result = await withRetry(async () => {",
+        "    calls += 1;",
+        "    if (calls < 3) throw new Error(\"flaky\");",
+        "    return \"ok\";",
+        "  }, 3);",
+        "  assert.equal(result, \"ok\");",
+        "  assert.equal(calls, 3);",
+        "});",
+        "test(\"rethrows the last error after all attempts fail\", async () => {",
+        "  await assert.rejects(withRetry(async () => { throw new Error(\"down\"); }, 2), /down/);",
+        "});"] },
+      { "variant": "noassert", "covers": [], "tests": [
+        "import test from \"node:test\";", "import { withRetry } from \"../src/retry.ts\";", "",
+        "test(\"smoke\", async () => {", "  await withRetry(async () => 42, 3);", "  await withRetry(async () => { throw new Error(\"down\"); }, 2).catch(() => {});", "});"] },
+      { "variant": "mixed", "covers": ["happy", "dependency"], "either": ["past_limit"], "tests": [
+        "import assert from \"node:assert/strict\";", "import test from \"node:test\";", "import { withRetry } from \"../src/retry.ts\";", "",
+        "test(\"returns the first successful result\", async () => assert.equal(await withRetry(async () => 42, 3), 42));",
+        "test(\"rethrows the last error after all attempts fail\", async () => {",
+        "  await assert.rejects(withRetry(async () => { throw new Error(\"down\"); }, 2), /down/);",
+        "});"] }
+    ]
+  }
+]

@@ -76,11 +76,11 @@ Reload Pi with `/reload` or restart it after installation.
 
 `comment-guard` reviews comments in code files before accepting them. It also reviews type/linter suppression comments and `from __future__ import annotations`, and blocks the write if no reviewer can run.
 
-When a TypeSafe key is configured (see [Jev decisions](#jev-decisions)), Jev scores each change first and approves or rejects it only when all scores are confident (≥ 0.8 or ≤ 0.2). Uncertain cases and Jev failures fall back to the read-only Pi reviewer.
+When a TypeSafe key is configured (see [Jev decisions](#jev-decisions)), Jev scores each change on three questions: does every comment document a non-obvious reason (`documentsWhy`), does one restate the code (`restatesCode`), and does it add an unexplained suppression (`unverifiedSuppression`). It rejects when `restatesCode` or `unverifiedSuppression` is ≥ 0.8 or `documentsWhy` is ≤ 0.2, and approves when `documentsWhy` ≥ 0.6, `restatesCode` ≤ 0.4, and `unverifiedSuppression` ≤ 0.2. Everything in between, and any Jev failure, falls back to the read-only Pi reviewer.
 
 ## Ponytail review on settle
 
-`ponytail-review-on-settle` sends `/skill:ponytail-review` once a turn settles after editing code files. With Jev configured, it first sends each edit's `before`/`after` text and skips the review when Jev is at least 0.8 confident the edits only change wording, names, formatting, or literal values. Jev failures and changes over 60,000 characters always get reviewed.
+`ponytail-review-on-settle` sends `/skill:ponytail-review` once a turn settles after editing code files. With Jev configured, it first sends each edit's `before`/`after` text and skips the review when Jev is at least 0.8 confident the edits only change wording, names, formatting, or literal values without adding or changing any logic, condition, operator, or control flow. Jev failures and changes over 60,000 characters always get reviewed.
 
 ## Test gaps on settle
 
@@ -89,7 +89,7 @@ When a TypeSafe key is configured (see [Jev decisions](#jev-decisions)), Jev sco
 1. It finds the code under test from the test file: relative imports for JS/TS, imported modules under the repository root or `src/` for Python, and `foo.go` for `foo_test.go`.
 2. It builds candidate cases: every `throw`/`raise`/`errors.New`/`fmt.Errorf` message in that code, plus a fixed checklist (happy path, empty input, null/None, values at and just past a limit, zero or negative numbers, malformed input, failing dependencies, duplicates).
 3. Jev keeps the checklist cases relevant to the code (≥ 0.5); error paths are always kept.
-4. Jev scores whether a test calls the code for each case **and asserts** the result or error. Cases scoring ≤ 0.2 are reported.
+4. Jev scores whether the tests contain an **assertion** that checks the outcome for each case, so a test that calls the code but ignores the result does not count. Cases scoring ≤ 0.4 are reported.
 
 The report arrives as a `[test-gaps]` follow-up message listing the missing cases, so the agent adds those tests or states in one line why a case cannot happen. Each case is reported at most once per test file per session, so a case the agent rejects is not raised again.
 
@@ -153,3 +153,17 @@ npm install
 npm test
 npx tsc --noEmit
 ```
+
+### Jev benchmark
+
+`bench/` holds 150 hand-labeled cases (50 per Jev-backed extension) and a runner that calls the real Jev API through each extension's own handler or `findGaps`:
+
+```bash
+node --experimental-strip-types bench/jev-bench.ts              # all three
+node --experimental-strip-types bench/jev-bench.ts comment-guard  # or ponytail, test-gaps
+node --experimental-strip-types bench/jev-bench.ts "" holdout    # all three on bench/holdout/
+```
+
+`bench/holdout/` (16 + 16 + 15 cases) was written before the thresholds and questions were tuned on the main set; use it to check that a change generalizes instead of fitting the main set.
+
+It reads the same TypeSafe settings as the extensions and costs well under $0.01 per full run. `comment-guard` runs with a stub Pi reviewer that always answers `DEFER`, so cases Jev leaves undecided show up as deferred instead of spawning Pi. The `test-gaps` report includes recall and precision for several gap thresholds, computed from the recorded scores.

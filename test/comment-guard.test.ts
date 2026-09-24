@@ -1,20 +1,85 @@
 import assert from "node:assert/strict";
+import { chmodSync, mkdtempSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import test from "node:test";
 
-const { extractReviewCandidate, jevVerdict } = await import(
+const { extractReviewCandidate, jevVerdict, default: commentGuard } = await import(
   `../extensions/comment-guard.ts?test=${Date.now()}`
 );
+
+const commented = `${"/".repeat(2)} Keep in sync with client_max_body_size in nginx.conf\nexport const MAX_UPLOAD_MB = 25;\n`;
+
+function guard(jev: Record<string, number> | Error, reviewerScript: string) {
+  process.env.TYPESAFE_API_KEY = "test-key";
+  process.env.TYPESAFE_BASE_URL = "https://jev.test/api";
+  let jevCalls = 0;
+  globalThis.fetch = (async () => {
+    jevCalls += 1;
+    if (jev instanceof Error) throw jev;
+    const answers = Object.fromEntries(Object.entries(jev).map(([id, noul]) => [id, { type: "noul", noul }]));
+    return new Response(JSON.stringify({ answers }));
+  }) as typeof fetch;
+  const dir = mkdtempSync(join(tmpdir(), "comment-guard-"));
+  const reviewer = join(dir, "reviewer");
+  writeFileSync(reviewer, `#!/bin/sh\n${reviewerScript}\n`);
+  chmodSync(reviewer, 0o755);
+  process.env.PI_COMMENT_REVIEWER_EXECUTABLE = reviewer;
+  let handler: (event: unknown, ctx: unknown) => Promise<{ block: true; reason: string } | undefined>;
+  commentGuard({ on: (_event: string, h: typeof handler) => (handler = h) });
+  return {
+    write: (content: string) => handler({ toolName: "write", input: { path: "src/upload.ts", content } }, { cwd: dir }),
+    jevCalls: () => jevCalls,
+  };
+}
+
+const CONFIDENT_REJECT = { documentsWhy: 0.1, restatesCode: 0.9, unverifiedSuppression: 0 };
+const CONFIDENT_APPROVE = { documentsWhy: 0.9, restatesCode: 0.1, unverifiedSuppression: 0 };
+const UNSURE = { documentsWhy: 0.5, restatesCode: 0.3, unverifiedSuppression: 0.1 };
+
+test("Jev decides confident cases without running the Pi reviewer", async () => {
+  const rejected = await guard(CONFIDENT_REJECT, "echo APPROVE").write(commented);
+  assert.equal(rejected?.block, true);
+  assert.match(rejected?.reason ?? "", /rejected this change: REJECT\nJev: documentsWhy=0\.10, restatesCode=0\.90/);
+
+  assert.equal(await guard(CONFIDENT_APPROVE, "exit 1").write(commented), undefined);
+});
+
+test("falls back to the Pi reviewer when Jev fails or is unsure", async () => {
+  assert.equal(await guard(new Error("network down"), "echo APPROVE").write(commented), undefined);
+
+  const rejected = await guard(UNSURE, "echo REJECT; echo restates the code").write(commented);
+  assert.match(rejected?.reason ?? "", /rejected this change: REJECT\nrestates the code/);
+});
+
+test("blocks the write when neither Jev nor the Pi reviewer can run", async () => {
+  const blocked = await guard(new Error("network down"), "exit 3").write(commented);
+  assert.equal(blocked?.block, true);
+  assert.match(blocked?.reason ?? "", /could not run; refusing to add unreviewed comments: .*exit code 3/);
+});
+
+test("empty writes and edits need no review", async () => {
+  assert.equal(extractReviewCandidate({ toolName: "write", input: { path: "src/a.ts", content: "" } }), undefined);
+  assert.equal(extractReviewCandidate({ toolName: "edit", input: { path: "src/a.ts", edits: [] } }), undefined);
+
+  const empty = guard(CONFIDENT_REJECT, "exit 1");
+  assert.equal(await empty.write(""), undefined);
+  assert.equal(empty.jevCalls(), 0);
+});
 
 test("Jev decides only confident cases and defers the rest to the Pi reviewer", () => {
   const verdict = (documentsWhy: number, restatesCode = 0, unverifiedSuppression = 0) =>
     jevVerdict({ documentsWhy, restatesCode, unverifiedSuppression });
 
   assert.equal(verdict(0.9), "APPROVE");
+  assert.equal(verdict(0.6, 0.4, 0.2), "APPROVE");
+  assert.equal(verdict(0.59), undefined);
+  assert.equal(verdict(0.9, 0.41), undefined);
+  assert.equal(verdict(0.9, 0, 0.21), undefined);
   assert.equal(verdict(0.1), "REJECT");
-  assert.equal(verdict(0.9, 0.85), "REJECT");
+  assert.equal(verdict(0.2), "REJECT");
+  assert.equal(verdict(0.9, 0.8), "REJECT");
   assert.equal(verdict(0.9, 0, 0.8), "REJECT");
-  assert.equal(verdict(0.5), undefined);
-  assert.equal(verdict(0.9, 0.5), undefined);
 });
 
 test("sends new code comments to the reviewer", () => {

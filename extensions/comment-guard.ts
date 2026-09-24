@@ -374,7 +374,8 @@ export function jevVerdict(
   const { documentsWhy, restatesCode, unverifiedSuppression } = answers;
   if (restatesCode >= 0.8 || unverifiedSuppression >= 0.8 || documentsWhy <= 0.2)
     return "REJECT";
-  if (documentsWhy >= 0.8 && restatesCode <= 0.2 && unverifiedSuppression <= 0.2)
+  // Calibrated with `bench/jev-bench.ts comment-guard`; rerun it before changing.
+  if (documentsWhy >= 0.6 && restatesCode <= 0.4 && unverifiedSuppression <= 0.2)
     return "APPROVE";
   return undefined;
 }

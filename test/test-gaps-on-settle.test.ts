@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 
-const { isTestFile, sourceFilesFor, errorPaths, default: testGaps } = await import(
+const { isTestFile, sourceFilesFor, errorPaths, findGaps, default: testGaps } = await import(
   `../extensions/test-gaps-on-settle.ts?test=${Date.now()}`
 );
 
@@ -44,6 +44,8 @@ test("resolves the source files a test imports", () => {
   assert.deepEqual(py, [join(root, "pkg/mod.py"), join(root, "src/svc/api.py")]);
 
   assert.deepEqual(sourceFilesFor(join(root, "go/sum_test.go"), "package sum", root), [join(root, "go/sum.go")]);
+  assert.deepEqual(sourceFilesFor(join(root, "test/empty.test.ts"), "", root), []);
+  assert.deepEqual(sourceFilesFor(join(root, "tests/test_empty.py"), "", root), []);
 });
 
 test("extracts each distinct error path once", () => {
@@ -56,30 +58,50 @@ test("extracts each distinct error path once", () => {
       'the error path that throws or raises "not found"',
     ],
   );
+  assert.deepEqual(errorPaths(""), []);
+});
+
+function mockJev(answer: (instructions: string) => number) {
+  process.env.TYPESAFE_API_KEY = "test-key";
+  process.env.TYPESAFE_BASE_URL = "https://jev.test/api";
+  const asked: string[][] = [];
+  globalThis.fetch = (async (_url: string, init: RequestInit) => {
+    const { questions } = JSON.parse(init.body as string);
+    const entries = Object.entries(questions as Record<string, { instructions: string }>);
+    asked.push(entries.map(([, { instructions }]) => instructions));
+    return new Response(
+      JSON.stringify({
+        answers: Object.fromEntries(entries.map(([id, { instructions }]) => [id, { type: "noul", noul: answer(instructions) }])),
+      }),
+    );
+  }) as typeof fetch;
+  return asked;
+}
+
+test("reports a case when its assertion score is at most 0.4", async () => {
+  const asked = mockJev((instructions) =>
+    instructions.startsWith("This case is relevant")
+      ? /empty input|malformed/.test(instructions) ? 0.9 : 0.1
+      : /empty input/.test(instructions) ? 0.4 : /malformed/.test(instructions) ? 0.41 : 0.95,
+  );
+
+  const gaps = await findGaps({ "a.ts": "export const f = (s: string) => s;" }, "test");
+
+  assert.deepEqual(gaps, ["empty input (empty string, list, map, or object)"]);
+  assert.ok(asked[1].every((q) => q.includes("contains an assertion")), "coverage asks about assertions");
+});
+
+test("skips the coverage request when no case is relevant", async () => {
+  const asked = mockJev(() => 0.1);
+  assert.deepEqual(await findGaps({ "a.ts": "export const f = () => 1;" }, "test"), []);
+  assert.equal(asked.length, 1);
 });
 
 function setup(files: Record<string, string>, fetchImpl?: typeof fetch) {
-  process.env.TYPESAFE_API_KEY = "test-key";
-  process.env.TYPESAFE_BASE_URL = "https://jev.test/api";
-  let calls = 0;
-  globalThis.fetch =
-    fetchImpl ??
-    ((async (_url: string, init: RequestInit) => {
-      calls += 1;
-      const { questions } = JSON.parse(init.body as string);
-      const answers = Object.fromEntries(
-        Object.entries(questions as Record<string, { instructions: string }>).map(([id, { instructions }]) => {
-          const relevance = instructions.startsWith("This case is relevant");
-          const noul = /happy path/.test(instructions)
-            ? 0.95
-            : relevance
-              ? /empty input/.test(instructions) ? 0.9 : 0.1
-              : 0.05;
-          return [id, { type: "noul", noul }];
-        }),
-      );
-      return new Response(JSON.stringify({ answers }));
-    }) as typeof fetch);
+  const asked = mockJev((i) =>
+    /happy path/.test(i) ? 0.95 : i.startsWith("This case is relevant") ? (/empty input/.test(i) ? 0.9 : 0.1) : 0.05,
+  );
+  if (fetchImpl) globalThis.fetch = fetchImpl;
   const root = project(files);
   const sent: [string, unknown][] = [];
   const handlers: Record<string, (event?: unknown, ctx?: unknown) => unknown> = {};
@@ -90,7 +112,7 @@ function setup(files: Record<string, string>, fetchImpl?: typeof fetch) {
     sendUserMessage: (text: string, options: unknown) => sent.push([text, options]),
   });
   const touch = (path: string, toolName = "write") => handlers.tool_call({ toolName, input: { path } }, { cwd: root });
-  return { root, sent, handlers, touch, calls: () => calls };
+  return { root, sent, handlers, touch, calls: () => asked.length };
 }
 
 const files = {
@@ -124,6 +146,8 @@ test("ignores non-test edits and stays silent when Jev fails", async () => {
   const quiet = setup(files);
   quiet.touch("src/age.ts");
   quiet.handlers.tool_call({ toolName: "read", input: { path: "test/age.test.ts" } }, { cwd: quiet.root });
+  for (const input of [undefined, {}, { path: null }, { path: 42 }])
+    quiet.handlers.tool_call({ toolName: "write", input }, { cwd: quiet.root });
   await quiet.handlers.agent_settled();
   assert.deepEqual(quiet.sent, []);
   assert.equal(quiet.calls(), 0);

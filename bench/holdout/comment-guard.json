@@ -1,0 +1,19 @@
+[
+  { "id": "firefox-blur", "category": "why", "expected": "APPROVE", "path": "src/Search.tsx", "change": ["// Firefox fires blur before click when Enter is pressed, so submit on keydown instead", "<input onKeyDown={(e) => e.key === \"Enter\" && submit()} />"] },
+  { "id": "boto3-threads", "category": "why", "expected": "APPROVE", "path": "app/upload.py", "change": ["# boto3 clients are not thread-safe; create one per worker thread", "client = session.client(\"s3\")"] },
+  { "id": "http-timeout", "category": "why", "expected": "APPROVE", "path": "client/http.go", "change": ["// http.DefaultClient has no timeout; a hung upstream would block this goroutine forever", "client := &http.Client{Timeout: 10 * time.Second}"] },
+  { "id": "not-valid-constraint", "category": "why", "expected": "APPROVE", "path": "db/migrations/012.sql", "change": ["-- NOT VALID skips scanning the 200M existing rows; VALIDATE runs later off-peak", "ALTER TABLE events ADD CONSTRAINT events_user_fk FOREIGN KEY (user_id) REFERENCES users (id) NOT VALID;"] },
+  { "id": "pipefail", "category": "why", "expected": "APPROVE", "path": "scripts/fetch.sh", "change": ["# pipefail so a failing curl is not hidden by a successful jq", "set -euo pipefail"] },
+  { "id": "utc-midnight", "category": "why", "expected": "APPROVE", "path": "src/dates.ts", "change": ["// API dates are UTC midnight; parsing them as local time shifts them a day back in the Americas", "const date = new Date(value + \"T00:00:00Z\");"] },
+  { "id": "predestroy-order", "category": "why", "expected": "APPROVE", "path": "src/Flusher.java", "change": ["// Must run before the Spring context closes; afterwards the datasource is already shut down", "@PreDestroy"] },
+  { "id": "ponytail-quadratic", "category": "why", "expected": "APPROVE", "path": "app/dedupe.py", "change": ["# ponytail: O(n^2) scan, index by email if lists grow past a few thousand rows", "pairs = [(a, b) for a in rows for b in rows if a.email == b.email and a is not b]"] },
+
+  { "id": "check-user-exists", "category": "restate", "expected": "REJECT", "path": "src/auth.ts", "change": ["// check if user exists", "if (user) {"] },
+  { "id": "init-variables", "category": "restate", "expected": "REJECT", "path": "app/report.py", "change": ["# initialize variables", "total = 0", "count = 0"] },
+  { "id": "handle-error", "category": "restate", "expected": "REJECT", "path": "cmd/serve.go", "change": ["// Handle error", "if err != nil {", "\treturn err", "}"] },
+  { "id": "jsdoc-constructor", "category": "restating-doc", "expected": "REJECT", "path": "src/orders.ts", "change": ["/** Constructor */", "constructor(private repo: OrderRepository) {}"] },
+  { "id": "bare-todo", "category": "todo", "expected": "REJECT", "path": "src/export.ts", "change": ["// TODO", "const csv = rows.map((r) => r.join(\",\")).join(\"\\n\");"] },
+  { "id": "old-implementation", "category": "commented-code", "expected": "REJECT", "path": "app/stats.py", "change": ["# return legacy_sum(xs)", "return sum(xs)"] },
+  { "id": "eslint-any", "category": "suppression", "expected": "REJECT", "path": "src/api.ts", "change": ["const data: any = res; // eslint-disable-line @typescript-eslint/no-explicit-any"] },
+  { "id": "noqa-unused", "category": "suppression", "expected": "REJECT", "path": "app/__init__.py", "change": ["import requests  # noqa: F401"] }
+]

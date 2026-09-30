@@ -352,6 +352,8 @@ function executableIndex(tokens: string[]): number | undefined {
 
 type ShellInvocation = { tokens: string[]; executableIndex: number };
 
+const commandName = (token: string) => token.split("/").at(-1)?.toLowerCase();
+
 function substitutionBodies(command: string): string[] {
   const bodies: string[] = [];
   let quote: "'" | '"' | undefined;
@@ -373,7 +375,7 @@ function substitutionBodies(command: string): string[] {
     } else if (character === "`") {
       const close = command.indexOf("`", i + 1);
       const body = command.slice(i + 1, close === -1 ? undefined : close);
-      bodies.push(body, ...substitutionBodies(body));
+      bodies.push(body);
       if (close === -1) break;
       i = close;
     }
@@ -381,26 +383,42 @@ function substitutionBodies(command: string): string[] {
   return bodies;
 }
 
-/** The command plus each `$(...)` / backtick body, tokenized separately so an unclosed quote in one cannot swallow the next. */
+/** The script string of each `sh|bash|zsh -c '<script>'` in the command. */
+function shellScriptBodies(command: string): string[] {
+  return shellCommandSegments(splitShellWords(command)).flatMap((tokens) => {
+    const index = executableIndex(tokens);
+    if (index === undefined) return [];
+    if (!["sh", "bash", "zsh", "dash", "ksh"].includes(commandName(tokens[index]) ?? "")) return [];
+    const flag = tokens.findIndex((t, i) => i > index && /^-[A-Za-z]*c[A-Za-z]*$/.test(t));
+    return flag === -1 || flag + 1 >= tokens.length ? [] : [tokens[flag + 1]];
+  });
+}
+
+function nestedBodies(command: string): string[] {
+  return [...substitutionBodies(command), ...shellScriptBodies(command)].flatMap(
+    (body) => [body, ...nestedBodies(body)],
+  );
+}
+
+/** The command plus every nested `$(...)`, backtick or `sh -c` body, tokenized separately so an unclosed quote in one cannot swallow the next. */
 function shellTokenLists(command: string): string[][] {
-  return [command, ...substitutionBodies(command)].map(splitShellWords);
+  return [command, ...nestedBodies(command)].map(splitShellWords);
 }
 
 function shellInvocations(
   command: string,
   executable: string,
 ): ShellInvocation[] {
-  const nameOf = (token: string) => token.split("/").at(-1)?.toLowerCase();
   return shellTokenLists(command)
     .flatMap(shellCommandSegments)
     .flatMap((tokens) => {
     const index = executableIndex(tokens);
     if (index === undefined) return [];
-    const name = nameOf(tokens[index]);
+    const name = commandName(tokens[index]);
     if (name === executable) return [{ tokens, executableIndex: index }];
     if (name !== "xargs" && name !== "find") return [];
     return tokens.flatMap((token, i) =>
-      i > index && nameOf(token) === executable
+      i > index && commandName(token) === executable
         ? [{ tokens, executableIndex: i }]
         : [],
     );
@@ -519,6 +537,7 @@ export function guardedGitTargets(command: string, cwd: string): GitTargets {
   const targets = new Set<string>();
   let state = new Set([cwd]);
   let chainStart = state;
+  let direct = 0;
 
   for (const { words: segment, separator } of parts) {
     const index = executableIndex(segment);
@@ -540,6 +559,7 @@ export function guardedGitTargets(command: string, cwd: string): GitTargets {
         const dirs = gitTargetDirs(segment, index, state);
         if (typeof dirs === "string") return { unresolved: dirs };
         for (const dir of dirs) targets.add(dir);
+        direct += 1;
       }
     }
 
@@ -549,6 +569,12 @@ export function guardedGitTargets(command: string, cwd: string): GitTargets {
       state = new Set([...chainStart, ...next]);
       chainStart = state;
     }
+  }
+  const guarded = shellInvocations(command, "git").filter((invocation) =>
+    GUARDED_SUBCOMMANDS.includes(gitSubcommand(invocation) ?? ""),
+  );
+  if (guarded.length !== direct) {
+    return { unresolved: "git runs inside a nested shell, substitution, xargs or find" };
   }
   return { dirs: [...targets] };
 }
@@ -914,8 +940,13 @@ function isGitPushRuntimeCode(code: string): boolean {
 }
 
 function isGitPush(command: string): boolean {
-  return /(?:^|[;&|()]|\s)git(?:\s+-[^\s]+(?:\s+[^\s]+)?)*\s+push(?:\s|$)/i.test(
-    command,
+  return (
+    shellInvocations(command, "git").some(
+      (invocation) => gitSubcommand(invocation) === "push",
+    ) ||
+    /(?:^|[;&|()]|\s)git(?:\s+-[^\s]+(?:\s+[^\s]+)?)*\s+push(?:\s|$)/i.test(
+      command,
+    )
   );
 }
 

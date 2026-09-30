@@ -36,6 +36,8 @@ const {
     githubWriteAction,
     guardedGitAction,
     guardedGitRuntimeAction,
+    guardedGitTargets,
+    hasGhAuthSwitchCommand,
 } = await import(`../extensions/github-write-confirm.ts?test=${Date.now()}`);
 
 test.after(() => rmSync(configDir, { recursive: true, force: true }));
@@ -268,6 +270,31 @@ test("sees gh launched through xargs, find -exec and command substitution", asyn
         assert.equal(allowed.result, undefined, command);
         assert.equal(allowed.confirms, 0, command);
     }
+});
+
+test("sees commands inside sh -c, wrapped or nested", async () => {
+    for (const command of [
+        'bash -c "gh pr merge 1"',
+        "zsh -lc 'gh pr merge 1'",
+        'sudo -u root env X=1 sh -c "gh pr merge 1"',
+        'bash -c "bash -c \\"gh pr merge 1\\""',
+        'bash -c "git push origin main"',
+    ]) {
+        const rejected = await createGate({ confirmed: false }).run({
+            toolName: "bash",
+            input: { command },
+        });
+        assert.equal(rejected.confirms, 1, command);
+    }
+
+    for (const command of ['bash -c "gh pr view 1 --repo a/b"', 'bash -c "echo hi"', "bash script.sh"]) {
+        const allowed = await createGate().run({ toolName: "bash", input: { command } });
+        assert.equal(allowed.confirms, 0, command);
+    }
+
+    assert.ok(hasGhAuthSwitchCommand('bash -c "gh auth switch -u x && git push"'));
+    assert.ok("unresolved" in guardedGitTargets('bash -c "cd /other && git push"', "/repo"));
+    assert.deepEqual(guardedGitTargets("git push", "/repo"), { dirs: ["/repo"] });
 });
 
 test("reads substitutions that are unterminated, over-closed or empty", async () => {

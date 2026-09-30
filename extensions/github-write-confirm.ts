@@ -352,15 +352,58 @@ function executableIndex(tokens: string[]): number | undefined {
 
 type ShellInvocation = { tokens: string[]; executableIndex: number };
 
+function substitutionBodies(command: string): string[] {
+  const bodies: string[] = [];
+  let quote: "'" | '"' | undefined;
+  for (let i = 0; i < command.length; i += 1) {
+    const character = command[i];
+    if (character === "\\") i += 1;
+    else if (quote === "'") {
+      if (character === "'") quote = undefined;
+    } else if (character === "'" && !quote) quote = "'";
+    else if (character === '"') quote = quote ? undefined : '"';
+    else if (character === "$" && command[i + 1] === "(") {
+      let depth = 1;
+      let end = i + 2;
+      for (; end < command.length && depth > 0; end += 1) {
+        if (command[end] === "(") depth += 1;
+        else if (command[end] === ")") depth -= 1;
+      }
+      bodies.push(command.slice(i + 2, depth === 0 ? end - 1 : end));
+    } else if (character === "`") {
+      const close = command.indexOf("`", i + 1);
+      const body = command.slice(i + 1, close === -1 ? undefined : close);
+      bodies.push(body, ...substitutionBodies(body));
+      if (close === -1) break;
+      i = close;
+    }
+  }
+  return bodies;
+}
+
+/** The command plus each `$(...)` / backtick body, tokenized separately so an unclosed quote in one cannot swallow the next. */
+function shellTokenLists(command: string): string[][] {
+  return [command, ...substitutionBodies(command)].map(splitShellWords);
+}
+
 function shellInvocations(
   command: string,
   executable: string,
 ): ShellInvocation[] {
-  return shellCommandSegments(splitShellWords(command)).flatMap((tokens) => {
+  const nameOf = (token: string) => token.split("/").at(-1)?.toLowerCase();
+  return shellTokenLists(command)
+    .flatMap(shellCommandSegments)
+    .flatMap((tokens) => {
     const index = executableIndex(tokens);
     if (index === undefined) return [];
-    const name = tokens[index].split("/").at(-1)?.toLowerCase();
-    return name === executable ? [{ tokens, executableIndex: index }] : [];
+    const name = nameOf(tokens[index]);
+    if (name === executable) return [{ tokens, executableIndex: index }];
+    if (name !== "xargs" && name !== "find") return [];
+    return tokens.flatMap((token, i) =>
+      i > index && nameOf(token) === executable
+        ? [{ tokens, executableIndex: i }]
+        : [],
+    );
   });
 }
 
@@ -695,7 +738,7 @@ function isReadOnlyGhInvocation(invocation: ShellInvocation): boolean {
 
 function isReadOnlyGhCommand(command: string): boolean {
   const invocations = shellInvocations(command, "gh");
-  const ghTokens = splitShellWords(command).filter((token) =>
+  const ghTokens = shellTokenLists(command).flat().filter((token) =>
     /(?:^|\/)gh(?:\.exe)?$/i.test(token),
   );
   return (

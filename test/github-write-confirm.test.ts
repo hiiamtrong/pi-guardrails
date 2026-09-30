@@ -242,6 +242,76 @@ test("reads every gh call after a ${var} expansion in a compound command", async
     }
 });
 
+test("sees gh launched through xargs, find -exec and command substitution", async () => {
+    for (const command of [
+        "find . -exec gh pr merge {} \\;",
+        "echo 1 | xargs -I{} gh pr merge {}",
+        'echo "$(gh pr merge 1)"',
+        "echo `gh pr merge 1`",
+        'echo "a $(echo $(gh pr merge 1))"',
+        "xargs curl -X POST https://api.github.com/repos/a/b/merges",
+    ]) {
+        const rejected = await createGate({ confirmed: false }).run({
+            toolName: "bash",
+            input: { command },
+        });
+        assert.equal(rejected.confirms, 1, command);
+    }
+
+    for (const command of [
+        'echo "account: $(gh api user --jq .login)"',
+        "echo 1 | xargs -I{} gh pr view {} --repo a/b",
+        "find . -name gh",
+        "echo '$(gh pr merge 1)'",
+    ]) {
+        const allowed = await createGate().run({ toolName: "bash", input: { command } });
+        assert.equal(allowed.result, undefined, command);
+        assert.equal(allowed.confirms, 0, command);
+    }
+});
+
+test("reads substitutions that are unterminated, over-closed or empty", async () => {
+    for (const command of [
+        'echo "$(gh pr merge 1',
+        'echo "$(gh pr merge 1))"',
+        "echo `gh pr merge 1",
+    ]) {
+        const rejected = await createGate({ confirmed: false }).run({
+            toolName: "bash",
+            input: { command },
+        });
+        assert.equal(rejected.confirms, 1, command);
+    }
+
+    for (const command of ['echo "$()"', "echo ``"]) {
+        const allowed = await createGate().run({ toolName: "bash", input: { command } });
+        assert.equal(allowed.confirms, 0, command);
+    }
+});
+
+test("does not allow a write when the confirmation dialog fails", async () => {
+    let handler: ToolHandler | undefined;
+    extension({
+        on(_event: "tool_call", callback: ToolHandler) {
+            handler = callback;
+        },
+    });
+    await assert.rejects(
+        handler!(
+            { toolName: "bash", input: { command: "gh pr merge 12" } },
+            {
+                hasUI: true,
+                ui: {
+                    async confirm() {
+                        throw new Error("dialog closed");
+                    },
+                },
+            },
+        ),
+        /dialog closed/,
+    );
+});
+
 test("ignores empty, separator-only and missing bash commands", async () => {
     const gate = createGate();
     for (const input of [{ command: "" }, { command: "}\n" }, { command: "{ }" }, {}]) {

@@ -1,7 +1,7 @@
 import { execFile } from "node:child_process";
 import { readFileSync, statSync } from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 
 type ToolInput = Record<string, unknown> & {
   command?: unknown;
@@ -394,14 +394,120 @@ function gitSubcommand(invocation: ShellInvocation): string | undefined {
   return undefined;
 }
 
+const GUARDED_SUBCOMMANDS = ["commit", "push"];
+
 export function guardedGitAction(command: string): string | undefined {
   for (const invocation of shellInvocations(command, "git")) {
     const subcommand = gitSubcommand(invocation);
-    if (subcommand && ["commit", "push"].includes(subcommand)) {
+    if (subcommand && GUARDED_SUBCOMMANDS.includes(subcommand)) {
       return `git ${subcommand}`;
     }
   }
   return undefined;
+}
+
+export type GitTargets = { dirs: string[] } | { unresolved: string };
+
+const SEQUENCE_SEPARATOR = /^(?:[;\n]+|&&|\|\|)$/;
+
+function resolveDirectory(base: string, raw: string): string | undefined {
+  if (/[$`*?\[]/.test(raw) || raw === "-" || /^~[^/]/.test(raw)) {
+    return undefined;
+  }
+  if (raw === "~" || raw.startsWith("~/")) return resolve(homedir(), raw.slice(2));
+  return resolve(base, raw);
+}
+
+function gitTargetDirs(
+  words: string[],
+  index: number,
+  bases: Set<string>,
+): string[] | string {
+  for (const word of words.slice(0, index)) {
+    if (/^(GIT_DIR|GIT_WORK_TREE)=/.test(word)) return "GIT_DIR or GIT_WORK_TREE is set";
+    if (word === "-C" || word.startsWith("--chdir")) return "a wrapper changes the directory";
+  }
+  let dirs = [...bases];
+  for (let i = index + 1; i < words.length; i += 1) {
+    const word = words[i];
+    if (word.startsWith("--git-dir") || word.startsWith("--work-tree")) {
+      return "--git-dir or --work-tree is used";
+    }
+    if (word === "-C") {
+      const next = words[i + 1];
+      const resolved = next === undefined ? [] : dirs.map((d) => resolveDirectory(d, next));
+      if (resolved.length === 0 || resolved.includes(undefined)) {
+        return `cannot resolve the path after -C (${next ?? "missing"})`;
+      }
+      dirs = resolved as string[];
+      i += 1;
+    } else if (["-c", "--config-env", "--namespace"].includes(word)) {
+      i += 1;
+    } else if (!word.startsWith("-")) {
+      break;
+    }
+  }
+  return dirs;
+}
+
+/**
+ * The directories a guarded git command (commit/push) may really run in.
+ * Follows leading `cd <path> &&` and `git -C <path>`; anything it cannot
+ * resolve statically is reported as unresolved so the caller refuses it
+ * instead of guessing. After `;`, `||` or a newline the previous directory
+ * stays possible, because a failed `cd` does not stop the next command.
+ */
+export function guardedGitTargets(command: string, cwd: string): GitTargets {
+  const parts: { words: string[]; separator?: string }[] = [];
+  let words: string[] = [];
+  for (const token of splitShellWords(command)) {
+    if ([...token].every((c) => ";&|()\n{}".includes(c))) {
+      parts.push({ words, separator: token });
+      words = [];
+    } else {
+      words.push(token);
+    }
+  }
+  parts.push({ words });
+
+  const complex = parts.some(
+    ({ separator }) => separator !== undefined && !SEQUENCE_SEPARATOR.test(separator),
+  );
+  const targets = new Set<string>();
+  let state = new Set([cwd]);
+  let chainStart = state;
+
+  for (const { words: segment, separator } of parts) {
+    const index = executableIndex(segment);
+    const name = index === undefined ? undefined : segment[index].split("/").at(-1)?.toLowerCase();
+    let next = state;
+
+    if (index !== undefined && (name === "pushd" || name === "popd")) {
+      return { unresolved: `${name} is not supported` };
+    }
+    if (index !== undefined && name === "cd") {
+      if (complex) return { unresolved: "cd inside a pipeline, subshell or group" };
+      const raw = segment.slice(index + 1).find((w) => !["-L", "-P", "-e", "-@", "--"].includes(w)) ?? "~";
+      const resolved = [...state].map((d) => resolveDirectory(d, raw));
+      if (resolved.includes(undefined)) return { unresolved: `cannot resolve cd ${raw}` };
+      next = new Set(resolved as string[]);
+    } else if (index !== undefined && name === "git") {
+      const subcommand = gitSubcommand({ tokens: segment, executableIndex: index });
+      if (subcommand && GUARDED_SUBCOMMANDS.includes(subcommand)) {
+        const dirs = gitTargetDirs(segment, index, state);
+        if (typeof dirs === "string") return { unresolved: dirs };
+        for (const dir of dirs) targets.add(dir);
+      }
+    }
+
+    if (separator === "&&") {
+      state = next;
+    } else {
+      state = new Set([...chainStart, ...next]);
+      chainStart = state;
+    }
+  }
+  return { dirs: [...targets] };
 }
 
 export function isGuardedGitCommand(command: string): boolean {

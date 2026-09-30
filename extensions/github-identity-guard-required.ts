@@ -6,6 +6,7 @@ import {
   githubWriteReason,
   guardedGitAction,
   guardedGitRuntimeAction,
+  guardedGitTargets,
   hasGhAuthSwitchCommand,
 } from "./github-write-confirm.ts";
 
@@ -154,19 +155,47 @@ export default function (pi: ExtensionApi): void {
 
     const cwd =
       typeof event.input?.cwd === "string" ? event.input.cwd : ctx.cwd;
-    const repo = repositoryPath(cwd);
-    if (!repo || !hasIdentityGuard(repo)) {
-      const kind = requiresGithubIdentity ? "GitHub write" : "Git write";
+    const shellCommands = isCtxBatch
+      ? commands
+      : typeof value === "string" &&
+          (toolName === "bash" || event.input?.language === "shell")
+        ? [value]
+        : [];
+    const targetDirs = new Set<string>();
+    let unresolved: string | undefined;
+    for (const command of requiresGitIdentity ? shellCommands : []) {
+      if (guardedGitAction(command) === undefined) continue;
+      const targets = guardedGitTargets(command, cwd);
+      if ("unresolved" in targets) unresolved ??= targets.unresolved;
+      else targets.dirs.forEach((dir) => targetDirs.add(dir));
+    }
+    if (targetDirs.size === 0) targetDirs.add(cwd);
+    const kind = requiresGithubIdentity ? "GitHub write" : "Git write";
+    if (unresolved) {
       return {
         block: true,
-        reason: `${kind} blocked. Action: ${action}. Install Git Identity Guard for this repository before continuing.`,
+        reason: `${kind} blocked. Action: ${action}. Cannot tell which repository this command targets (${unresolved}). Use a literal path (cd <path> && ..., git -C <path> ...) or set the tool's cwd.`,
       };
     }
-    if (requiresGithubIdentity && !githubIdentityMatches(repo)) {
-      return {
-        block: true,
-        reason: `GitHub write blocked. Action: ${action}. The authenticated gh account does not match identity.guard.user.`,
-      };
+    const pushOnly = githubReason?.startsWith("git push") === true;
+    const dirs = [
+      ...(requiresGitIdentity ? targetDirs : []),
+      ...(requiresGithubIdentity && !pushOnly ? [cwd] : []),
+    ];
+    for (const dir of dirs) {
+      const repo = repositoryPath(dir);
+      if (!repo || !hasIdentityGuard(repo)) {
+        return {
+          block: true,
+          reason: `${kind} blocked. Action: ${action}. Install Git Identity Guard for this repository before continuing.`,
+        };
+      }
+      if (requiresGithubIdentity && !githubIdentityMatches(repo)) {
+        return {
+          block: true,
+          reason: `GitHub write blocked. Action: ${action}. The authenticated gh account does not match identity.guard.user.`,
+        };
+      }
     }
     return undefined;
   });

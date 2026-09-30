@@ -230,9 +230,8 @@ function shellCommandSegments(tokens: string[]): string[][] {
   let segment: string[] = [];
   for (const token of tokens) {
     if (
-      token === "{" ||
-      token === "}" ||
-      [...token].every((character) => ";&|()\n".includes(character))
+      token !== "{}" &&
+      [...token].every((character) => ";&|(){}\n".includes(character))
     ) {
       if (segment.length > 0) segments.push(segment);
       segment = [];

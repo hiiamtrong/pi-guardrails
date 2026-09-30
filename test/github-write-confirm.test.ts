@@ -214,6 +214,43 @@ test("permits GitHub API GET requests with output formatting", async () => {
     }
 });
 
+test("reads every gh call after a ${var} expansion in a compound command", async () => {
+    const reviewLoop = [
+        "for pair in 1:aa 2:bb; do",
+        "  n=${pair%%:*}; reviewed=${pair#*:}",
+        "  gh pr view $n --repo a/b --json state",
+        "  gh api repos/a/b/pulls/$n/comments --jq '.[] | .id'",
+        "done",
+    ].join("\n");
+    const allowed = await createGate().run({
+        toolName: "bash",
+        input: { command: reviewLoop },
+    });
+    assert.equal(allowed.result, undefined);
+    assert.equal(allowed.confirms, 0);
+
+    for (const command of [
+        reviewLoop.replace("gh pr view $n", "gh pr merge $n"),
+        "x=${y#*:}\ngh pr merge 12",
+        "{ echo hi; }\ngh pr merge 12",
+    ]) {
+        const rejected = await createGate({ confirmed: false }).run({
+            toolName: "bash",
+            input: { command },
+        });
+        assert.equal(rejected.confirms, 1, command);
+    }
+});
+
+test("ignores empty, separator-only and missing bash commands", async () => {
+    const gate = createGate();
+    for (const input of [{ command: "" }, { command: "}\n" }, { command: "{ }" }, {}]) {
+        const { result, confirms } = await gate.run({ toolName: "bash", input });
+        assert.equal(result, undefined, JSON.stringify(input));
+        assert.equal(confirms, 0);
+    }
+});
+
 test("confirms GitHub writes and blocks them without UI", async () => {
     for (const command of [
         "gh pr merge 12 --merge",

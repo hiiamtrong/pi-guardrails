@@ -72,7 +72,7 @@ export function relevantSource(source: string, tests: string, keepDefault = fals
       chunks.push({
         name: declared?.[1] ?? declared?.[2],
         isDefault: /^export\s+default\b/.test(line),
-        head: [...header, line].join("\n"),
+        head: [...header.filter((comment) => /^@/.test(comment)), line].join("\n"),
         text: [...header, line].join("\n"),
       });
       header = [];
@@ -83,8 +83,8 @@ export function relevantSource(source: string, tests: string, keepDefault = fals
   const testWords = words(tests);
   const named = new Set(chunks.flatMap((chunk) => (chunk.name && testWords.has(chunk.name) ? [chunk.name] : [])));
   // Tests import a default export under any local name, and reach route handlers only through the
-  // object they register on (`app.get(...)`, `@app.route`), so also keep chunks whose opening line
-  // uses a named one. Only the opening line: bodies that merely read a shared constant stay out.
+  // object they register on (`app.get(...)`, `@app.route`), so also keep chunks whose decorators or
+  // declaration line use a named one. Bodies and doc comments that merely mention it stay out.
   const kept = new Set(
     chunks.filter((chunk) => (keepDefault && chunk.isDefault) || [...words(chunk.head)].some((word) => named.has(word))),
   );

@@ -135,6 +135,7 @@ test("detects which source file a test imports by default", () => {
   assert.equal(importsDefault(testPath, 'import { parseAge } from "../src/age.ts";', age), false);
   assert.equal(importsDefault(testPath, 'import assert from "node:assert/strict";', age), false);
   assert.equal(importsDefault(testPath, 'import other from "../src/other.ts";', age), false);
+  assert.equal(importsDefault(testPath, "", age), false);
 });
 
 test("keeps route handlers registered on an app the test uses", () => {
@@ -191,6 +192,10 @@ test("keeps a commented route but not other functions sharing a constant the tes
   const kept = relevantSource(limits, 'import { parseAge, MAX } from "../src/limits.ts";\nassert.throws(() => parseAge(String(MAX + 1)));');
   assert.deepEqual(errorPaths(kept), ['the error path that throws or raises "age is unrealistic"']);
 
+  const documented = limits.replace("export function parseHeight", "/** Same rules as parseAge, but for heights. */\nexport function parseHeight");
+  const keptDocumented = relevantSource(documented, 'import { parseAge } from "../src/limits.ts";\nparseAge("3");');
+  assert.deepEqual(errorPaths(keptDocumented), ['the error path that throws or raises "age is unrealistic"']);
+
   const routes = [
     "export const app = express();",
     "",
@@ -223,6 +228,7 @@ test("falls back to the whole source when the tests name nothing in it", () => {
   const source = "export default function () {\n  return 1;\n}";
   assert.equal(relevantSource(source, "import run from '../src/run.ts';\nrun();"), source);
   assert.equal(relevantSource("", "anything"), "");
+  assert.equal(relevantSource(source, ""), source);
 });
 
 test("extracts each distinct error path once", () => {

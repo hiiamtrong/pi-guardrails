@@ -53,7 +53,15 @@ export function sourceFilesFor(testPath: string, testCode: string, cwd: string):
 const DECLARATION =
   /^(?:export\s+)?(?:default\s+)?(?:declare\s+)?(?:abstract\s+)?(?:async\s+)?(?:function\*?|def|class|func(?:\s*\([^)]*\))?|const|let|var|type|interface|enum)\s+(\w+)|^(\w+)\s*(?::[^=]*)?=(?!=)/;
 
-export function relevantSource(source: string, tests: string): string {
+export function importsDefault(testPath: string, testCode: string, file: string): boolean {
+  const specs = [
+    ...testCode.matchAll(/import\s+\w+\s*(?:,\s*\{[^}]*\}\s*)?from\s+["'`](\.{1,2}\/[^"'`?$]+)/g),
+    ...testCode.matchAll(/\bdefault\s*:[^}]*\}\s*=\s*await\s+import\(\s*["'`](\.{1,2}\/[^"'`?$]+)/g),
+  ];
+  return specs.some(([, spec]) => JS_EXTENSIONS.some((ext) => resolve(dirname(testPath), spec + ext) === file));
+}
+
+export function relevantSource(source: string, tests: string, keepDefault = false): string {
   const chunks: { name?: string; isDefault: boolean; text: string }[] = [];
   let header: string[] = [];
   for (const line of source.split("\n")) {
@@ -72,8 +80,12 @@ export function relevantSource(source: string, tests: string): string {
 
   const words = (text: string) => new Set(text.match(/\w+/g));
   const testWords = words(tests);
-  // Tests import a default export under any local name, so its own name never matches.
-  const kept = new Set(chunks.filter((chunk) => chunk.isDefault || (chunk.name && testWords.has(chunk.name))));
+  const named = new Set(chunks.flatMap((chunk) => (chunk.name && testWords.has(chunk.name) ? [chunk.name] : [])));
+  // Tests import a default export under any local name, and reach route handlers only through the
+  // object they register on (`app.get(...)`, `@app.route`), so also keep chunks that use a named one.
+  const kept = new Set(
+    chunks.filter((chunk) => (keepDefault && chunk.isDefault) || [...words(chunk.text)].some((word) => named.has(word))),
+  );
   if (kept.size === 0) return source;
   for (let grew = true; grew; ) {
     grew = false;
@@ -145,7 +157,10 @@ export default function (pi: ExtensionAPI): void {
       if (!existsSync(testPath)) continue;
       const tests = readFileSync(testPath, "utf8");
       const sources = Object.fromEntries(
-        sourceFilesFor(testPath, tests, cwd).map((file) => [file, relevantSource(readFileSync(file, "utf8"), tests)]),
+        sourceFilesFor(testPath, tests, cwd).map((file) => [
+          file,
+          relevantSource(readFileSync(file, "utf8"), tests, importsDefault(testPath, tests, file)),
+        ]),
       );
       if (Object.keys(sources).length === 0) continue;
       let gaps: string[];

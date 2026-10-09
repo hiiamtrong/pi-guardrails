@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 
-const { isTestFile, sourceFilesFor, errorPaths, findGaps, relevantSource, default: testGaps } = await import(
+const { isTestFile, sourceFilesFor, errorPaths, findGaps, relevantSource, importsDefault, default: testGaps } = await import(
   `../extensions/test-gaps-on-settle.ts?test=${Date.now()}`
 );
 
@@ -92,7 +92,8 @@ test("keeps a default export imported under another name and abstract base class
     "  return Number(s);",
     "}",
   ].join("\n");
-  const kept = relevantSource(age, 'import parse, { MAX_AGE } from "../src/age.ts";\nassert.throws(() => parse(String(MAX_AGE + 1)));');
+  const tests = 'import parse, { MAX_AGE } from "../src/age.ts";\nassert.throws(() => parse(String(MAX_AGE + 1)));';
+  const kept = relevantSource(age, tests, true);
   assert.equal(kept, ["export const MAX_AGE = 150;", ...age.split("\n").slice(3)].join("\n"));
 
   const exporters = [
@@ -105,6 +106,72 @@ test("keeps a default export imported under another name and abstract base class
   const base = relevantSource(exporters, 'import { CsvExporter } from "../src/export.ts";\nnew CsvExporter().run();');
   assert.equal(base, exporters);
   assert.deepEqual(errorPaths(base), ['the error path that throws or raises "not implemented"']);
+});
+
+test("drops a default export the test does not import", () => {
+  const source = [
+    "export function parseAge(s: string) {",
+    "  return Number(s);",
+    "}",
+    "",
+    "export default function (pi: unknown) {",
+    '  throw new Error("handler failure");',
+    "}",
+  ].join("\n");
+  const tests = 'import { parseAge } from "../src/age.ts";';
+  assert.equal(relevantSource(source, tests), source.split("\n").slice(0, 4).join("\n"));
+  assert.equal(relevantSource(source, tests, true), source);
+});
+
+test("detects which source file a test imports by default", () => {
+  const testPath = "/repo/test/age.test.ts";
+  const age = "/repo/src/age.ts";
+  assert.equal(importsDefault(testPath, 'import parse from "../src/age.ts";', age), true);
+  assert.equal(importsDefault(testPath, 'import parse, { MAX_AGE } from "../src/age";', age), true);
+  assert.equal(
+    importsDefault(testPath, "const { parseAge, default: plugin } = await import(`../src/age.ts?test=${Date.now()}`);", age),
+    true,
+  );
+  assert.equal(importsDefault(testPath, 'import { parseAge } from "../src/age.ts";', age), false);
+  assert.equal(importsDefault(testPath, 'import assert from "node:assert/strict";', age), false);
+  assert.equal(importsDefault(testPath, 'import other from "../src/other.ts";', age), false);
+});
+
+test("keeps route handlers registered on an app the test uses", () => {
+  const express = [
+    'import express from "express";',
+    "",
+    "export const app = express();",
+    "",
+    'app.get("/users/:id", (req, res) => {',
+    '  if (!/^\\d+$/.test(req.params.id)) throw new Error("invalid id");',
+    "  res.json({});",
+    "});",
+    "",
+    "function unrelated() {",
+    '  throw new Error("unrelated failure");',
+    "}",
+  ].join("\n");
+  const keptExpress = relevantSource(
+    express,
+    'import request from "supertest";\nimport { app } from "../src/app.ts";\nawait request(app).get("/users/1").expect(200);',
+  );
+  assert.deepEqual(errorPaths(keptExpress), ['the error path that throws or raises "invalid id"']);
+
+  const flask = [
+    "from flask import Flask",
+    "",
+    "app = Flask(__name__)",
+    "",
+    "",
+    '@app.route("/users/<id>")',
+    "def get_user(id):",
+    "    if not id.isdigit():",
+    '        raise ValueError("invalid id")',
+    "    return {}",
+  ].join("\n");
+  const keptFlask = relevantSource(flask, "from app import app\n\ndef test_ok():\n    assert app.test_client().get('/users/1').status_code == 200");
+  assert.deepEqual(errorPaths(keptFlask), ['the error path that throws or raises "invalid id"']);
 });
 
 test("isolates the named function in a half-edited CRLF file", () => {

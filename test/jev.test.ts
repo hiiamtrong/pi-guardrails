@@ -1,4 +1,7 @@
 import assert from "node:assert/strict";
+import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import test from "node:test";
 
 const { askNoul } = await import(`../extensions/jev.ts?test=${Date.now()}`);
@@ -56,12 +59,46 @@ test("sends the pinned TYPESAFE_MODEL and falls back to jev-latest when it is bl
 
 test("rejects missing, non-numeric, or out-of-range answers instead of trusting them", async () => {
   process.env.TYPESAFE_API_KEY = "test-key";
-  for (const a of [undefined, { noul: null }, { noul: "0.1" }, { noul: 1.5 }, { noul: Number.NaN }]) {
+  for (const a of [undefined, { noul: null }, { noul: "0.1" }, { noul: 1.5 }, { noul: -0.01 }, { noul: Number.NaN }]) {
     mockFetch(200, { answers: { a } });
     await assert.rejects(askNoul("s", { a: "Is A" }), /invalid answer for a/);
   }
   mockFetch(200, {});
   await assert.rejects(askNoul("s", { a: "Is A" }), /invalid answer for a/);
+});
+
+test("accepts the probability bounds 0 and 1", async () => {
+  process.env.TYPESAFE_API_KEY = "test-key";
+  mockFetch(200, { answers: { a: { noul: 0 }, b: { noul: 1 } } });
+  assert.deepEqual(await askNoul("s", { a: "Is A", b: "Is B" }), { a: 0, b: 1 });
+});
+
+test("reads mcp-env.json without leaking its contents when it is broken", async (t) => {
+  const home = process.env.HOME;
+  const key = process.env.TYPESAFE_API_KEY;
+  t.after(() => {
+    process.env.HOME = home;
+    process.env.TYPESAFE_API_KEY = key;
+  });
+  delete process.env.TYPESAFE_API_KEY;
+  process.env.HOME = mkdtempSync(join(tmpdir(), "jev-home-"));
+  const file = join(process.env.HOME, ".pi/agent/mcp-env.json");
+
+  await assert.rejects(askNoul("s", { a: "Is A" }), { message: `Cannot read ${file}` });
+
+  mkdirSync(join(process.env.HOME, ".pi/agent"), { recursive: true });
+  writeFileSync(file, '{"TYPESAFE_API_KEY": "sk-secret-value",');
+  await assert.rejects(askNoul("s", { a: "Is A" }), (error: Error) => {
+    assert.equal(error.message, `Cannot read ${file}`);
+    assert.ok(!error.message.includes("sk-secret-value"));
+    return true;
+  });
+
+  writeFileSync(file, JSON.stringify({ TYPESAFE_API_KEY: "file-key", TYPESAFE_BASE_URL: "https://jev.test/file" }));
+  const calls = mockFetch(200, { answers: { a: { noul: 0.5 } } });
+  assert.deepEqual(await askNoul("s", { a: "Is A" }), { a: 0.5 });
+  assert.equal(calls[0].url, "https://jev.test/file/v1/systemone");
+  assert.equal((calls[0].init.headers as Record<string, string>).Authorization, "Bearer file-key");
 });
 
 test("throws on HTTP errors and on a blank API key", async () => {

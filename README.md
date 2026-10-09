@@ -91,7 +91,7 @@ When a TypeSafe key is configured (see [Jev decisions](#jev-decisions)), Jev sco
 3. Jev keeps the checklist cases relevant to the code (≥ 0.5); error paths are always kept.
 4. Jev scores whether the tests contain an **assertion** that checks the outcome for each case, so a test that calls the code but ignores the result does not count. Cases scoring ≤ 0.4 are reported.
 
-The report arrives as a `[test-gaps]` follow-up message listing the missing cases, so the agent adds those tests or states in one line why a case cannot happen. Each case is reported at most once per test file per session, so a case the agent rejects is not raised again.
+The report arrives as a `[test-gaps]` follow-up message listing the missing cases, so the agent adds those tests or states in one line why a case cannot happen. Each case is reported at most once per test file within 30 days, so a case the agent rejects is not raised again, even after `/reload` or in another session. Reported cases are kept in `~/.pi/agent/test-gaps-reported.json`; delete it to start over.
 
 Example: you ask "write tests for `parseAge` in `src/age.ts`" and the agent writes only `parseAge("30")`. When the turn ends, the extension reports the untested `"age is required"` / `"age is unrealistic"` errors, empty and malformed input, and values at and past the 150 limit.
 

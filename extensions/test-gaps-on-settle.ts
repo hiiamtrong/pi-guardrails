@@ -1,4 +1,5 @@
-import { existsSync, readFileSync, statSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, renameSync, statSync, writeFileSync } from "node:fs";
+import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { askNoul, MAX_STATE_CHARS } from "./jev.ts";
 
@@ -140,9 +141,29 @@ export async function findGaps(sources: Record<string, string>, tests: string): 
   return relevant.filter((_, i) => asserted[`c${i}`] <= 0.4);
 }
 
+const REPORTED_TTL_MS = 30 * 24 * 60 * 60 * 1000;
+const reportedFile = () => join(homedir(), ".pi/agent/test-gaps-reported.json");
+
+function loadReported(): Record<string, number> {
+  let reported: Record<string, number>;
+  try {
+    reported = JSON.parse(readFileSync(reportedFile(), "utf8"));
+  } catch {
+    return {};
+  }
+  const cutoff = Date.now() - REPORTED_TTL_MS;
+  return Object.fromEntries(Object.entries(reported).filter(([, at]) => at >= cutoff));
+}
+
+function saveReported(reported: Record<string, number>): void {
+  const file = reportedFile();
+  mkdirSync(dirname(file), { recursive: true });
+  writeFileSync(`${file}.tmp`, JSON.stringify(reported));
+  renameSync(`${file}.tmp`, file);
+}
+
 export default function (pi: ExtensionAPI): void {
   const touched = new Map<string, string>();
-  const reported = new Set<string>();
 
   pi.on("tool_call", (event, ctx) => {
     const { toolName, input } = event as ToolCallEvent;
@@ -155,6 +176,7 @@ export default function (pi: ExtensionAPI): void {
     const files = [...touched];
     touched.clear();
     const report: string[] = [];
+    const reported = loadReported();
     for (const [testPath, cwd] of files) {
       if (!existsSync(testPath)) continue;
       const tests = readFileSync(testPath, "utf8");
@@ -171,8 +193,8 @@ export default function (pi: ExtensionAPI): void {
       } catch {
         continue;
       }
-      const fresh = gaps.filter((gap) => !reported.has(`${testPath}\n${gap}`));
-      fresh.forEach((gap) => reported.add(`${testPath}\n${gap}`));
+      const fresh = gaps.filter((gap) => !(`${testPath}\n${gap}` in reported));
+      fresh.forEach((gap) => (reported[`${testPath}\n${gap}`] = Date.now()));
       if (fresh.length)
         report.push(`${testPath} (source: ${Object.keys(sources).join(", ")}):\n${fresh.map((g) => `- ${g}`).join("\n")}`);
     }
@@ -181,5 +203,6 @@ export default function (pi: ExtensionAPI): void {
       `[test-gaps] Jev found cases the tests do not cover yet:\n\n${report.join("\n\n")}\n\nAdd tests for the cases that apply to this code. For any case that cannot happen here, say why in one line instead of testing it.`,
       { deliverAs: "followUp" },
     );
+    saveReported(reported);
   });
 }

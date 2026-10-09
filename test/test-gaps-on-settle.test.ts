@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -285,17 +285,22 @@ function setup(files: Record<string, string>, fetchImpl?: typeof fetch) {
     /happy path/.test(i) ? 0.95 : i.startsWith("This case is relevant") ? (/empty input/.test(i) ? 0.9 : 0.1) : 0.05,
   );
   if (fetchImpl) globalThis.fetch = fetchImpl;
+  process.env.HOME = mkdtempSync(join(tmpdir(), "test-gaps-home-"));
   const root = project(files);
-  const sent: [string, unknown][] = [];
-  const handlers: Record<string, (event?: unknown, ctx?: unknown) => unknown> = {};
-  testGaps({
-    on: (event: string, handler: (event?: unknown, ctx?: unknown) => unknown) => {
-      handlers[event] = handler;
-    },
-    sendUserMessage: (text: string, options: unknown) => sent.push([text, options]),
-  });
-  const touch = (path: string, toolName = "write") => handlers.tool_call({ toolName, input: { path } }, { cwd: root });
-  return { root, sent, handlers, touch, calls: () => asked.length };
+  const load = () => {
+    const sent: [string, unknown][] = [];
+    const handlers: Record<string, (event?: unknown, ctx?: unknown) => unknown> = {};
+    testGaps({
+      on: (event: string, handler: (event?: unknown, ctx?: unknown) => unknown) => {
+        handlers[event] = handler;
+      },
+      sendUserMessage: (text: string, options: unknown) => sent.push([text, options]),
+    });
+    const touch = (path: string, toolName = "write") => handlers.tool_call({ toolName, input: { path } }, { cwd: root });
+    return { sent, handlers, touch };
+  };
+  const reportedFile = join(process.env.HOME, ".pi/agent/test-gaps-reported.json");
+  return { root, ...load(), reload: load, reportedFile, calls: () => asked.length };
 }
 
 const files = {
@@ -336,6 +341,36 @@ test("reports untested relevant cases once after a test file is written", async 
   touch("test/age.test.ts", "edit");
   await handlers.agent_settled();
   assert.equal(sent.length, 1, "the same gaps are never reported twice");
+});
+
+test("remembers reported gaps across a reload", async () => {
+  const first = setup(files);
+  first.touch("test/age.test.ts");
+  await first.handlers.agent_settled();
+  assert.equal(first.sent.length, 1);
+
+  const reloaded = first.reload();
+  reloaded.touch("test/age.test.ts");
+  await reloaded.handlers.agent_settled();
+  assert.deepEqual(reloaded.sent, []);
+});
+
+test("reports again after 30 days and survives a corrupt state file", async () => {
+  const state = setup(files);
+  mkdirSync(join(state.reportedFile, ".."), { recursive: true });
+  writeFileSync(state.reportedFile, "{not json");
+  state.touch("test/age.test.ts");
+  await state.handlers.agent_settled();
+  assert.equal(state.sent.length, 1);
+
+  const stamps = JSON.parse(readFileSync(state.reportedFile, "utf8"));
+  const old = Date.now() - 31 * 24 * 60 * 60 * 1000;
+  writeFileSync(state.reportedFile, JSON.stringify(Object.fromEntries(Object.keys(stamps).map((key) => [key, old]))));
+  const reloaded = state.reload();
+  reloaded.touch("test/age.test.ts");
+  await reloaded.handlers.agent_settled();
+  assert.equal(reloaded.sent.length, 1, "gaps reported over 30 days ago are reported again");
+  assert.ok(Object.values(JSON.parse(readFileSync(state.reportedFile, "utf8"))).every((at) => (at as number) > old));
 });
 
 test("ignores non-test edits and stays silent when Jev fails", async () => {

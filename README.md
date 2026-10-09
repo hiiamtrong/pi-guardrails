@@ -86,7 +86,7 @@ When a TypeSafe key is configured (see [Jev decisions](#jev-decisions)), Jev sco
 
 `test-gaps-on-settle` runs after any turn in which the agent writes or edits a test file, whether you asked for tests or the agent added them on its own. You do not need to invoke it.
 
-1. It finds the code under test from the test file: relative imports for JS/TS, imported modules under the repository root or `src/` for Python, and `foo.go` for `foo_test.go`.
+1. It finds the code under test from the test file: relative imports for JS/TS, imported modules under the repository root or `src/` for Python, and `foo.go` for `foo_test.go`. From each source file it keeps only the top-level declarations the test names, any `export default`, and the declarations those use; if the test names nothing in the file, the whole file is kept. Large files otherwise drown the decision in unrelated code and report other functions' error paths as gaps.
 2. It builds candidate cases: every `throw`/`raise`/`errors.New`/`fmt.Errorf` message in that code, plus a fixed checklist (happy path, empty input, null/None, values at and just past a limit, zero or negative numbers, malformed input, failing dependencies, duplicates).
 3. Jev keeps the checklist cases relevant to the code (≥ 0.5); error paths are always kept.
 4. Jev scores whether the tests contain an **assertion** that checks the outcome for each case, so a test that calls the code but ignores the result does not count. Cases scoring ≤ 0.4 are reported.
@@ -95,11 +95,13 @@ The report arrives as a `[test-gaps]` follow-up message listing the missing case
 
 Example: you ask "write tests for `parseAge` in `src/age.ts`" and the agent writes only `parseAge("30")`. When the turn ends, the extension reports the untested `"age is required"` / `"age is unrealistic"` errors, empty and malformed input, and values at and past the 150 limit.
 
-Recognized test files: `*.test.*`, `*.spec.*` (JS/TS), `test_*.py`, `*_test.py`, and `*_test.go`. Test files whose code under test cannot be resolved, or whose source and tests exceed 60,000 characters, are skipped silently, as is the whole check when Jev fails.
+Recognized test files: `*.test.*`, `*.spec.*` (JS/TS), `test_*.py`, `*_test.py`, and `*_test.go`. Test files whose code under test cannot be resolved, or whose trimmed source and tests exceed 60,000 characters, are skipped silently, as is the whole check when Jev fails.
 
 ## Jev decisions
 
-All three Jev-backed extensions call the [TypeSafe System One API](https://docs.typesafe.ai/api) with model `jev-latest`. They read `TYPESAFE_API_KEY` and `TYPESAFE_BASE_URL` (default `https://api.typesafe.ai`) from the environment, or from `~/.pi/agent/mcp-env.json` when `TYPESAFE_API_KEY` is unset. To route through OpenRouter, set `TYPESAFE_BASE_URL` to `https://openrouter.ai/api` and use an OpenRouter key. Set `TYPESAFE_API_KEY=` (empty) to disable Jev.
+All three Jev-backed extensions call the [TypeSafe System One API](https://docs.typesafe.ai/api) with model `TYPESAFE_MODEL` (default `jev-latest`). They read `TYPESAFE_API_KEY`, `TYPESAFE_BASE_URL` (default `https://api.typesafe.ai`), and `TYPESAFE_MODEL` from the environment, or from `~/.pi/agent/mcp-env.json` when `TYPESAFE_API_KEY` is unset. To route through OpenRouter, set `TYPESAFE_BASE_URL` to `https://openrouter.ai/api` and use an OpenRouter key. Set `TYPESAFE_API_KEY=` (empty) to disable Jev.
+
+The thresholds were calibrated against Jev 1.13, and the `jev-latest` alias moves when TypeSafe ships a new version. Pin the version with `TYPESAFE_MODEL`, then rerun `bench/` before moving to a newer one. Version IDs differ by provider: `jev-1.13.0` on `api.typesafe.ai`, `typesafe/jev-1.13-20260917` on OpenRouter.
 
 Jev receives the proposed code text, and `test-gaps-on-settle` sends whole test files and the source files they import, so only enable it for code you may send to TypeSafe (and OpenRouter, if used).
 

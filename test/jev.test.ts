@@ -15,6 +15,7 @@ function mockFetch(status: number, body: unknown) {
 test("posts noul questions to the configured System One endpoint", async () => {
   process.env.TYPESAFE_API_KEY = "test-key";
   process.env.TYPESAFE_BASE_URL = "https://jev.test/api";
+  delete process.env.TYPESAFE_MODEL;
   const calls = mockFetch(200, {
     answers: { a: { type: "noul", noul: 0.9 }, b: { type: "noul", noul: 0.1 } },
   });
@@ -35,6 +36,22 @@ test("posts noul questions to the configured System One endpoint", async () => {
       b: { type: "noul", instructions: "Is B" },
     },
   });
+});
+
+test("sends the pinned TYPESAFE_MODEL and falls back to jev-latest when it is blank", async () => {
+  process.env.TYPESAFE_API_KEY = "test-key";
+  const answer = { answers: { a: { type: "noul", noul: 0.5 } } };
+  const model = async () => {
+    const calls = mockFetch(200, answer);
+    await askNoul("s", { a: "Is A" });
+    return JSON.parse(calls[0].init.body as string).model;
+  };
+
+  process.env.TYPESAFE_MODEL = "typesafe/jev-1.13-20260917";
+  assert.equal(await model(), "typesafe/jev-1.13-20260917");
+  process.env.TYPESAFE_MODEL = "";
+  assert.equal(await model(), "jev-latest");
+  delete process.env.TYPESAFE_MODEL;
 });
 
 test("rejects missing, non-numeric, or out-of-range answers instead of trusting them", async () => {

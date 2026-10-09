@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 
-const { isTestFile, sourceFilesFor, errorPaths, findGaps, default: testGaps } = await import(
+const { isTestFile, sourceFilesFor, errorPaths, findGaps, relevantSource, default: testGaps } = await import(
   `../extensions/test-gaps-on-settle.ts?test=${Date.now()}`
 );
 
@@ -46,6 +46,87 @@ test("resolves the source files a test imports", () => {
   assert.deepEqual(sourceFilesFor(join(root, "go/sum_test.go"), "package sum", root), [join(root, "go/sum.go")]);
   assert.deepEqual(sourceFilesFor(join(root, "test/empty.test.ts"), "", root), []);
   assert.deepEqual(sourceFilesFor(join(root, "tests/test_empty.py"), "", root), []);
+});
+
+test("keeps only the code a test names plus what that code uses", () => {
+  const ts = [
+    'import { readFileSync } from "node:fs";',
+    "",
+    "const LIMIT = 150;",
+    "/** Unrelated helper. */",
+    "export function slugify(s: string) {",
+    '  if (!s) throw new Error("empty title");',
+    "  return s.toLowerCase();",
+    "}",
+    "",
+    "/**",
+    " * Parses an age.",
+    " */",
+    "export function parseAge(input: string): number {",
+    "  const age = Number(input);",
+    '  if (age > LIMIT) throw new Error("age is unrealistic");',
+    "  return age;",
+    "}",
+  ].join("\n");
+  const kept = relevantSource(ts, 'import { parseAge } from "../src/age.ts";\nassert.equal(parseAge("3"), 3);');
+  assert.equal(
+    kept,
+    ["const LIMIT = 150;", "/**", " * Parses an age.", " */", ...ts.split("\n").slice(12)].join("\n"),
+  );
+  assert.deepEqual(errorPaths(kept), ['the error path that throws or raises "age is unrealistic"']);
+
+  const py = ["import re", "", 'EMAIL = re.compile(r"@")', "", "", "def other():", "    return 1", "", "", "@cache", "def check(s):", "    return EMAIL.match(s)"].join("\n");
+  assert.equal(relevantSource(py, "from mod import check\nassert check('a@b')"), ['EMAIL = re.compile(r"@")', "", "", "@cache", "def check(s):", "    return EMAIL.match(s)"].join("\n"));
+
+  const go = ["package calc", "", "func helper() int { return 2 }", "", "func (c *Calc) Divide(a, b int) int {", "\treturn a / b", "}"].join("\n");
+  assert.equal(relevantSource(go, "c.Divide(4, 2)"), ["func (c *Calc) Divide(a, b int) int {", "\treturn a / b", "}"].join("\n"));
+});
+
+test("keeps a default export imported under another name and abstract base classes", () => {
+  const age = [
+    "export const MAX_AGE = 150;",
+    "export const UNUSED = 1;",
+    "",
+    "export default function parseAge(s: string) {",
+    '  if (Number(s) > MAX_AGE) throw new Error("too old");',
+    "  return Number(s);",
+    "}",
+  ].join("\n");
+  const kept = relevantSource(age, 'import parse, { MAX_AGE } from "../src/age.ts";\nassert.throws(() => parse(String(MAX_AGE + 1)));');
+  assert.equal(kept, ["export const MAX_AGE = 150;", ...age.split("\n").slice(3)].join("\n"));
+
+  const exporters = [
+    "export abstract class Exporter {",
+    '  run(): string { throw new Error("not implemented"); }',
+    "}",
+    "",
+    "export class CsvExporter extends Exporter {}",
+  ].join("\n");
+  const base = relevantSource(exporters, 'import { CsvExporter } from "../src/export.ts";\nnew CsvExporter().run();');
+  assert.equal(base, exporters);
+  assert.deepEqual(errorPaths(base), ['the error path that throws or raises "not implemented"']);
+});
+
+test("isolates the named function in a half-edited CRLF file", () => {
+  const source = [
+    "export function broken(s: string) {",
+    "  if (s) {",
+    "    return 1;",
+    "",
+    "export function parseAge(input: string) {",
+    '  if (!input) throw new Error("age is required");',
+    "  return Number(input);",
+    "}",
+  ].join("\r\n");
+  const kept = relevantSource(source, 'import { parseAge } from "../src/age.ts";');
+  assert.equal(kept, source.split("\r\n").slice(4).join("\r\n"));
+  assert.deepEqual(errorPaths(kept), ['the error path that throws or raises "age is required"']);
+});
+
+test("falls back to the whole source when the tests name nothing in it", () => {
+  const source = "export default function () {\n  return 1;\n}";
+  assert.equal(relevantSource(source, "import run from '../src/run.ts';\nrun();"), source);
+  assert.equal(relevantSource("", "anything"), "");
 });
 
 test("extracts each distinct error path once", () => {
@@ -119,6 +200,19 @@ const files = {
   "src/age.ts": 'export function parseAge(s: string) { if (!s) throw new Error("age is required"); return Number(s); }',
   "test/age.test.ts": 'import { parseAge } from "../src/age.ts";\ntest("ok", () => assert.equal(parseAge("3"), 3));',
 };
+
+test("ignores error paths of functions the test does not use", async () => {
+  const { sent, handlers, touch } = setup({
+    ...files,
+    "src/age.ts": `export function unrelated() {\n  throw new Error("unrelated failure");\n}\n\n${files["src/age.ts"]}`,
+  });
+
+  touch("test/age.test.ts");
+  await handlers.agent_settled();
+
+  assert.ok(sent[0][0].includes('"age is required"'));
+  assert.ok(!sent[0][0].includes("unrelated failure"));
+});
 
 test("reports untested relevant cases once after a test file is written", async () => {
   const { sent, handlers, touch, root } = setup(files);

@@ -5,7 +5,7 @@ import { join } from "node:path";
 // ~15k tokens; keeps the state well under Jev's 32k-token state budget.
 export const MAX_STATE_CHARS = 60_000;
 
-type TypeSafeEnv = { TYPESAFE_API_KEY?: string; TYPESAFE_BASE_URL?: string };
+type TypeSafeEnv = { TYPESAFE_API_KEY?: string; TYPESAFE_BASE_URL?: string; TYPESAFE_MODEL?: string };
 type NoulAnswers = { answers: Record<string, { noul: number }> };
 
 function typeSafeEnv(): TypeSafeEnv {
@@ -35,7 +35,7 @@ export async function askNoul(
         "Content-Type": "application/json",
       },
       body: JSON.stringify({
-        model: "jev-latest",
+        model: env.TYPESAFE_MODEL || "jev-latest",
         state,
         questions: Object.fromEntries(
           Object.entries(questions).map(([id, instructions]) => [

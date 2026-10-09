@@ -50,6 +50,43 @@ export function sourceFilesFor(testPath: string, testCode: string, cwd: string):
   );
 }
 
+const DECLARATION =
+  /^(?:export\s+)?(?:default\s+)?(?:declare\s+)?(?:abstract\s+)?(?:async\s+)?(?:function\*?|def|class|func(?:\s*\([^)]*\))?|const|let|var|type|interface|enum)\s+(\w+)|^(\w+)\s*(?::[^=]*)?=(?!=)/;
+
+export function relevantSource(source: string, tests: string): string {
+  const chunks: { name?: string; isDefault: boolean; text: string }[] = [];
+  let header: string[] = [];
+  for (const line of source.split("\n")) {
+    const topLevel = /^\S/.test(line) && !/^[)\]}]/.test(line);
+    if ((topLevel && /^(?:@|\/\/|#|\/\*)/.test(line)) || (!topLevel && header.length)) header.push(line);
+    else if (topLevel || chunks.length === 0) {
+      const declared = line.match(DECLARATION);
+      chunks.push({
+        name: declared?.[1] ?? declared?.[2],
+        isDefault: /^export\s+default\b/.test(line),
+        text: [...header, line].join("\n"),
+      });
+      header = [];
+    } else chunks[chunks.length - 1].text += `\n${line}`;
+  }
+
+  const words = (text: string) => new Set(text.match(/\w+/g));
+  const testWords = words(tests);
+  // Tests import a default export under any local name, so its own name never matches.
+  const kept = new Set(chunks.filter((chunk) => chunk.isDefault || (chunk.name && testWords.has(chunk.name))));
+  if (kept.size === 0) return source;
+  for (let grew = true; grew; ) {
+    grew = false;
+    const used = words([...kept].map((chunk) => chunk.text).join("\n"));
+    for (const chunk of chunks)
+      if (chunk.name && !kept.has(chunk) && used.has(chunk.name)) {
+        kept.add(chunk);
+        grew = true;
+      }
+  }
+  return chunks.filter((chunk) => kept.has(chunk)).map((chunk) => chunk.text).join("\n");
+}
+
 export function errorPaths(source: string): string[] {
   return [
     ...new Set(
@@ -108,7 +145,7 @@ export default function (pi: ExtensionAPI): void {
       if (!existsSync(testPath)) continue;
       const tests = readFileSync(testPath, "utf8");
       const sources = Object.fromEntries(
-        sourceFilesFor(testPath, tests, cwd).map((file) => [file, readFileSync(file, "utf8")]),
+        sourceFilesFor(testPath, tests, cwd).map((file) => [file, relevantSource(readFileSync(file, "utf8"), tests)]),
       );
       if (Object.keys(sources).length === 0) continue;
       let gaps: string[];

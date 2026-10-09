@@ -355,6 +355,26 @@ test("remembers reported gaps across a reload", async () => {
   assert.deepEqual(reloaded.sent, []);
 });
 
+test("treats an empty, null, or non-object state file as nothing reported", async () => {
+  for (const content of ["", "null", "[]", "{}"]) {
+    const state = setup(files);
+    mkdirSync(join(state.reportedFile, ".."), { recursive: true });
+    writeFileSync(state.reportedFile, content);
+    state.touch("test/age.test.ts");
+    await state.handlers.agent_settled();
+    assert.equal(state.sent.length, 1, `state file ${JSON.stringify(content)}`);
+    assert.equal(Object.keys(JSON.parse(readFileSync(state.reportedFile, "utf8"))).length, 2);
+  }
+});
+
+test("still delivers the report when the state file cannot be written", async () => {
+  const state = setup(files);
+  writeFileSync(join(process.env.HOME as string, ".pi"), "not a directory");
+  state.touch("test/age.test.ts");
+  await assert.rejects(Promise.resolve(state.handlers.agent_settled()), /ENOTDIR|EEXIST/);
+  assert.equal(state.sent.length, 1);
+});
+
 test("reports again after 30 days and survives a corrupt state file", async () => {
   const state = setup(files);
   mkdirSync(join(state.reportedFile, ".."), { recursive: true });

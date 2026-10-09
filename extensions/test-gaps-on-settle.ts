@@ -147,7 +147,7 @@ const reportedFile = () => join(homedir(), ".pi/agent/test-gaps-reported.json");
 function loadReported(): Record<string, number> {
   let reported: Record<string, number>;
   try {
-    reported = JSON.parse(readFileSync(reportedFile(), "utf8"));
+    reported = JSON.parse(readFileSync(reportedFile(), "utf8")) ?? {};
   } catch {
     return {};
   }
@@ -158,8 +158,9 @@ function loadReported(): Record<string, number> {
 function saveReported(reported: Record<string, number>): void {
   const file = reportedFile();
   mkdirSync(dirname(file), { recursive: true });
-  writeFileSync(`${file}.tmp`, JSON.stringify(reported));
-  renameSync(`${file}.tmp`, file);
+  const temporary = `${file}.${process.pid}.tmp`;
+  writeFileSync(temporary, JSON.stringify(reported));
+  renameSync(temporary, file);
 }
 
 export default function (pi: ExtensionAPI): void {

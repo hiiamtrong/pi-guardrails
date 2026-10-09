@@ -174,6 +174,35 @@ test("keeps route handlers registered on an app the test uses", () => {
   assert.deepEqual(errorPaths(keptFlask), ['the error path that throws or raises "invalid id"']);
 });
 
+test("keeps a commented route but not other functions sharing a constant the test names", () => {
+  const limits = [
+    "export const MAX = 150;",
+    "",
+    "export function parseAge(s: string) {",
+    '  if (Number(s) > MAX) throw new Error("age is unrealistic");',
+    "  return Number(s);",
+    "}",
+    "",
+    "export function parseHeight(s: string) {",
+    '  if (Number(s) > MAX) throw new Error("height is unrealistic");',
+    "  return Number(s);",
+    "}",
+  ].join("\n");
+  const kept = relevantSource(limits, 'import { parseAge, MAX } from "../src/limits.ts";\nassert.throws(() => parseAge(String(MAX + 1)));');
+  assert.deepEqual(errorPaths(kept), ['the error path that throws or raises "age is unrealistic"']);
+
+  const routes = [
+    "export const app = express();",
+    "",
+    "// Look up a user by numeric id.",
+    'app.get("/users/:id", (req) => {',
+    '  if (!req.params.id) throw new Error("invalid id");',
+    "});",
+  ].join("\n");
+  const keptRoute = relevantSource(routes, 'import { app } from "../src/app.ts";\nawait request(app).get("/users/1");');
+  assert.deepEqual(errorPaths(keptRoute), ['the error path that throws or raises "invalid id"']);
+});
+
 test("isolates the named function in a half-edited CRLF file", () => {
   const source = [
     "export function broken(s: string) {",

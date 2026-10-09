@@ -62,7 +62,7 @@ export function importsDefault(testPath: string, testCode: string, file: string)
 }
 
 export function relevantSource(source: string, tests: string, keepDefault = false): string {
-  const chunks: { name?: string; isDefault: boolean; text: string }[] = [];
+  const chunks: { name?: string; isDefault: boolean; head: string; text: string }[] = [];
   let header: string[] = [];
   for (const line of source.split("\n")) {
     const topLevel = /^\S/.test(line) && !/^[)\]}]/.test(line);
@@ -72,6 +72,7 @@ export function relevantSource(source: string, tests: string, keepDefault = fals
       chunks.push({
         name: declared?.[1] ?? declared?.[2],
         isDefault: /^export\s+default\b/.test(line),
+        head: [...header, line].join("\n"),
         text: [...header, line].join("\n"),
       });
       header = [];
@@ -82,9 +83,10 @@ export function relevantSource(source: string, tests: string, keepDefault = fals
   const testWords = words(tests);
   const named = new Set(chunks.flatMap((chunk) => (chunk.name && testWords.has(chunk.name) ? [chunk.name] : [])));
   // Tests import a default export under any local name, and reach route handlers only through the
-  // object they register on (`app.get(...)`, `@app.route`), so also keep chunks that use a named one.
+  // object they register on (`app.get(...)`, `@app.route`), so also keep chunks whose opening line
+  // uses a named one. Only the opening line: bodies that merely read a shared constant stay out.
   const kept = new Set(
-    chunks.filter((chunk) => (keepDefault && chunk.isDefault) || [...words(chunk.text)].some((word) => named.has(word))),
+    chunks.filter((chunk) => (keepDefault && chunk.isDefault) || [...words(chunk.head)].some((word) => named.has(word))),
   );
   if (kept.size === 0) return source;
   for (let grew = true; grew; ) {

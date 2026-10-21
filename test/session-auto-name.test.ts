@@ -49,6 +49,7 @@ function setup(opts: { name?: string; fetch?: (body: any) => any; complete?: () 
 			await sleep();
 		},
 		name: () => name,
+		rename: (n: string) => (name = n),
 		exec,
 		prompts,
 		branch,
@@ -61,7 +62,7 @@ test("first turn sets the name, records it and renames the Orca tab", async () =
 	await t.turn();
 	assert.equal(t.name(), "Review PR 123");
 	assert.deepEqual(historyOf(t.branch), ["Review PR 123"]);
-	assert.deepEqual(t.exec[0], ["terminal", "rename", "--terminal", "term_x", "--title", "Review PR 123"]);
+	assert.deepEqual(t.exec[0], ["terminal", "rename", "--terminal", "term_x", "--title=Review PR 123"]);
 });
 
 test("a new request that widens the work renames the session and keeps history", async () => {
@@ -217,4 +218,23 @@ test("a single request is not repeated as a latest request", async () => {
 	const t = setup();
 	await t.turn();
 	assert.ok(t.prompts[0].includes("(same as first)"));
+});
+
+test("a name typed by hand while the model is answering is not overwritten", async () => {
+	let release!: () => void;
+	const t = setup({ fetch: () => new Promise((r) => (release = () => r(reply("Auto name")))) });
+	await t.turn();
+	t.rename("Typed by hand");
+	release();
+	await sleep();
+	assert.equal(t.name(), "Typed by hand");
+	assert.deepEqual(historyOf(t.branch), []);
+	assert.equal(t.exec.length, 0);
+});
+
+test("a title starting with -- reaches the Orca rename as a single --title= argument", async () => {
+	const t = setup({ fetch: () => reply("--flag-like title") });
+	await t.turn();
+	assert.equal(t.name(), "--flag-like title");
+	assert.deepEqual(t.exec[0], ["terminal", "rename", "--terminal", "term_x", "--title=--flag-like title"]);
 });

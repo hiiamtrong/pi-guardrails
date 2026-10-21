@@ -90,11 +90,14 @@ export default function (pi: ExtensionAPI) {
 				.replace(/^["'`#*\s]+|["'`*\s]+$/g, "")
 				.slice(0, MAX_NAME_LENGTH);
 			if (!name || /^keep\W*$/i.test(name) || name === current) return;
+			// Why: the model call takes seconds, so a name typed meanwhile with /session-name must win.
+			if (pi.getSessionName() !== current) return;
 			pi.appendEntry(ENTRY, { name });
 			pi.setSessionName(name);
 			// Why: Orca ranks its own first-prompt generatedTitle above the terminal title, so only a tab customTitle wins.
 			const handle = process.env.ORCA_TERMINAL_HANDLE;
-			if (handle) await pi.exec("orca", ["terminal", "rename", "--terminal", handle, "--title", name], { timeout: 5000 });
+			// Why: the joined --title= form keeps a title that starts with "--" from being parsed as a flag.
+			if (handle) await pi.exec("orca", ["terminal", "rename", "--terminal", handle, `--title=${name}`], { timeout: 5000 });
 		} catch {
 			// Why: naming is cosmetic; a failed call must not surface as a session error.
 		}

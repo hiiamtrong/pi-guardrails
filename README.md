@@ -1,6 +1,6 @@
 # Pi GitHub Guards
 
-A Pi package with eight workflow and security extensions:
+A Pi package with ten workflow and security extensions:
 
 - **`comment-guard`** reviews new code comments, suppressions, and Python future annotations before they are written.
 - **`ponytail-review-on-settle`** runs `/skill:ponytail-review` after a turn that edited code, unless the edits were trivial.
@@ -9,6 +9,8 @@ A Pi package with eight workflow and security extensions:
 - **`github-identity-guard-required`** blocks agent-initiated Git/GitHub writes until Git Identity Guard is installed in the current repository.
 - **`pr-review-archive`** archives human PR review evidence in a local SQLite database.
 - **`review-pipeline`** adds `/review-pr <GitHub PR link>`, which opens a live web UI for the PR review pipeline of the repo whose review checkout you are in, and tracks the step the agent is on.
+- **`compact-continue`** resumes the run once after Pi compacts the context at the end of a run, so the task is not left waiting for you.
+- **`session-auto-name`** names each session after its work, keeps the name current as the work changes, and renames the Orca tab to match.
 - **`worktree-bootstrap`** configures a personal, per-repository `post-checkout` bootstrap hook that copies selected ignored files into new Git worktrees.
 
 The GitHub write and identity gates fail closed when the required condition cannot be verified.
@@ -49,6 +51,19 @@ git clone --depth 1 https://github.com/hiiamtrong/git-identity-guard.git ~/.loca
 ```
 
 Git Identity Guard installs local `pre-commit` and `pre-push` hooks. This Pi extension is an additional agent-side gate, not a replacement for remote branch protection or CI enforcement.
+
+## Session names
+
+`session-auto-name` asks a small model after every turn whether the session title still fits, and renames the session when it does not. It records each name in the session file, lists them with `/session-names`, and never touches a name you set with `/session-name`.
+
+It first calls an OpenAI-compatible endpoint from `~/.pi/agent/session-auto-name.json` (set `SESSION_AUTO_NAME_CONFIG` for another path), then falls back to `claude-bridge/claude-haiku-5-5`, then to the session's own model. Keep the file private, since it holds a secret:
+
+```json
+{
+  "endpoint": "https://example.com/v1",
+  "secret": "<bearer token>"
+}
+```
 
 ## Install
 

@@ -5,11 +5,12 @@
   "type": "module",
   "license": "MIT",
   "files": ["extensions", "config", "review-pipeline", "packages"],
-  "dependencies": {
-    "typebox": "1.3.27"
+  "peerDependencies": {
+    "typebox": "*"
   },
   "devDependencies": {
     "@types/node": "^24.0.0",
+    "typebox": "1.3.27",
     "typescript": "^5.0.0"
   },
   "keywords": ["pi-package", "pi-extension", "github", "security"],

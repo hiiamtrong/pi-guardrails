@@ -1,0 +1,458 @@
+import json
+import pathlib
+import re
+import subprocess
+import sys
+import tempfile
+import time
+import unittest
+import urllib.request
+
+HERE = pathlib.Path(__file__).resolve().parent
+HEAD = 'e008ae0769'
+OLD = '6cfa543ec1'
+
+
+def block(title, body):
+    return f'== {title}, 18:00 ICT ==\n{body}\npytest_rc=1\n'
+
+
+def check_runs(log, head, changed=None):
+    with tempfile.TemporaryDirectory() as tmp:
+        path = pathlib.Path(tmp) / 'runs.txt'
+        path.write_text(log)
+        extra = []
+        if changed is not None:
+            listing = pathlib.Path(tmp) / 'changed.txt'
+            listing.write_text('\n'.join(changed))
+            extra = ['--changed', str(listing)]
+        done = subprocess.run([sys.executable, '-I', str(HERE / 'check_runs.py'), '--head', head, *extra, str(path)],
+                              capture_output=True, text=True)
+    return done.returncode, done.stdout
+
+
+class CheckRunsHead(unittest.TestCase):
+    def logs(self, head):
+        return (block(f'#1 trial merge {head} (tests)', '9 failed, 600 passed')
+                + block(f'#1 the new test file (head {head}) on DEVELOP code', '5 failed, 31 passed')
+                + 'only on trial: 0 | only on develop: 0\n')
+
+    def test_log_of_the_current_head_passes(self):
+        code, out = check_runs(self.logs(HEAD), HEAD)
+        self.assertEqual(code, 0, out)
+
+    def test_log_of_an_older_head_fails_both_head_bound_checks(self):
+        code, out = check_runs(self.logs(OLD), HEAD)
+        self.assertEqual(code, 1)
+        self.assertIn(f'không có khối trial trên head {HEAD}', out)
+        self.assertIn(f'có failed > 0 trên head {HEAD}', out)
+
+    def test_old_trial_line_does_not_count_for_the_new_head(self):
+        log = self.logs(OLD) + block(f'#1 new test file (head {HEAD}) on DEVELOP code', '5 failed, 31 passed')
+        code, out = check_runs(log, HEAD)
+        self.assertEqual(code, 1)
+        self.assertIn('trial-vs-develop', out)
+
+
+class DocsOnly(unittest.TestCase):
+    def test_a_diff_of_documents_needs_no_test_run(self):
+        code, out = check_runs('', HEAD, changed=['docs/dm-migration/30-hide.md', 'README.rst', 'notes.txt'])
+        self.assertEqual(code, 0, out)
+        self.assertIn('docs-only', out)
+
+    def test_one_code_file_keeps_every_check(self):
+        code, out = check_runs('', HEAD, changed=['docs/a.md', 'swag/a.py'])
+        self.assertEqual(code, 1)
+        self.assertNotIn('docs-only', out)
+
+    def test_a_deploy_file_is_not_a_document(self):
+        code, _ = check_runs('', HEAD, changed=['deploy/chat-backfill/README.md', 'deploy/job.yaml'])
+        self.assertEqual(code, 1)
+
+    def test_an_empty_change_list_is_not_docs_only(self):
+        code, _ = check_runs('', HEAD, changed=[])
+        self.assertEqual(code, 1)
+
+
+class ParallelNotes(unittest.TestCase):
+    def test_forty_notes_at_once_all_succeed_and_all_land(self):
+        with tempfile.TemporaryDirectory() as rv:
+            env = {'RV': rv, 'PATH': '/usr/bin:/bin'}
+            procs = [subprocess.Popen([sys.executable, '-I', str(HERE / 'pipeline_step.py'), 'note', '1', '00', '--msg', f'n{i}'],
+                                      env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True) for i in range(40)]
+            results = [(p.wait(), p.stderr.read()) for p in procs]
+            work = pathlib.Path(rv, 'reports', 'reviews', 'evidence', '1', 'gates')
+            events = [json.loads(line) for line in (work / 'events.jsonl').read_text().splitlines()]
+            leftovers = [p.name for p in work.iterdir() if p.name.endswith('.tmp')]
+        self.assertEqual([r for r in results if r[0] != 0], [])
+        self.assertEqual(len(events), 40)
+        self.assertEqual(leftovers, [])
+
+
+
+sys.path.insert(0, str(HERE))
+import pipeline_ui
+
+
+def step(rv, *args, check=True):
+    done = subprocess.run([sys.executable, '-I', str(HERE / 'pipeline_step.py'), *args],
+                          env={'RV': rv, 'PATH': '/usr/bin:/bin', 'PYTHONDONTWRITEBYTECODE': '1'}, capture_output=True, text=True)
+    if check:
+        assert done.returncode == 0, done.stderr
+    return done
+
+
+def begin(rv, pr, *flags):
+    done = step(rv, 'begin', pr, '--no-open', *flags, check=False)
+    return done, (json.loads(done.stdout.strip().splitlines()[-1]) if done.returncode == 0 else None)
+
+
+def gates(rv, pr):
+    return pathlib.Path(rv, 'reports', 'reviews', 'evidence', pr, 'gates')
+
+
+def title(rv, pr):
+    port = int(gates(rv, pr).joinpath('ui.port').read_text())
+    with urllib.request.urlopen(f'http://127.0.0.1:{port}/', timeout=3) as page:
+        return page.read().decode().split('<title>')[1].split('</title>')[0]
+
+
+class Session(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.rv = self.tmp.name
+        self.sleepers = []
+
+    def tearDown(self):
+        for pr in ('1', '2'):
+            step(self.rv, 'stop', pr, check=False)
+        for proc in self.sleepers:
+            proc.kill()
+        self.tmp.cleanup()
+
+    def sleeper(self):
+        proc = subprocess.Popen(['sleep', '300'])
+        self.sleepers.append(proc)
+        return proc.pid
+
+
+class Resume(Session):
+    def test_second_begin_keeps_the_progress_and_names_the_next_step(self):
+        begin(self.rv, '1')
+        step(self.rv, 'start', '1', '00')
+        _, first = begin(self.rv, '1')
+        self.assertTrue(first['resumed'])
+        self.assertEqual(first['next'], '00')
+        events = gates(self.rv, '1') / 'events.jsonl'
+        self.assertEqual([e['state'] for e in map(json.loads, events.read_text().splitlines())], ['begin', 'start', 'resume'])
+        self.assertEqual([p.name for p in gates(self.rv, '1').glob('events-*')], [])
+
+    def test_restart_archives_the_old_progress(self):
+        begin(self.rv, '1')
+        step(self.rv, 'start', '1', '00')
+        _, fresh = begin(self.rv, '1', '--restart')
+        self.assertFalse(fresh['resumed'])
+        self.assertEqual(len(list(gates(self.rv, '1').glob('events-*'))), 1)
+
+    def test_a_finished_review_starts_fresh_without_a_flag(self):
+        begin(self.rv, '1')
+        step(self.rv, 'end', '1')
+        _, again = begin(self.rv, '1')
+        self.assertFalse(again['resumed'])
+
+
+class Owner(Session):
+    def test_second_live_owner_is_refused_and_takeover_gets_through(self):
+        mine, theirs = self.sleeper(), self.sleeper()
+        self.assertEqual(begin(self.rv, '1', '--owner', str(mine))[0].returncode, 0)
+        refused, _ = begin(self.rv, '1', '--owner', str(theirs))
+        self.assertEqual(refused.returncode, 3)
+        self.assertIn(f'tiến trình pi {mine}', refused.stderr)
+        self.assertEqual(len((gates(self.rv, '1') / 'events.jsonl').read_text().splitlines()), 1)
+        taken, data = begin(self.rv, '1', '--owner', str(theirs), '--takeover')
+        self.assertEqual(taken.returncode, 0)
+        self.assertTrue(data['resumed'])
+
+    def test_a_dead_owner_does_not_block(self):
+        dead = subprocess.Popen(['true'])
+        dead.wait()
+        begin(self.rv, '1', '--owner', str(dead.pid))
+        done, data = begin(self.rv, '1', '--owner', str(self.sleeper()))
+        self.assertEqual(done.returncode, 0)
+        self.assertTrue(data['resumed'])
+
+
+class Server(Session):
+    def test_two_reviews_started_at_once_each_get_their_own_page(self):
+        for _ in range(4):
+            procs = [subprocess.Popen([sys.executable, '-I', str(HERE / 'pipeline_step.py'), 'begin', pr, '--no-open'],
+                                      env={'RV': self.rv, 'PYTHONDONTWRITEBYTECODE': '1'}, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                     for pr in ('1', '2')]
+            for proc in procs:
+                proc.communicate()
+            self.assertEqual([proc.returncode for proc in procs], [0, 0])
+            self.assertEqual((title(self.rv, '1'), title(self.rv, '2')), ('Review #1', 'Review #2'))
+            ports = {gates(self.rv, pr).joinpath('ui.port').read_text() for pr in ('1', '2')}
+            self.assertEqual(len(ports), 2)
+            for pr in ('1', '2'):
+                step(self.rv, 'stop', pr)
+                step(self.rv, 'end', pr)
+                (gates(self.rv, pr) / 'events.jsonl').unlink()
+
+    def test_two_begins_for_the_same_review_at_once_start_one_server(self):
+        for _ in range(4):
+            procs = [subprocess.Popen([sys.executable, '-I', str(HERE / 'pipeline_step.py'), 'begin', '1', '--no-open'],
+                                      env={'RV': self.rv, 'PYTHONDONTWRITEBYTECODE': '1'}, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                     for _ in range(2)]
+            for proc in procs:
+                proc.communicate()
+            self.assertEqual([proc.returncode for proc in procs], [0, 0])
+            servers = [line for line in subprocess.run(['ps', '-axo', 'command='], capture_output=True, text=True).stdout.splitlines()
+                       if 'pipeline_ui.py 1 --work' in line and self.rv in line]
+            self.assertEqual(len(servers), 1, servers)
+            step(self.rv, 'stop', '1')
+            step(self.rv, 'end', '1')
+            (gates(self.rv, '1') / 'events.jsonl').unlink()
+
+    def test_stop_leaves_an_unrelated_process_alone(self):
+        victim = self.sleeper()
+        begin(self.rv, '1')
+        step(self.rv, 'stop', '1')
+        gates(self.rv, '1').joinpath('ui.pid').write_text(str(victim))
+        out = step(self.rv, 'stop', '1').stdout
+        self.assertIn('không phải server UI', out)
+        time.sleep(0.2)
+        self.assertEqual(subprocess.run(['kill', '-0', str(victim)]).returncode, 0)
+
+    def test_a_dead_server_comes_back_on_the_next_note(self):
+        begin(self.rv, '1')
+        step(self.rv, 'start', '1', '00')
+        subprocess.run(['kill', '-9', gates(self.rv, '1').joinpath('ui.pid').read_text()])
+        time.sleep(0.3)
+        step(self.rv, 'note', '1', '00', '--msg', 'sau khi chết')
+        self.assertEqual(title(self.rv, '1'), 'Review #1')
+
+
+class WaitingStep(Session):
+    def seed(self, verdicts):
+        work = gates(self.rv, '1')
+        work.mkdir(parents=True, exist_ok=True)
+        now = time.time() - 600
+        events = [{'ts': now, 'step': '-', 'state': 'begin', 'msg': ''}]
+        for index, (num, verdict) in enumerate(verdicts):
+            events.append({'ts': now + index, 'step': num, 'state': 'start', 'msg': ''})
+            events.append({'ts': now + index + 0.5, 'step': num, 'state': 'done', 'verdict': verdict, 'items': []})
+        (work / 'events.jsonl').write_text(''.join(json.dumps(e) + '\n' for e in events))
+
+    def test_manual_step_is_next_and_waiting_not_done(self):
+        self.seed([(n, 'pass') for n in ('00', '01', '02', '03', '04')] + [('05', 'manual')])
+        _, data = begin(self.rv, '1')
+        self.assertEqual(data['done'], ['00', '01', '02', '03', '04'])
+        self.assertEqual((data['next'], data['waiting']), ('05', '05'))
+
+    def test_a_gap_before_the_manual_step_is_next_and_nothing_waits(self):
+        self.seed([('00', 'pass'), ('01', 'pass'), ('05', 'manual')])
+        _, data = begin(self.rv, '1')
+        self.assertEqual(data['done'], ['00', '01'])
+        self.assertEqual((data['next'], data['waiting']), ('02', None))
+
+    def test_a_fresh_begin_has_nothing_waiting(self):
+        _, data = begin(self.rv, '1')
+        self.assertEqual((data['next'], data['waiting'], data['done']), ('00', None, []))
+
+
+class PortBinding(unittest.TestCase):
+    def test_a_port_held_on_every_address_is_skipped(self):
+        import socket
+        for _ in range(20):
+            probe = socket.socket()
+            probe.bind(('127.0.0.1', 0))
+            first = probe.getsockname()[1]
+            probe.close()
+            wildcard = socket.socket()
+            wildcard.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            try:
+                wildcard.bind(('0.0.0.0', first))
+            except OSError:
+                wildcard.close()
+                continue
+            wildcard.listen(1)
+            break
+        else:
+            self.skipTest('no free port')
+        saved = pipeline_ui.PORTS
+        pipeline_ui.PORTS = range(first, first + 2)
+        try:
+            server = pipeline_ui.bind(None, 0)
+        finally:
+            pipeline_ui.PORTS = saved
+            wildcard.close()
+        try:
+            self.assertEqual(server.server_address[1], first + 1)
+        finally:
+            server.server_close()
+
+
+class IdleBanner(unittest.TestCase):
+    def banner(self, idle):
+        now = 10_000.0
+        events = [{'ts': now - idle - 5, 'step': '-', 'state': 'begin'}, {'ts': now - idle - 4, 'step': '03', 'state': 'start', 'msg': 'chạy'},
+                  {'ts': now - idle, 'step': '03', 'state': 'note', 'msg': 'M3 xong'}]
+        steps, meta = pipeline_ui.model(events)
+        return pipeline_ui.banner_of(steps, meta, now)
+
+    def test_recent_activity_shows_the_running_step(self):
+        kind, text = self.banner(60)
+        self.assertEqual(kind, 'run')
+        self.assertIn('Đang ở bước 03', text)
+
+    def test_five_minutes_of_silence_warns_and_keeps_the_last_note(self):
+        kind, text = self.banner(300)
+        self.assertEqual(kind, 'wait')
+        self.assertIn('chưa có ghi chú mới', text)
+        self.assertIn('M3 xong', text)
+
+    def test_a_step_waiting_for_the_human_says_who_and_what(self):
+        events = [{'ts': 1, 'step': '05', 'state': 'start'}, {'ts': 2, 'step': '05', 'state': 'done', 'verdict': 'manual', 'items': []}]
+        steps, meta = pipeline_ui.model(events)
+        self.assertIn('OK post', pipeline_ui.banner_of(steps, meta, 3)[1])
+
+
+class DescriptionHash(unittest.TestCase):
+    def test_the_guard_hashes_raw_bytes_so_it_matches_shasum_on_a_crlf_description(self):
+        template = (HERE / 'post_guard.template.sh').read_text()
+        snippet = re.search(r'python3\.12 -c "(import hashlib[^"]*)"', template).group(1)
+        with tempfile.TemporaryDirectory() as tmp:
+            path = pathlib.Path(tmp) / 'desc.txt'
+            path.write_bytes(b'## PR\r\nline two\r\n')
+            guard = subprocess.run([sys.executable, '-I', '-c', snippet.replace("$OUT/$D-desc.txt", str(path))],
+                                   capture_output=True, text=True, check=True).stdout.strip()
+            shasum = subprocess.run(['shasum', '-a', '256', str(path)], capture_output=True, text=True, check=True).stdout[:16]
+        self.assertEqual(guard, shasum)
+
+
+
+class StackedBase(unittest.TestCase):
+    """gate_intake.sh against a fake gh: the base of a stacked PR is the head ref of the parent PR named in its description."""
+
+    FAKE_GH = """#!/usr/bin/env python3
+import os, sys
+a = sys.argv[1:]
+if a[:2] == ['auth', 'token']:
+    print('token')
+elif 'pulls/9' in a[1] and '.base.ref' in ' '.join(a):
+    print('open false null Sotatek-X ' + os.environ['FAKE_HEAD'] + ' ' + os.environ['FAKE_BASE'])
+elif a[1].endswith('pulls/9') and '.body' in a:
+    print(os.environ['FAKE_BODY'])
+elif a[1].endswith('pulls/5'):
+    print(os.environ.get('FAKE_PARENT_REF', ''))
+elif 'branches/develop' in a[1]:
+    print(os.environ['FAKE_HEAD'])
+elif 'issues/9' in a[1]:
+    print('type/feature')
+"""
+
+    def run_gate(self, base, body, parent_ref):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = pathlib.Path(tmp)
+            repo = tmp / 'repo'
+            repo.mkdir()
+            git = lambda *args: subprocess.run(['git', '-C', str(repo), *args], capture_output=True, text=True, check=True).stdout.strip()
+            git('init', '-q')
+            git('-c', 'user.name=t', '-c', 'user.email=t@t', 'commit', '-q', '--allow-empty', '-m', 'x')
+            head = git('rev-parse', 'HEAD')
+            git('update-ref', 'refs/remotes/pr/9', head)
+            git('update-ref', 'refs/remotes/origin/develop', head)
+            bin_dir = tmp / 'bin'
+            bin_dir.mkdir()
+            (bin_dir / 'gh').write_text(self.FAKE_GH)
+            (bin_dir / 'gh').chmod(0o755)
+            handbook = tmp / 'handbook.md'
+            handbook.write_text('x')
+            env = {'PATH': f'{bin_dir}:/usr/bin:/bin', 'RV': str(repo), 'HANDBOOK': str(handbook), 'REVIEWER': 'r', 'REPO': 'o/r',
+                   'WT_PREFIX': 'wt-', 'FAKE_HEAD': head, 'FAKE_BASE': base, 'FAKE_BODY': body, 'FAKE_PARENT_REF': parent_ref}
+            done = subprocess.run(['/bin/bash', str(HERE / 'gate_intake.sh'), '9', str(repo)], capture_output=True, text=True, env=env)
+        return done.returncode, done.stdout
+
+    def test_develop_passes(self):
+        code, out = self.run_gate('develop', '## PR Dependencies\n- None\n', '')
+        self.assertIn('PASS   base=develop', out)
+
+    def test_a_parent_pr_branch_named_in_the_dependencies_passes(self):
+        code, out = self.run_gate('feat/parent', '## PR Dependencies\n- #5\n\n## Description\nx', 'feat/parent')
+        self.assertIn('PASS   base=feat/parent (stacked on open #5', out)
+
+    def test_a_branch_nobody_named_fails(self):
+        code, out = self.run_gate('feat/parent', '## PR Dependencies\n- None\n\n## Description\nx', 'feat/parent')
+        self.assertIn('FAIL   base=feat/parent', out)
+        self.assertEqual(code, 1)
+
+    def test_a_named_parent_with_a_different_head_ref_fails(self):
+        code, out = self.run_gate('feat/parent', '## PR Dependencies\n- #5\n', 'feat/other')
+        self.assertIn('FAIL   base=feat/parent', out)
+
+    def test_a_closed_parent_fails(self):
+        code, out = self.run_gate('feat/parent', '## PR Dependencies\n- #5\n', '')
+        self.assertIn('FAIL   base=feat/parent', out)
+
+    def test_a_pr_mentioned_after_the_dependencies_section_does_not_count(self):
+        code, out = self.run_gate('feat/parent', '## PR Dependencies\n- None\n\n## Description\nfollows #5', 'feat/parent')
+        self.assertIn('FAIL   base=feat/parent', out)
+
+
+if __name__ == '__main__':
+    unittest.main()
+
+
+class DraftVoice(unittest.TestCase):
+    """check_draft: a body that reads like a colleague, and a gate that does not force odd sentences into it."""
+
+    @classmethod
+    def setUpClass(cls):
+        sys.path.insert(0, str(HERE))
+        import check_draft
+        cls.cd = check_draft
+
+    def hits(self, text):
+        return [name for pat, name in self.cd.BANNED if re.search(pat, text)]
+
+    def test_quote_ignores_case_backticks_and_full_stop(self):
+        body = 'Your tests pass. The unlink still removes only the `provider` that was asked for.'
+        self.assertTrue(self.cd.quote_in_body('the unlink still removes only the provider that was asked for', body))
+        self.assertTrue(self.cd.quote_in_body('The unlink still removes only the provider that was asked for.', body))
+
+    def test_quote_must_still_be_in_the_body(self):
+        self.assertFalse(self.cd.quote_in_body('the unlink deletes the PG provider row', 'Your tests pass.'))
+        self.assertFalse(self.cd.quote_in_body('', 'Your tests pass.'))
+        self.assertFalse(self.cd.quote_in_body(' ` ', 'Your tests pass.'))
+
+    def test_tool_narration_is_banned(self):
+        for text in (
+            'The tests cover the unlink and the guard in several ways.',
+            'I broke the unlink and the guard on purpose and your tests caught both.',
+            'I broke each fix on purpose and your tests caught every one.',
+            'It still lacks the PG retry, which we agreed to leave.',
+            "Bingyang's and Han's approvals were dismissed too, so those are still needed.",
+        ):
+            with self.subTest(text=text):
+                self.assertTrue(self.hits(text))
+
+    def test_plain_findings_are_not_banned(self):
+        for text in (
+            'I removed is_primary from the facade call and every test stayed green.',
+            'Your tests still catch the cases I tried against the guard and the unlink.',
+            'Joel\'s change request is still on the old commit, so he needs to look again.',
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(self.hits(text), [])
+
+    def test_repeated_idea_is_found(self):
+        body = ('3. Serious bug: No. The code is the same as the version I approved, rebased onto develop.\n\n'
+                'Approving again. The code is the same as the version I approved, and your tests pass.')
+        self.assertTrue(self.cd.repeated_phrase(body))
+
+    def test_repeats_that_are_not_ideas_are_left_alone(self):
+        self.assertIsNone(self.cd.repeated_phrase('1. No. 2. No issue. 3. No. Heads up that this is DM. Heads up that this is DM.'))
+        call = 'some_long_call(first_argument, second_argument, third_argument, fourth_argument, fifth_argument, sixth_argument, seventh_argument, eighth_argument, ninth_argument)'
+        code = f'```\\n{call}\\n{call}\\n```'
+        self.assertIsNone(self.cd.repeated_phrase('Please add this test.\n' + code))

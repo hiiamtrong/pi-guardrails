@@ -1,0 +1,819 @@
+import assert from "node:assert/strict";
+import { execFileSync, spawnSync } from "node:child_process";
+import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, readlinkSync, realpathSync, rmSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { dirname, join } from "node:path";
+import test from "node:test";
+
+process.env.SWAG_REVIEW_PYTHON = "python3";
+
+const { parsePrLink, parseBegin, repoOf, splitFlags, findRoot, handbookOf, assembleTools, claimProjectRules, renderTimes, readPolicy, ruleRoots, projectRulesDir, readWidget, kickoff, withIdleWarning, IDLE_MS, STALE_TOOLS_MS, POLL_MS, default: reviewPipeline } =
+  await import(`../extensions/review-pipeline.ts?test=${Date.now()}`);
+
+const STUB = `import json, os, pathlib, sys
+cmd, pr = sys.argv[1], sys.argv[2]
+work = pathlib.Path(__file__).resolve().parent / "work"
+work.mkdir(exist_ok=True)
+log = work / "calls.txt"
+with open(log, "a") as f:
+    f.write(" ".join(sys.argv[1:]) + "\\n")
+(work / "policy.txt").write_text(" ".join(os.environ.get(k, "-") for k in ("WT_PREFIX", "GATES", "IMPACT_SECTIONS", "DRAFT_CHECK", "AUTHOR_PATTERN")) + "\\n")
+(work / "env.txt").write_text(" ".join(os.environ.get(k, "-") for k in ("REPO", "RV", "HANDBOOK", "REVIEWER", "RULES")) + "\\n")
+if cmd == "begin":
+    if "STUB_REFUSE" in os.environ:
+        print(os.environ["STUB_REFUSE"], file=sys.stderr)
+        sys.exit(3)
+    (work / "widget.txt").write_text(f"Review #{pr}: Đang ở bước 00 intake\\n▶ 00 intake\\n")
+    print(os.environ["STUB_BEGIN"] if "STUB_BEGIN" in os.environ else json.dumps({"url": "http://127.0.0.1:9", "widget": str(work / "widget.txt")}))
+    if "STUB_STDERR" in os.environ:
+        print(os.environ["STUB_STDERR"], file=sys.stderr)
+elif cmd == "done":
+    print("VERDICT bước 01 comments: fail")
+    sys.exit(10)
+elif "traceback" in sys.argv:
+    print("Traceback (most recent call last): boom", file=sys.stderr)
+    sys.exit(1)
+elif "crash" in sys.argv:
+    print("broken", file=sys.stderr)
+    sys.exit(3)
+else:
+    print(f"ok {cmd}")
+`;
+
+const RULES = ["/rules/project", "/rules/global"];
+
+type Fixture = { root: string; work: string; engine: string; globalRules: string };
+
+function repo(
+  remote: string | null = "https://github.com/swaglive/swag-server.git",
+  options: { reviewer?: string | null; handbook?: string | null; projectRules?: boolean } = {},
+): Fixture {
+  const root = mkdtempSync(join(tmpdir(), "review-pipeline-"));
+  execFileSync("git", ["-C", root, "init", "-q"]);
+  if (remote) execFileSync("git", ["-C", root, "remote", "add", "origin", remote]);
+  const { reviewer = "Sotatek-TheoNguyen2", handbook = "AGENTS.local.md", projectRules = true } = options;
+  if (reviewer) execFileSync("git", ["-C", root, "config", "--local", "identity.guard.user", reviewer]);
+  if (handbook) writeFileSync(join(root, handbook), "# handbook\n");
+  process.env.REVIEW_PIPELINE_HOME = mkdtempSync(join(tmpdir(), "review-home-"));
+  const globalRules = join(process.env.REVIEW_PIPELINE_HOME, "global");
+  if (projectRules) mkdirSync(join(projectRulesDir(root), "steps"), { recursive: true });
+  const engine = mkdtempSync(join(tmpdir(), "review-engine-"));
+  mkdirSync(join(engine, "v2"));
+  writeFileSync(join(engine, "v2", "pipeline_step.py"), STUB);
+  process.env.REVIEW_PIPELINE_ENGINE = engine;
+  return { root, work: join(engine, "v2", "work"), engine, globalRules };
+}
+
+function setup() {
+  const sent: string[] = [];
+  const commands: Record<string, (args: string, ctx: unknown) => Promise<void>> = {};
+  type ToolFn = (id: string, params: Record<string, unknown>) => Promise<{ content: { text: string }[] }>;
+  const tools: Record<string, ToolFn | undefined> = {};
+  const handlers: Record<string, () => void> = {};
+  reviewPipeline({
+    registerCommand: (name: string, command: { handler: (args: string, ctx: unknown) => Promise<void> }) => {
+      commands[name] = command.handler;
+    },
+    registerTool: (tool: { name: string; execute: (id: string, params: Record<string, unknown>) => Promise<{ content: { text: string }[] }> }) => {
+      tools[tool.name] = tool.execute;
+    },
+    on: (event: string, handler: () => void) => {
+      handlers[event] = handler;
+    },
+    sendUserMessage: (text: string) => sent.push(text),
+  });
+  const notes: string[] = [];
+  const widgets: (string[] | undefined)[] = [];
+  const statuses: (string | undefined)[] = [];
+  const ctx = (cwd: string, idle = true) => ({
+    cwd,
+    isIdle: () => idle,
+    ui: {
+      notify: (message: string) => notes.push(message),
+      setWidget: (_key: string, lines: string[] | undefined) => widgets.push(lines),
+      setStatus: (_key: string, text: string | undefined) => statuses.push(text),
+    },
+  });
+  return { sent, commands, tools, handlers, notes, widgets, statuses, ctx };
+}
+
+test("parsePrLink reads a GitHub PR link, with or without scheme and trailing path, and nothing else", () => {
+  const link = "https://github.com/swaglive/swag-server/pull/19233";
+  assert.deepEqual(parsePrLink(link), { repo: "swaglive/swag-server", pr: "19233" });
+  assert.deepEqual(parsePrLink(`${link}/files`), { repo: "swaglive/swag-server", pr: "19233" });
+  assert.deepEqual(parsePrLink(`${link}#discussion_r1`), { repo: "swaglive/swag-server", pr: "19233" });
+  assert.deepEqual(parsePrLink(`  github.com/swaglive/swag-server/pull/19233  `), { repo: "swaglive/swag-server", pr: "19233" });
+  assert.deepEqual(parsePrLink("https://github.com/swaglive/swag-openim/pull/73"), { repo: "swaglive/swag-openim", pr: "73" });
+  assert.equal(parsePrLink("19233"), undefined);
+  assert.equal(parsePrLink("#19233"), undefined);
+  assert.equal(parsePrLink(""), undefined);
+  assert.equal(parsePrLink(`${link} and more words`), undefined);
+  assert.equal(parsePrLink("https://github.com/swaglive/swag-server/issues/19233"), undefined);
+});
+
+test("findRoot walks up from a subdirectory to the git checkout, and stops at the filesystem root", () => {
+  const { root } = repo();
+  const sub = join(root, "swag", "features");
+  mkdirSync(sub, { recursive: true });
+  assert.equal(findRoot(sub), root);
+  assert.equal(findRoot(mkdtempSync(join(tmpdir(), "no-repo-"))), undefined);
+});
+
+test("handbookOf prefers AGENTS.local.md, falls back to AGENTS.md, and is undefined without either", () => {
+  const both = repo().root;
+  writeFileSync(join(both, "AGENTS.md"), "x");
+  assert.equal(handbookOf(both), join(both, "AGENTS.local.md"));
+  const only = repo(undefined, { handbook: "AGENTS.md" }).root;
+  assert.equal(handbookOf(only), join(only, "AGENTS.md"));
+  assert.equal(handbookOf(repo(undefined, { handbook: null }).root), undefined);
+});
+
+test("ruleRoots lists the project rules before the global ones and skips a folder without steps", () => {
+  const f = repo();
+  assert.deepEqual(ruleRoots(f.root), [projectRulesDir(f.root)]);
+  mkdirSync(join(f.globalRules, "steps"), { recursive: true });
+  assert.deepEqual(ruleRoots(f.root), [projectRulesDir(f.root), f.globalRules]);
+  const globalOnly = repo(undefined, { projectRules: false });
+  assert.deepEqual(ruleRoots(globalOnly.root), []);
+  mkdirSync(join(globalOnly.globalRules, "steps"), { recursive: true });
+  assert.deepEqual(ruleRoots(globalOnly.root), [globalOnly.globalRules]);
+});
+
+test("projectRulesDir encodes the repo path like memory does, maps a linked worktree to its main repo, and avoids another repo's folder", () => {
+  const { root } = repo();
+  const home = process.env.REVIEW_PIPELINE_HOME!;
+  const real = realpathSync.native(root);
+  assert.equal(projectRulesDir(root), join(home, "projects", real.replaceAll("/", "-")));
+
+  const linked = mkdtempSync(join(tmpdir(), "linked-"));
+  const gitDir = join(root, ".git", "worktrees", "wt");
+  mkdirSync(gitDir, { recursive: true });
+  writeFileSync(join(gitDir, "commondir"), "../..\n");
+  writeFileSync(join(linked, ".git"), `gitdir: ${gitDir}\n`);
+  assert.equal(projectRulesDir(linked), projectRulesDir(root));
+
+  const claimed = projectRulesDir(root);
+  mkdirSync(claimed, { recursive: true });
+  writeFileSync(join(claimed, ".project.json"), JSON.stringify({ root: "/some/other/place" }));
+  assert.match(projectRulesDir(root), new RegExp(`^${claimed}-[0-9a-f]{10}$`));
+});
+
+test("assembleTools links the engine, lets global then project files override it, and rebuilds on every run", () => {
+  const f = repo();
+  mkdirSync(join(f.engine, "v2"), { recursive: true });
+  writeFileSync(join(f.engine, "impact_map.py"), "engine");
+  mkdirSync(join(f.globalRules, "steps"), { recursive: true });
+  mkdirSync(join(f.globalRules, "tools"), { recursive: true });
+  writeFileSync(join(f.globalRules, "tools", "impact_map.py"), "global");
+  writeFileSync(join(f.globalRules, "tools", "only_global.sh"), "g");
+  mkdirSync(join(projectRulesDir(f.root), "tools", "v2"), { recursive: true });
+  writeFileSync(join(projectRulesDir(f.root), "tools", "impact_map.py"), "project");
+  writeFileSync(join(projectRulesDir(f.root), "tools", "v2", "check_draft_x.py"), "x");
+  const tools = join(f.root, "reports", "reviews", "tools");
+  const rules = ruleRoots(f.root);
+  assert.equal(assembleTools(f.root, rules), undefined);
+  assert.equal(readFileSync(join(tools, "impact_map.py"), "utf8"), "project");
+  assert.equal(readFileSync(join(tools, "only_global.sh"), "utf8"), "g");
+  assert.equal(readFileSync(join(tools, "v2", "check_draft_x.py"), "utf8"), "x");
+  assert.ok(readFileSync(join(tools, "v2", "pipeline_step.py"), "utf8").length > 0);
+  rmSync(join(projectRulesDir(f.root), "tools", "impact_map.py"), { force: true });
+  assert.equal(assembleTools(f.root, ruleRoots(f.root)), undefined);
+  assert.equal(readFileSync(join(tools, "impact_map.py"), "utf8"), "global");
+});
+
+test("assembleTools replaces a link left by an older version and refuses a real folder it does not manage", () => {
+  const f = repo();
+  const tools = join(f.root, "reports", "reviews", "tools");
+  mkdirSync(dirname(tools), { recursive: true });
+  symlinkSync(f.engine, tools);
+  assert.equal(assembleTools(f.root, ruleRoots(f.root)), undefined);
+  assert.notEqual(readlinkSync(tools), f.engine);
+  assert.equal(existsSync(f.engine), true);
+  const real = repo();
+  const realTools = join(real.root, "reports", "reviews", "tools");
+  mkdirSync(realTools, { recursive: true });
+  writeFileSync(join(realTools, "impact_map.py"), "mine");
+  assert.match(assembleTools(real.root, ruleRoots(real.root)) ?? "", /chưa do review-pipeline quản lý/);
+  assert.equal(readFileSync(join(realTools, "impact_map.py"), "utf8"), "mine");
+});
+
+test("assembleTools swaps the tools link in one step, drops the folder it replaced, and never removes the engine", () => {
+  const f = repo();
+  const reviews = join(f.root, "reports", "reviews");
+  const tools = join(reviews, "tools");
+  assert.equal(assembleTools(f.root, ruleRoots(f.root), { REPO: "o/r" }), undefined);
+  const first = readlinkSync(tools);
+  assert.equal(assembleTools(f.root, ruleRoots(f.root), { REPO: "o/r" }), undefined);
+  const second = readlinkSync(tools);
+  assert.notEqual(first, second);
+  assert.equal(existsSync(first), false);
+  assert.deepEqual(readdirSync(reviews).filter((name) => name.startsWith(".tools-") || name.includes(".swap-")), [second.split("/").pop()]);
+  assert.equal(existsSync(join(f.engine, "v2", "pipeline_step.py")), true);
+});
+
+test("assembleTools writes the environment next to the tools, quoted for sh, and a script run by hand loads it", () => {
+  const f = repo();
+  const real = join(dirname(new URL(import.meta.url).pathname), "..", "review-pipeline");
+  process.env.REVIEW_PIPELINE_ENGINE = real;
+  const env = { REPO: "o/r", RV: f.root, HANDBOOK: join(f.root, "AGENTS.local.md"), REVIEWER: "it's-me", GATES: "00 02", WT_PREFIX: "wt-" };
+  assert.equal(assembleTools(f.root, [], env), undefined);
+  const file = join(f.root, "reports", "reviews", "tools", ".pipeline-env");
+  const loaded = execFileSync("sh", ["-c", `. "${file}"; printf '%s|%s' "$REVIEWER" "$GATES"`], { encoding: "utf8" });
+  assert.equal(loaded, "it's-me|00 02");
+  const run = (script: string, ...args: string[]) =>
+    spawnSync("bash", [join(f.root, "reports", "reviews", "tools", script), ...args], { cwd: f.root, encoding: "utf8", env: { PATH: process.env.PATH, HOME: process.env.HOME } });
+  // The fake reviewer has no token, so each script stops at its first gh call; what matters is that it got that far.
+  for (const script of ["v2/gate_intake.sh", "v2/pipeline_status.sh", "v2/after_post.sh", "comments_seen.sh"]) {
+    const out = run(script, "1", "draft.md");
+    assert.doesNotMatch(out.stdout + out.stderr, /set RV|set REPO|set REVIEWER|set HANDBOOK|unbound variable/, script);
+  }
+  assert.match(run("v2/gate_intake.sh", "1").stdout, /INTAKE: ABORT/);
+  const named = spawnSync("bash", [join(real, "v2", "gate_intake.sh"), "1"], { cwd: f.root, encoding: "utf8", env: { PATH: process.env.PATH, HOME: process.env.HOME } });
+  assert.match(named.stderr, /set RV/);
+});
+
+test("findRoot maps a PR worktree to the review clone instead of the worktree itself", () => {
+  const f = repo();
+  const gitDir = join(f.root, ".git", "worktrees", "wt");
+  mkdirSync(gitDir, { recursive: true });
+  writeFileSync(join(gitDir, "commondir"), "../..\n");
+  const worktree = mkdtempSync(join(tmpdir(), "swag-pr-"));
+  writeFileSync(join(worktree, ".git"), `gitdir: ${gitDir}\n`);
+  mkdirSync(join(worktree, "swag"));
+  assert.equal(findRoot(join(worktree, "swag")), realpathSync.native(f.root));
+  assert.equal(findRoot(join(f.root, "swag")), f.root);
+});
+
+test("claimProjectRules records the owner once, and only for a folder that has rules", () => {
+  const f = repo();
+  const file = join(projectRulesDir(f.root), ".project.json");
+  claimProjectRules(f.root);
+  assert.deepEqual(JSON.parse(readFileSync(file, "utf8")), { root: realpathSync.native(f.root) });
+  writeFileSync(file, JSON.stringify({ root: realpathSync.native(f.root), kept: true }));
+  claimProjectRules(f.root);
+  assert.equal(JSON.parse(readFileSync(file, "utf8")).kept, true);
+  const bare = repo(undefined, { projectRules: false });
+  claimProjectRules(bare.root);
+  assert.equal(existsSync(join(projectRulesDir(bare.root), ".project.json")), false);
+});
+
+test("/review-pr does not touch the checkout when the agent is busy", async () => {
+  const f = repo();
+  const { commands, ctx, notes } = setup();
+  await commands["review-pr"]("https://github.com/swaglive/swag-server/pull/19233", ctx(f.root, false));
+  assert.match(notes[0], /bận/);
+  assert.equal(existsSync(join(f.root, "reports")), false);
+  assert.equal(existsSync(join(projectRulesDir(f.root), ".project.json")), false);
+});
+
+test("readPolicy merges pipeline.json with the project over global, and rejects a typo or a wrong type", () => {
+  const f = repo();
+  mkdirSync(join(f.globalRules, "steps"), { recursive: true });
+  writeFileSync(join(f.globalRules, "pipeline.json"), JSON.stringify({ worktreePrefix: "g-", impactSections: 8, gates: ["00", "06"] }));
+  writeFileSync(join(projectRulesDir(f.root), "pipeline.json"), JSON.stringify({ worktreePrefix: "p-", draftCheck: "check.py", authorPattern: "^(a|b)-" }));
+  assert.deepEqual(readPolicy(ruleRoots(f.root)), { worktreePrefix: "p-", impactSections: 8, gates: ["00", "06"], draftCheck: "check.py", authorPattern: "^(a|b)-" });
+  for (const bad of [{ gate: ["00"] }, { gates: ["99"] }, { impactSections: 0 }, { draftCheck: "../x.py" }, { worktreePrefix: 3 }, { authorPattern: "" }, { authorPattern: "(" }, { authorPattern: 5 }]) {
+    writeFileSync(join(projectRulesDir(f.root), "pipeline.json"), JSON.stringify(bad));
+    assert.throws(() => readPolicy(ruleRoots(f.root)), /lạ hoặc giá trị sai kiểu/);
+  }
+  writeFileSync(join(projectRulesDir(f.root), "pipeline.json"), "{nope");
+  assert.throws(() => readPolicy(ruleRoots(f.root)), /không đọc được/);
+});
+
+test("/review-pr exports the policy to the pipeline, always keeps intake, and defaults the worktree prefix to the repo name", async () => {
+  const f = repo("https://github.com/swaglive/swag-op-console-server.git");
+  const { commands, ctx, handlers } = setup();
+  await commands["review-pr"]("https://github.com/swaglive/swag-op-console-server/pull/1076", ctx(f.root));
+  assert.equal(readFileSync(join(f.work, "policy.txt"), "utf8"), "swag-op-console-server-pr- - - - -\n");
+  handlers.session_shutdown();
+  writeFileSync(join(projectRulesDir(f.root), "pipeline.json"), JSON.stringify({ worktreePrefix: "swag-op-pr-", gates: ["02", "06"], impactSections: 9, draftCheck: "check_draft_opc.py", authorPattern: "^acme-" }));
+  await commands["review-pr"]("https://github.com/swaglive/swag-op-console-server/pull/1076", ctx(f.root));
+  assert.equal(readFileSync(join(f.work, "policy.txt"), "utf8"), "swag-op-pr- 00 02 06 9 check_draft_opc.py ^acme-\n");
+  handlers.session_shutdown();
+});
+
+test("/review-pr stops with a clear message when pipeline.json is wrong, before it touches the checkout", async () => {
+  const f = repo();
+  writeFileSync(join(projectRulesDir(f.root), "pipeline.json"), JSON.stringify({ gate: [] }));
+  const { commands, notes, sent, ctx } = setup();
+  await commands["review-pr"]("https://github.com/swaglive/swag-server/pull/19233", ctx(f.root));
+  assert.equal(sent.length, 0);
+  assert.match(notes[0], /pipeline\.json: khóa "gate" lạ/);
+  assert.equal(existsSync(join(f.root, "reports")), false);
+});
+
+test("renderTimes turns the engine's since marks into the time that has passed, and leaves other text alone", () => {
+  const now = 1_000_000 * 1000;
+  assert.deepEqual(
+    renderTimes(["Review #7: Đang ở bước 01 comments ({{since:999955}}): đọc", "▶ 01 comments ({{since:999955}})", "✔ 00 intake (12s)", "· 02 map"], now),
+    ["Review #7: Đang ở bước 01 comments (45s): đọc", "▶ 01 comments (45s)", "✔ 00 intake (12s)", "· 02 map"],
+  );
+  assert.equal(renderTimes(["({{since:999875}})"], now)[0], "(2m05s)");
+  assert.equal(renderTimes(["({{since:1000000}}) ({{since:1000500}})"], now)[0], "(0s) (0s)");
+});
+
+test("/review-pr widget keeps counting while the engine's file does not change", async () => {
+  const { root, work } = repo();
+  const { commands, widgets, ctx, handlers } = setup();
+  await commands["review-pr"]("https://github.com/swaglive/swag-server/pull/19233", ctx(root));
+  const start = Math.floor(Date.now() / 1000) - 120;
+  writeFileSync(join(work, "widget.txt"), `Review #19233: Đang ở bước 01 comments ({{since:${start}}}): đọc\n▶ 01 comments ({{since:${start}}})\n`);
+  await new Promise((resolve) => setTimeout(resolve, POLL_MS + 400));
+  const first = widgets.at(-1)![0];
+  assert.match(first, /\(2m0[0-9]s\)/);
+  await new Promise((resolve) => setTimeout(resolve, POLL_MS * 2 + 400));
+  assert.notEqual(widgets.at(-1)![0], first);
+  handlers.session_shutdown();
+});
+
+test("readWidget returns the lines of the file, or undefined while it is missing or empty", () => {
+  const { root } = repo();
+  assert.equal(readWidget(join(root, "missing.txt")), undefined);
+  const file = join(root, "w.txt");
+  writeFileSync(file, "");
+  assert.equal(readWidget(file), undefined);
+  writeFileSync(file, "a\n\nb\n");
+  assert.deepEqual(readWidget(file), ["a", "b"]);
+});
+
+test("kickoff names the PR and the URL, and keeps the step 06 stop", () => {
+  const text = kickoff("swaglive/swag-server", "Sotatek-TheoNguyen2", RULES, "19233", "http://127.0.0.1:8765");
+  assert.match(text, /swaglive\/swag-server #19233/);
+  assert.match(text, /__REVIEWER__ = Sotatek-TheoNguyen2/);
+  assert.match(text, /\/rules\/project, \/rules\/global/);
+  assert.match(text, /http:\/\/127\.0\.0\.1:8765/);
+  assert.match(text, /Dừng sau bước 05/);
+});
+
+test("/review-pr opens the UI, shows the widget, then hands the agent its kickoff once", async () => {
+  const { root, work } = repo();
+  const { commands, notes, sent, widgets, statuses, ctx, handlers } = setup();
+  await commands["review-pr"]("https://github.com/swaglive/swag-server/pull/19233", ctx(root));
+  assert.equal(sent.length, 1);
+  assert.match(sent[0], /#19233/);
+  assert.match(sent[0], /127\.0\.0\.1:9/);
+  assert.match(notes.join("\n"), /UI ở http:\/\/127\.0\.0\.1:9/);
+  assert.deepEqual(widgets[0], ["Review #19233: Đang ở bước 00 intake", "▶ 00 intake"]);
+  assert.equal(statuses[0], "Review #19233: Đang ở bước 00 intake");
+
+  writeFileSync(join(work, "widget.txt"), "Review #19233: Xong: đã post\n✔ 00 intake\n");
+  await new Promise((resolve) => setTimeout(resolve, POLL_MS + 400));
+  assert.equal(widgets.at(-1)?.[0], "Review #19233: Xong: đã post");
+  handlers.session_shutdown();
+});
+
+test("/review-pr refuses outside a checkout, with a busy agent, without a link, and for a repo that is not the checkout's", async () => {
+  const { root, work } = repo();
+  const { commands, notes, sent, ctx } = setup();
+  const review = commands["review-pr"];
+  await review("", ctx(root));
+  await review("19233", ctx(root));
+  await review("https://github.com/swaglive/swag-server/pull/19233", ctx(mkdtempSync(join(tmpdir(), "elsewhere-"))));
+  await review("https://github.com/swaglive/swag-openim/pull/1234", ctx(root));
+  await review("https://github.com/swaglive/swag-server/pull/19233", ctx(root, false));
+  assert.equal(sent.length, 0);
+  assert.equal(notes.length, 5);
+  assert.match(notes[0], /Usage: \/review-pr/);
+  assert.match(notes[1], /Usage: \/review-pr/);
+  assert.match(notes[2], /review checkout của repo cần review/);
+  assert.match(notes[3], /checkout này là swaglive\/swag-server, không phải swaglive\/swag-openim/);
+  assert.match(notes[4], /bận/);
+  assert.equal(existsSync(join(work, "calls.txt")), false);
+});
+
+test("/review-pr refuses a checkout without a handbook, a reviewer or a free tools path, and starts nothing", async () => {
+  const link = "https://github.com/swaglive/swag-server/pull/19233";
+  const noHandbook = repo(undefined, { handbook: null });
+  const noReviewer = repo(undefined, { reviewer: null });
+  const realTools = repo();
+  mkdirSync(join(realTools.root, "reports", "reviews", "tools"), { recursive: true });
+  const { commands, notes, sent, ctx } = setup();
+  await commands["review-pr"](link, ctx(noHandbook.root));
+  await commands["review-pr"](link, ctx(noReviewer.root));
+  await commands["review-pr"](link, ctx(realTools.root));
+  assert.equal(sent.length, 0);
+  assert.match(notes[0], /AGENTS\.local\.md hoặc AGENTS\.md/);
+  assert.match(notes[1], /identity\.guard\.user/);
+  assert.match(notes[2], /là thư mục thật/);
+  for (const f of [noHandbook, noReviewer, realTools]) assert.equal(existsSync(join(f.work, "calls.txt")), false);
+});
+
+test("repoOf reads owner/name from https, scp-style host aliases and ssh remotes, and nothing else", () => {
+  assert.equal(repoOf("https://github.com/swaglive/swag-server.git"), "swaglive/swag-server");
+  assert.equal(repoOf("https://github.com/swaglive/swag-server"), "swaglive/swag-server");
+  assert.equal(repoOf("git@github-harvey:swaglive/swag-op-console-server.git\n"), "swaglive/swag-op-console-server");
+  assert.equal(repoOf("ssh://git@github.com/swaglive/swag-openim.git"), "swaglive/swag-openim");
+  assert.equal(repoOf(""), undefined);
+  assert.equal(repoOf("not-a-remote"), undefined);
+});
+
+test("/review-pr works in the review checkout of another repo and hands that repo to the pipeline", async () => {
+  const { root, work } = repo("git@github-harvey:swaglive/swag-op-console-server.git", { reviewer: "Sotatek-HarveyTran", handbook: "AGENTS.md" });
+  const { commands, notes, sent, tools, ctx, handlers } = setup();
+  await commands["review-pr"]("https://github.com/SwagLive/swag-op-console-server/pull/1077", ctx(root));
+  assert.equal(sent.length, 1);
+  assert.match(sent[0], /swaglive\/swag-op-console-server #1077/);
+  assert.match(sent[0], /__REPO__ = swaglive\/swag-op-console-server và __REVIEWER__ = Sotatek-HarveyTran/);
+  assert.equal(readFileSync(join(work, "env.txt"), "utf8"), `swaglive/swag-op-console-server ${root} ${join(root, "AGENTS.md")} Sotatek-HarveyTran ${projectRulesDir(root)}\n`);
+  await tools.review_step!("id", { action: "note", step: "01", message: "x" });
+  assert.equal(readFileSync(join(work, "env.txt"), "utf8"), `swaglive/swag-op-console-server ${root} ${join(root, "AGENTS.md")} Sotatek-HarveyTran ${projectRulesDir(root)}\n`);
+  assert.doesNotMatch(notes.join("\n"), /Review checkout này/);
+  handlers.session_shutdown();
+});
+
+test("/review-pr refuses a checkout without a readable origin remote and starts nothing", async () => {
+  const { root, work } = repo(null);
+  const { commands, notes, sent, ctx } = setup();
+  await commands["review-pr"]("https://github.com/swaglive/swag-server/pull/19233", ctx(root));
+  assert.equal(sent.length, 0);
+  assert.match(notes[0], /Không đọc được remote origin/);
+  assert.equal(existsSync(join(work, "calls.txt")), false);
+});
+
+test("review_step is not available before /review-pr and rejects bad calls after it", async () => {
+  const { root } = repo();
+  const { commands, tools, ctx, handlers } = setup();
+  assert.equal(tools.review_step, undefined);
+  await commands["review-pr"]("https://github.com/swaglive/swag-server/pull/19233", ctx(root));
+  const call = (params: Record<string, unknown>) => tools.review_step!("1", params);
+  await assert.rejects(call({ action: "start" }), /cần step/);
+  await assert.rejects(call({ action: "start", step: "09" }), /cần step/);
+  await assert.rejects(call({ action: "note", step: "01" }), /cần message/);
+  await assert.rejects(call({ action: "jump", step: "01" }), /action phải là/);
+  handlers.session_shutdown();
+});
+
+test("review_step passes the call to the pipeline, returns a red gate as text, and throws when the script itself breaks", async () => {
+  const { root, work } = repo();
+  const { commands, tools, ctx, handlers } = setup();
+  await commands["review-pr"]("https://github.com/swaglive/swag-server/pull/19233", ctx(root));
+  const step = tools.review_step!;
+  const started = await step("1", { action: "start", step: "00", message: "fetch" });
+  assert.equal(started.content[0].text, "ok start");
+  const red = await step("2", { action: "done", step: "01" });
+  assert.match(red.content[0].text, /VERDICT bước 01 comments: fail/);
+  await assert.rejects(step("3", { action: "note", step: "02", message: "crash" }), /broken/);
+  await step("4", { action: "end", message: "xong" });
+  const calls = readWidget(join(work, "calls.txt")) ?? [];
+  assert.deepEqual(calls, [
+    `begin 19233 --owner ${process.pid}`,
+    "start 19233 00 --msg fetch",
+    "done 19233 01",
+    "note 19233 02 --msg crash",
+    "end 19233 --msg xong",
+  ]);
+  handlers.session_shutdown();
+});
+
+test("parseBegin returns url and widget only when both are strings on the last line", () => {
+  const good = JSON.stringify({ url: "http://127.0.0.1:8765", widget: "/w.txt" });
+  assert.deepEqual(parseBegin(good), { url: "http://127.0.0.1:8765", widget: "/w.txt" });
+  assert.deepEqual(parseBegin(`noise\n${good}`), { url: "http://127.0.0.1:8765", widget: "/w.txt" });
+  for (const bad of ["", "null", "{}", "[]", "5", '"text"', "not json", '{"url":"u"}', '{"widget":"w"}', '{"url":null,"widget":"w"}', '{"url":1,"widget":"w"}', `${good}\nwarning`]) {
+    assert.equal(parseBegin(bad), undefined, JSON.stringify(bad));
+  }
+});
+
+for (const [name, output] of [["an empty object", "{}"], ["null", "null"], ["nothing", ""], ["text that is not JSON", "oops"]]) {
+  test(`/review-pr reports an error and starts nothing when begin prints ${name}`, async () => {
+    const { root, work } = repo();
+    const { commands, notes, sent, widgets, ctx } = setup();
+    process.env.STUB_BEGIN = output;
+    try {
+      await commands["review-pr"]("https://github.com/swaglive/swag-server/pull/19233", ctx(root));
+    } finally {
+      delete process.env.STUB_BEGIN;
+    }
+    assert.equal(sent.length, 0);
+    assert.equal(widgets.length, 0);
+    assert.equal(notes.length, 1);
+    assert.match(notes[0], /Không đọc được đầu ra của begin/);
+    assert.equal(notes[0].includes("undefined"), false);
+    assert.equal(existsSync(join(work, "calls.txt")), true);
+  });
+}
+
+test("/review-pr reports the failure when the Python binary does not exist", async () => {
+  const { root } = repo();
+  const { commands, notes, sent, ctx } = setup();
+  process.env.SWAG_REVIEW_PYTHON = "python-does-not-exist";
+  try {
+    await commands["review-pr"]("https://github.com/swaglive/swag-server/pull/19233", ctx(root));
+  } finally {
+    process.env.SWAG_REVIEW_PYTHON = "python3";
+  }
+  assert.equal(sent.length, 0);
+  assert.equal(notes.length, 1);
+  assert.match(notes[0], /Không bật được UI: .*ENOENT/);
+});
+
+test("/review-pr still starts when begin prints a warning on stderr after its JSON", async () => {
+  const { root } = repo();
+  const { commands, notes, sent, ctx, handlers } = setup();
+  process.env.STUB_STDERR = "DeprecationWarning: something noisy";
+  try {
+    await commands["review-pr"]("https://github.com/swaglive/swag-server/pull/19233", ctx(root));
+  } finally {
+    delete process.env.STUB_STDERR;
+  }
+  assert.equal(sent.length, 1);
+  assert.match(notes.join("\n"), /UI ở http:\/\/127\.0\.0\.1:9/);
+  handlers.session_shutdown();
+});
+
+test("review_step throws on a traceback (exit 1) and returns only a red gate (exit 10) as a result", async () => {
+  const { root } = repo();
+  const { commands, tools, ctx, handlers } = setup();
+  await commands["review-pr"]("https://github.com/swaglive/swag-server/pull/19233", ctx(root));
+  const step = tools.review_step!;
+  await assert.rejects(step("1", { action: "note", step: "02", message: "traceback" }), /Traceback/);
+  const red = await step("2", { action: "done", step: "01" });
+  assert.match(red.content[0].text, /VERDICT bước 01 comments: fail/);
+  handlers.session_shutdown();
+});
+
+test("splitFlags takes --takeover and --restart out of the arguments and keeps the link", () => {
+  const link = "https://github.com/swaglive/swag-server/pull/19233";
+  assert.deepEqual(splitFlags(`${link} --takeover`), { rest: link, flags: ["--takeover"] });
+  assert.deepEqual(splitFlags(`  ${link}   --restart  --takeover `), { rest: link, flags: ["--restart", "--takeover"] });
+  assert.deepEqual(splitFlags(link), { rest: link, flags: [] });
+  assert.deepEqual(splitFlags("--restart"), { rest: "", flags: ["--restart"] });
+  assert.deepEqual(splitFlags(""), { rest: "", flags: [] });
+});
+
+test("parseBegin keeps the resume fields only when they have the right types", () => {
+  const base = { url: "http://127.0.0.1:8765", widget: "/w.txt" };
+  assert.deepEqual(parseBegin(JSON.stringify({ ...base, resumed: true, next: "03", done: ["00", "01"] })), { ...base, resumed: true, next: "03", done: ["00", "01"] });
+  assert.deepEqual(parseBegin(JSON.stringify({ ...base, resumed: false, next: null, done: [] })), { ...base, resumed: false, next: null, done: [] });
+  assert.deepEqual(parseBegin(JSON.stringify({ ...base, resumed: "yes", next: 3, done: "00" })), base);
+});
+
+test("kickoff for a resumed review names the next step and tells the agent to redo intake, a fresh one does not", () => {
+  const fresh = kickoff("swaglive/swag-server", "Sotatek-TheoNguyen2", RULES, "19233", "http://127.0.0.1:8765");
+  assert.doesNotMatch(fresh, /ĐANG DỞ/);
+  const resumed = kickoff("swaglive/swag-server", "Sotatek-TheoNguyen2", RULES, "19233", "http://127.0.0.1:8765", { url: "u", widget: "w", resumed: true, next: "03", done: ["00", "01", "02"] });
+  assert.match(resumed, /ĐANG DỞ/);
+  assert.match(resumed, /bước đã xong: 00, 01, 02; bước kế: 03/);
+  assert.match(resumed, /Chạy lại bước 00 trước/);
+  assert.match(resumed, /events\.jsonl/);
+  assert.match(kickoff("swaglive/swag-server", "Sotatek-TheoNguyen2", RULES, "19233", "u", { url: "u", widget: "w", resumed: true, next: null, done: [] }), /chưa có; bước kế: không còn/);
+});
+
+test("/review-pr passes the pi pid and the flags to begin, and says when it resumes", async () => {
+  const { root, work } = repo();
+  const { commands, notes, sent, ctx, handlers } = setup();
+  process.env.STUB_BEGIN = JSON.stringify({ url: "http://127.0.0.1:9", widget: join(work, "widget.txt"), resumed: true, next: "03", done: ["00", "01", "02"] });
+  try {
+    await commands["review-pr"]("https://github.com/swaglive/swag-server/pull/19233 --takeover", ctx(root));
+  } finally {
+    delete process.env.STUB_BEGIN;
+  }
+  assert.deepEqual(readWidget(join(work, "calls.txt")), [`begin 19233 --owner ${process.pid} --takeover`]);
+  assert.match(notes.join("\n"), /tiếp tục review dang dở/);
+  assert.match(sent[0], /ĐANG DỞ/);
+  assert.match(sent[0], /bước kế: 03/);
+  handlers.session_shutdown();
+});
+
+test("/review-pr shows why another pi owns the review and starts nothing", async () => {
+  const { root } = repo();
+  const { commands, notes, sent, widgets, ctx } = setup();
+  process.env.STUB_REFUSE = "review #19233 đang chạy ở tiến trình pi 4242. Thêm --takeover nếu chắc.";
+  try {
+    await commands["review-pr"]("https://github.com/swaglive/swag-server/pull/19233", ctx(root));
+  } finally {
+    delete process.env.STUB_REFUSE;
+  }
+  assert.equal(sent.length, 0);
+  assert.equal(widgets.length, 0);
+  assert.equal(notes.length, 1);
+  assert.match(notes[0], /Không bật được UI: review #19233 đang chạy ở tiến trình pi 4242.*--takeover/);
+});
+
+test("parseBegin keeps waiting only as a string or null", () => {
+  const base = { url: "u", widget: "w" };
+  assert.deepEqual(parseBegin(JSON.stringify({ ...base, waiting: "05" })), { ...base, waiting: "05" });
+  assert.deepEqual(parseBegin(JSON.stringify({ ...base, waiting: null })), { ...base, waiting: null });
+  assert.deepEqual(parseBegin(JSON.stringify({ ...base, waiting: 5 })), base);
+});
+
+test("kickoff tells the agent to wait for Theo when a step is waiting, and not otherwise", () => {
+  const waiting = kickoff("swaglive/swag-server", "Sotatek-TheoNguyen2", RULES, "19233", "u", { url: "u", widget: "w", resumed: true, next: "05", done: ["00", "01", "02", "03", "04"], waiting: "05" });
+  assert.match(waiting, /Bước 05 đang CHỜ người review \(Sotatek-TheoNguyen2\)/);
+  assert.match(waiting, /Chưa làm bước nào sau nó/);
+  const free = kickoff("swaglive/swag-server", "Sotatek-TheoNguyen2", RULES, "19233", "u", { url: "u", widget: "w", resumed: true, next: "02", done: ["00", "01"], waiting: null });
+  assert.doesNotMatch(free, /CHỜ người review/);
+  assert.doesNotMatch(kickoff("swaglive/swag-server", "Sotatek-TheoNguyen2", RULES, "19233", "u"), /CHỜ người review/);
+});
+
+test("withIdleWarning replaces the first line only for a running step that was silent long enough", () => {
+  const running = ["Review #19233: Đang ở bước 03 verify (40s): chạy mutant", "✔ 00 intake", "▶ 03 verify"];
+  assert.deepEqual(withIdleWarning(running, IDLE_MS - 1, "19233"), running);
+  const warned = withIdleWarning(running, IDLE_MS, "19233");
+  assert.match(warned[0], /^Review #19233: 5 phút không có ghi chú mới/);
+  assert.deepEqual(warned.slice(1), running.slice(1));
+  assert.match(withIdleWarning(running, 12 * 60_000, "19233")[0], /12 phút/);
+  const waiting = ["Review #19233: Bước 05 draft xong: chờ bạn đọc bản nháp rồi nói OK post", "✔ 00 intake"];
+  assert.deepEqual(withIdleWarning(waiting, 3_600_000, "19233"), waiting);
+  const done = ["Review #19233: Xong: đã post"];
+  assert.deepEqual(withIdleWarning(done, 3_600_000, "19233"), done);
+  assert.deepEqual(withIdleWarning(running, 3_600_000, "999"), running);
+  assert.deepEqual(withIdleWarning([], 3_600_000, "19233"), []);
+});
+
+test("/review-pr widget shows the silence warning when events.jsonl has not been touched for ten minutes", async () => {
+  const { root, work } = repo();
+  mkdirSync(work, { recursive: true });
+  const events = join(work, "events.jsonl");
+  writeFileSync(events, "");
+  const old = new Date(Date.now() - 10 * 60_000);
+  utimesSync(events, old, old);
+  const { commands, widgets, statuses, ctx, handlers } = setup();
+  await commands["review-pr"]("https://github.com/swaglive/swag-server/pull/19233", ctx(root));
+  assert.match(widgets[0]?.[0] ?? "", /^Review #19233: 10 phút không có ghi chú mới/);
+  assert.equal(widgets[0]?.[1], "▶ 00 intake");
+  assert.match(statuses[0] ?? "", /10 phút/);
+  handlers.session_shutdown();
+});
+
+test("kickoff names the given reviewer and carries no Theo, Han or SotaTek rule for another reviewer", () => {
+  const resumed = { url: "u", widget: "w", resumed: true, next: "05", done: ["00", "01", "02", "03", "04"], waiting: "05" };
+  const text = kickoff("acme/widgets", "acme-reviewer", RULES, "7", "u", resumed);
+  assert.match(text, /Dừng sau bước 05 để acme-reviewer đọc/);
+  assert.match(text, /CHỜ người review \(acme-reviewer\)/);
+  assert.doesNotMatch(text, /Theo|Han\b|SotaTek|SWAG/);
+});
+
+test("assembleTools removes tools folders an older build left behind, and only the old ones", () => {
+  const f = repo();
+  assert.equal(assembleTools(f.root, []), undefined);
+  const reviews = join(f.root, "reports", "reviews");
+  const stale = join(reviews, ".tools-stale");
+  const fresh = join(reviews, ".tools-fresh");
+  mkdirSync(stale);
+  mkdirSync(fresh);
+  const old = new Date(Date.now() - STALE_TOOLS_MS - 60_000);
+  utimesSync(stale, old, old);
+  assert.equal(assembleTools(f.root, []), undefined);
+  assert.equal(existsSync(stale), false);
+  assert.equal(existsSync(fresh), true);
+  assert.equal(existsSync(join(reviews, "tools", ".review-pipeline-managed")), true);
+});
+
+test("run_tests_rc.sh refuses an argument with spaces instead of letting sh split it into a pytest usage error", () => {
+  const f = repo();
+  const real = join(dirname(new URL(import.meta.url).pathname), "..", "review-pipeline");
+  process.env.REVIEW_PIPELINE_ENGINE = real;
+  const env = { REPO: "o/r", RV: f.root, HANDBOOK: join(f.root, "AGENTS.local.md"), REVIEWER: "me", WT_PREFIX: "wt-" };
+  assert.equal(assembleTools(f.root, [], env), undefined);
+  const script = join(f.root, "reports", "reviews", "tools", "v2", "run_tests_rc.sh");
+  const run = (...args: string[]) => spawnSync("bash", [script, "1", ...args], { cwd: f.root, encoding: "utf8", env: { PATH: process.env.PATH, HOME: process.env.HOME } });
+  const refused = run("-k", "case1 or case2");
+  assert.equal(refused.status, 2);
+  assert.match(refused.stderr, /argument with spaces \(case1 or case2\)/);
+  assert.doesNotMatch(run("-k", "case1").stderr, /argument with spaces/);
+});
+
+test("assembleTools is not stopped by a .tools-* entry it cannot read", () => {
+  const f = repo();
+  assert.equal(assembleTools(f.root, []), undefined);
+  const reviews = join(f.root, "reports", "reviews");
+  symlinkSync(join(f.root, "gone"), join(reviews, ".tools-dangling"));
+  assert.equal(assembleTools(f.root, []), undefined);
+  assert.equal(existsSync(join(reviews, "tools", ".review-pipeline-managed")), true);
+});
+
+test("gate 00 checks the author only against the authorPattern the project set", () => {
+  const f = repo();
+  const real = join(dirname(new URL(import.meta.url).pathname), "..", "review-pipeline");
+  process.env.REVIEW_PIPELINE_ENGINE = real;
+  const bin = mkdtempSync(join(tmpdir(), "fakegh-"));
+  writeFileSync(join(bin, "gh"), `#!/bin/sh
+case "$*" in
+  *"auth token"*) echo token ;;
+  *"branches/develop"*) echo 0000000000000000000000000000000000000001 ;;
+  *"issues/"*) echo "type/bug" ;;
+  *"pulls/"*) echo "open false null $FAKE_AUTHOR 0000000000000000000000000000000000000002 develop" ;;
+esac
+`, { mode: 0o755 });
+  const gate = (author: string, pattern?: string) => {
+    const env = { REPO: "o/r", RV: f.root, HANDBOOK: join(f.root, "AGENTS.local.md"), REVIEWER: "me", WT_PREFIX: "wt-", ...(pattern ? { AUTHOR_PATTERN: pattern } : {}) };
+    assert.equal(assembleTools(f.root, [], env), undefined);
+    return spawnSync("bash", [join(f.root, "reports", "reviews", "tools", "v2", "gate_intake.sh"), "1"], {
+      cwd: f.root, encoding: "utf8", env: { PATH: `${bin}:${process.env.PATH}`, HOME: process.env.HOME, FAKE_AUTHOR: author },
+    }).stdout;
+  };
+  assert.match(gate("acme-dev", "^acme-"), /INTAKE: PASS   author=acme-dev/);
+  assert.match(gate("outsider", "^acme-"), /INTAKE: FAIL   author=outsider/);
+  const unchecked = gate("outsider");
+  assert.match(unchecked, /INTAKE: INFO   author=outsider \(pipeline.json không có authorPattern/);
+  assert.doesNotMatch(unchecked, /FAIL   author/);
+});
+
+const BOARD_STUB = `import sys
+import os, time
+print("BOARD " + " ".join(sys.argv[1:]) + " COLUMNS=" + os.environ.get("COLUMNS", "-"))
+if "BOARD_CWD" in os.environ:
+    print("CWD " + os.path.realpath(os.getcwd()))
+if "BOARD_HANG" in os.environ:
+    time.sleep(30)
+if "BOARD_FAIL" in os.environ:
+    print("gh search: boom", file=sys.stderr)
+    sys.exit(2)
+`;
+
+test("/review-board runs the board for the checkout's repo and reviewer with the policy's author pattern, even with a busy agent", async () => {
+  const f = repo();
+  writeFileSync(join(f.engine, "v2", "review_board.py"), BOARD_STUB);
+  writeFileSync(join(projectRulesDir(f.root), "pipeline.json"), JSON.stringify({ authorPattern: "^Sotatek-" }));
+  const { commands, notes, ctx } = setup();
+  await commands["review-board"]("", ctx(f.root, false));
+  assert.equal(notes.length, 1);
+  assert.equal(notes[0], "BOARD --repo swaglive/swag-server --reviewer Sotatek-TheoNguyen2 --no-color --author-pattern ^Sotatek- COLUMNS=-");
+  assert.equal(existsSync(join(f.root, "reports")), false);
+});
+
+test("/review-board works without project rules, and reports a failing board or a checkout it cannot identify", async () => {
+  const bare = repo("https://github.com/swaglive/swag-server.git", { projectRules: false });
+  writeFileSync(join(bare.engine, "v2", "review_board.py"), BOARD_STUB);
+  const { commands, notes, ctx } = setup();
+  await commands["review-board"]("", ctx(bare.root));
+  assert.equal(notes[0], "BOARD --repo swaglive/swag-server --reviewer Sotatek-TheoNguyen2 --no-color COLUMNS=-");
+
+  process.env.BOARD_FAIL = "1";
+  await commands["review-board"]("", ctx(bare.root));
+  delete process.env.BOARD_FAIL;
+  assert.match(notes[1], /boom/);
+
+  await commands["review-board"]("", ctx(mkdtempSync(join(tmpdir(), "elsewhere-"))));
+  const noOrigin = repo(null);
+  await commands["review-board"]("", ctx(noOrigin.root));
+  const noReviewer = repo("https://github.com/swaglive/swag-server.git", { reviewer: null });
+  await commands["review-board"]("", ctx(noReviewer.root));
+  assert.match(notes[2], /review checkout/);
+  assert.match(notes[3], /remote origin/);
+  assert.match(notes[4], /identity\.guard\.user/);
+});
+
+test("/review-board passes the terminal width, and gives up on a board that hangs instead of waiting for the pipeline's 15 minutes", async () => {
+  const f = repo();
+  writeFileSync(join(f.engine, "v2", "review_board.py"), BOARD_STUB);
+  const { commands, notes, ctx } = setup();
+  const columns = Object.getOwnPropertyDescriptor(process.stdout, "columns");
+  Object.defineProperty(process.stdout, "columns", { value: 91, configurable: true });
+  try {
+    await commands["review-board"]("", ctx(f.root));
+  } finally {
+    if (columns) Object.defineProperty(process.stdout, "columns", columns);
+    else delete (process.stdout as { columns?: number }).columns;
+  }
+  assert.match(notes[0], /COLUMNS=91$/);
+
+  process.env.BOARD_HANG = "1";
+  process.env.REVIEW_BOARD_TIMEOUT_MS = "300";
+  const started = Date.now();
+  await commands["review-board"]("", ctx(f.root));
+  delete process.env.BOARD_HANG;
+  delete process.env.REVIEW_BOARD_TIMEOUT_MS;
+  assert.ok(Date.now() - started < 5000);
+  assert.match(notes[1], /Command failed/);
+});
+
+test("/review-board runs the board in the checkout root, so its ack file is found from a subdirectory too", async () => {
+  const f = repo();
+  writeFileSync(join(f.engine, "v2", "review_board.py"), BOARD_STUB);
+  const sub = join(f.root, "reports", "reviews");
+  mkdirSync(sub, { recursive: true });
+  const { commands, notes, ctx } = setup();
+  process.env.BOARD_CWD = "1";
+  try {
+    await commands["review-board"]("", ctx(sub));
+  } finally {
+    delete process.env.BOARD_CWD;
+  }
+  assert.ok(notes[0].endsWith(`CWD ${realpathSync(f.root)}`), notes[0]);
+});
+
+test("/review-board shows a counting status while it loads and clears it on success, failure and timeout", async () => {
+  const f = repo();
+  writeFileSync(join(f.engine, "v2", "review_board.py"), BOARD_STUB);
+  const { commands, statuses, ctx } = setup();
+  await commands["review-board"]("", ctx(f.root));
+  assert.match(statuses[0] ?? "", /đang tải PR.*0s/);
+  assert.equal(statuses.at(-1), undefined);
+
+  process.env.BOARD_FAIL = "1";
+  statuses.length = 0;
+  await commands["review-board"]("", ctx(f.root));
+  delete process.env.BOARD_FAIL;
+  assert.equal(statuses.at(-1), undefined);
+
+  process.env.BOARD_HANG = "1";
+  process.env.REVIEW_BOARD_TIMEOUT_MS = "1500";
+  statuses.length = 0;
+  await commands["review-board"]("", ctx(f.root));
+  delete process.env.BOARD_HANG;
+  delete process.env.REVIEW_BOARD_TIMEOUT_MS;
+  assert.ok(statuses.some((s) => /1s$/.test(s ?? "")), "the status ticks while waiting");
+  assert.equal(statuses.at(-1), undefined);
+});

@@ -4,7 +4,7 @@
   "description": "Pi extension that permits GitHub reads and confirms remote writes",
   "type": "module",
   "license": "MIT",
-  "files": ["extensions", "config"],
+  "files": ["extensions", "config", "review-pipeline"],
   "devDependencies": {
     "@types/node": "^24.0.0",
     "typescript": "^5.0.0"
@@ -15,6 +15,6 @@
     "typecheck": "tsc --noEmit"
   },
   "pi": {
-    "extensions": ["./extensions/comment-guard.ts", "./extensions/github-write-confirm.ts", "./extensions/github-identity-guard-required.ts", "./extensions/pr-review-archive.ts", "./extensions/worktree-bootstrap.ts", "./extensions/ponytail-review-on-settle.ts", "./extensions/test-gaps-on-settle.ts"]
+    "extensions": ["./extensions/comment-guard.ts", "./extensions/github-write-confirm.ts", "./extensions/github-identity-guard-required.ts", "./extensions/pr-review-archive.ts", "./extensions/worktree-bootstrap.ts", "./extensions/ponytail-review-on-settle.ts", "./extensions/test-gaps-on-settle.ts", "./extensions/review-pipeline.ts"]
   }
 }

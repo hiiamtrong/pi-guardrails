@@ -1,6 +1,6 @@
 # Pi GitHub Guards
 
-A Pi package with seven workflow and security extensions:
+A Pi package with eight workflow and security extensions:
 
 - **`comment-guard`** reviews new code comments, suppressions, and Python future annotations before they are written.
 - **`ponytail-review-on-settle`** runs `/skill:ponytail-review` after a turn that edited code, unless the edits were trivial.
@@ -8,6 +8,7 @@ A Pi package with seven workflow and security extensions:
 - **`github-write-confirm`** permits GitHub reads and requires confirmation for GitHub remote writes.
 - **`github-identity-guard-required`** blocks agent-initiated Git/GitHub writes until Git Identity Guard is installed in the current repository.
 - **`pr-review-archive`** archives human PR review evidence in a local SQLite database.
+- **`review-pipeline`** adds `/review-pr <GitHub PR link>`, which opens a live web UI for the PR review pipeline of the repo whose review checkout you are in, and tracks the step the agent is on.
 - **`worktree-bootstrap`** configures a personal, per-repository `post-checkout` bootstrap hook that copies selected ignored files into new Git worktrees.
 
 The GitHub write and identity gates fail closed when the required condition cannot be verified.
@@ -67,6 +68,7 @@ ln -sf "$PWD/extensions/pr-review-archive.ts" ~/.pi/agent/extensions/pr-review-a
 ln -sf "$PWD/extensions/worktree-bootstrap.ts" ~/.pi/agent/extensions/worktree-bootstrap.ts
 ln -sf "$PWD/extensions/ponytail-review-on-settle.ts" ~/.pi/agent/extensions/ponytail-review-on-settle.ts
 ln -sf "$PWD/extensions/test-gaps-on-settle.ts" ~/.pi/agent/extensions/test-gaps-on-settle.ts
+ln -sf "$PWD/extensions/review-pipeline.ts" ~/.pi/agent/extensions/review-pipeline.ts   # dev only: delete this link once the package that ships the extension is installed, or it loads twice
 cp config/github-write-confirm.example.json ~/.pi/agent/github-write-confirm.json
 ```
 
@@ -96,6 +98,44 @@ The report arrives as a `[test-gaps]` follow-up message listing the missing case
 Example: you ask "write tests for `parseAge` in `src/age.ts`" and the agent writes only `parseAge("30")`. When the turn ends, the extension reports the untested `"age is required"` / `"age is unrealistic"` errors, empty and malformed input, and values at and past the 150 limit.
 
 Recognized test files: `*.test.*`, `*.spec.*` (JS/TS), `test_*.py`, `*_test.py`, and `*_test.go`. Test files whose code under test cannot be resolved, or whose trimmed source and tests exceed 60,000 characters, are skipped silently, as is the whole check when Jev fails.
+
+## Review pipeline
+
+`/review-pr <GitHub PR link> [--takeover | --restart]` starts or resumes a PR review in the review checkout you are in, and opens a local page (127.0.0.1) that shows which pipeline step the agent is on, what it is doing, and each gate's verdict.
+
+The package ships the engine in `review-pipeline/` (runner, live UI, gates, post guard). Rules are separate, laid out like Pi memory under the agent directory, so nothing is stored in the repo:
+
+```
+~/.pi/agent/review-pipeline/
+├── global/                       rules shared by every repo
+└── projects/-canonical-repository-path/   rules of one repo (same key as ~/.pi/agent/memory/projects)
+    └── .project.json             {"root": "<repo path>"}   written by /review-pr when missing
+```
+
+A rules folder holds `steps/NN-*.md` (what the agent reads at `start`), `steps/NN-*.rules.md`, `reference/` and `draft_template.md`. **The project folder is looked up first, then global**, so a project overrides a global file and falls back to it for the rest. The command needs `steps/` in at least one of them. `REVIEW_PIPELINE_HOME` replaces `~/.pi/agent/review-pipeline`.
+
+A rules folder can also hold:
+
+- **`pipeline.json`**: the project's policy, merged over the global one. `worktreePrefix` (default `<repo name>-pr-`; the worktree is `../<prefix><PR>`), `gates` (steps with a machine gate, from `00` to `07`; default all, `00` is always on, a step without a gate is recorded as passed with an INFO line and checked by the reviewer), `impactSections` (how many `## ` sections `evidence/<PR>/impact-map.txt` must have, default 8) `draftCheck` (a script in `tools/v2` that replaces the default draft gate) and `authorPattern` (an extended regular expression the PR author must match at gate 00; without it the author is not checked). A typo or a wrong type stops `/review-pr` with a message.
+- **`tools/`**: overrides for engine scripts, same layout as the engine (`tools/impact_map.py`, `tools/v2/check_draft_x.py`). The command rebuilds `reports/reviews/tools/` on every run from the engine, then global overrides, then project overrides, as links: it builds a new folder beside the old one and swaps a link, so a review in progress never sees it missing. It also writes `tools/.pipeline-env` (the variables below), which the scripts load when the agent runs them by hand. A real `tools` folder that the command did not create is never touched: move its files into the project's `tools/` first.
+
+Besides the rules, the review checkout needs:
+
+- **A handbook** at the checkout root, `AGENTS.local.md` or `AGENTS.md`. The gates refuse to run without one.
+- **`identity.guard.user`** in the checkout's local git config: the GitHub login the gates read as the reviewer (its token, its reviews, its comments).
+- **An `origin` remote**: `owner/name` is taken from it, so the gates read that repo. A PR link for another repo is refused.
+
+The command builds `reports/reviews/tools` (rules and scripts address the tools by that path), exports `REPO`, `RV` (the checkout), `HANDBOOK`, `REVIEWER`, `RULES` (the existing rules folders, project first) and the policy (`WT_PREFIX`, `GATES`, `IMPACT_SECTIONS`, `DRAFT_CHECK`, `AUTHOR_PATTERN`) to every pipeline call, shows the step list as a widget in Pi, then hands the agent a kickoff prompt. A real `reports/reviews/tools` directory is never overwritten: move it away first.
+
+- It registers a `review_step` tool the agent calls at each step boundary: `start` returns that step's instructions, `note` shows what it is doing, `done` runs that step's gate and records its verdict.
+- A review that was left half done (agent killed, machine restarted) is resumed, not wiped: the agent is told which steps are done and to redo intake first. `--restart` archives the old progress and starts clean, `--takeover` takes the review over from another Pi.
+- The command takes a full PR link such as `https://github.com/swaglive/swag-server/pull/19233`. Run from a PR worktree it still works on the review clone, not the worktree. It refuses a bare number, a link to a repo other than the checkout's, a checkout without rules, a handbook, a reviewer or an `origin`, and a busy agent.
+- Set `SWAG_REVIEW_PYTHON` to use a Python other than `python3.12`. Set `REVIEW_PIPELINE_ENGINE` to run another engine directory (the tests do).
+- `/review-board` runs it for you inside Pi: it takes the repo from `origin`, the reviewer from `identity.guard.user` and `authorPattern` from `pipeline.json`, so it works in any review checkout without `/review-pr` having run, and it does not need an idle agent. Reload Pi (`/reload`) after updating the package so the command appears.
+- `review-pipeline/v2/review_board.py` prints one terminal screen of every open PR the reviewer has reviewed or been asked to review, grouped by the next action: review again (new commit or a dismissed review), not reviewed, new replies since your review, waiting for the author, done. Run it from the review checkout, `python3.12 <engine>/v2/review_board.py` (or `reports/reviews/tools/v2/review_board.py` once `/review-pr` has built the tools). It reads `REPO`, `REVIEWER` and `AUTHOR_PATTERN` from the flags, the environment or `reports/reviews/tools/.pipeline-env`, and only issues GET and search calls. The board keeps no memory of what you or an agent already read, so replies you have seen stay under "new replies" until you review again. `review_board.py --ack N [N ...]` records the newest reply on those PRs in `reports/reviews/.board-ack.json`; a later reply or a new commit brings the PR back. Run it after an agent has gone through the replies.
+- The engine's tests: `cd review-pipeline/v2 && python3.12 -m unittest test_gates test_policy test_board`.
+
+With no `pipeline.json` every gate runs with swag-server's policy (release labels, the "Heads up" flag, cross-service evidence, trial blocks). The base branch is `develop` in all of them for now.
 
 ## Jev decisions
 

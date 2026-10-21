@@ -1,0 +1,8 @@
+{
+  "name": "pi-lazy-tools-local",
+  "private": true,
+  "version": "1.0.0",
+  "pi": {
+    "extensions": ["./index.ts"]
+  }
+}

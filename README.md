@@ -65,6 +65,14 @@ It first calls an OpenAI-compatible endpoint from `~/.pi/agent/session-auto-name
 }
 ```
 
+## Bundled packages
+
+`packages/` holds three standalone Pi extensions that keep their own `package.json`:
+
+- **`claude-memory`** is registered by this package. It stores durable memory topics for Pi (see its README).
+- **`lazy-tools`** loads tool schemas on demand. It is not registered here: add `./packages/lazy-tools/index.ts` to `pi.extensions` to enable it. Test with `npm run test:lazy-tools` (needs Bun).
+- **`mcp-bridge`** connects MCP servers as Pi tools. It is not registered here and needs `npm install` inside `packages/mcp-bridge` first.
+
 ## Install
 
 Install globally as a Pi package:

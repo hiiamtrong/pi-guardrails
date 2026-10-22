@@ -175,7 +175,7 @@ export function parsePrLink(
   return match ? { repo: `${match[1]}/${match[2]}`, pr: match[3] } : undefined;
 }
 
-const FLAGS = ["--takeover", "--restart"];
+const FLAGS = ["--takeover", "--restart", "--bg"];
 
 export function splitFlags(args: string): { rest: string; flags: string[] } {
   const words = args.trim().split(/\s+/).filter(Boolean);
@@ -297,6 +297,14 @@ export function assembleTools(root: string, rules: string[], env: Env = {}): str
   return undefined;
 }
 
+// Reads back what assembleTools wrote, so a process that never ran /review-pr (a background subagent) gets the same environment.
+export function readPipelineEnv(file: string): Env | undefined {
+  if (!existsSync(file)) return undefined;
+  const env: Env = {};
+  for (const [, key, value] of readFileSync(file, "utf8").matchAll(/^export (\w+)='((?:[^']|'\\'')*)'$/gm)) env[key] = value.replaceAll("'\\''", "'");
+  return env.RV ? env : undefined;
+}
+
 function validPattern(value: string): boolean {
   try {
     return value.length > 0 && !!new RegExp(value);
@@ -383,7 +391,7 @@ function idleMs(widgetPath: string): number {
   }
 }
 
-export function kickoff(repo: string, reviewer: string, rules: string[], pr: string, url: string, resume?: Begin): string {
+export function kickoff(repo: string, reviewer: string, rules: string[], pr: string, url: string, resume?: Begin, background?: string): string {
   const resumeLines = resume?.resumed
     ? [
         `Review này ĐANG DỞ từ phiên trước (bước đã xong: ${resume.done?.join(", ") || "chưa có"}; bước kế: ${resume.next ?? "không còn"}). Tiến độ nằm ở reports/reviews/evidence/${pr}/gates/events.jsonl, bản nháp ở reports/reviews/${pr}.md.`,
@@ -395,7 +403,15 @@ export function kickoff(repo: string, reviewer: string, rules: string[], pr: str
           : []),
       ]
     : [];
-  return [
+  const ending = background
+    ? [
+        `- Bạn chạy nền nên không ghi được lên GitHub: dừng ngay sau bước 05, KHÔNG làm bước 06 và 07, KHÔNG gọi action=end. Kết thúc bằng bản tóm tắt bản nháp reports/reviews/${pr}.md và gate nào còn đỏ hoặc chờ người.`,
+      ]
+    : [
+        `- Dừng sau bước 05 để ${reviewer} đọc và nói OK post. Chưa làm bước 06 và chưa ghi gì lên GitHub trước đó.`,
+        "- Xong thì gọi review_step action=end.",
+      ];
+  const text = [
     `Review PR ${repo} #${pr} theo pipeline v2. UI đã mở ở ${url}.`,
     `Bước 06 và mọi lệnh gh trong pipeline đọc repo ${repo} qua biến REPO; khi cụ thể hoá post_guard.template.sh thì điền __REPO__ = ${repo} và __REVIEWER__ = ${reviewer}. Thư mục rule, ưu tiên từ trên xuống (file nào có ở cả hai thì lấy bản trên): ${rules.join(", ")}.`,
     ...resumeLines,
@@ -404,8 +420,15 @@ export function kickoff(repo: string, reviewer: string, rules: string[], pr: str
     `- Trước mỗi bước gọi review_step action=start step=<NN> pr=${pr}: tool trả hướng dẫn của bước đó, đọc kỹ rồi làm đúng.`,
     "- Khi chuyển sang việc khác trong bước, gọi review_step action=note với một dòng ngắn để UI hiện bạn đang làm gì.",
     "- Hết bước gọi review_step action=done: tool tự chạy gate của bước, kết quả đó là kết luận, không tự khai pass. Gate đỏ thì sửa rồi gọi done lại.",
-    `- Dừng sau bước 05 để ${reviewer} đọc và nói OK post. Chưa làm bước 06 và chưa ghi gì lên GitHub trước đó.`,
-    "- Xong thì gọi review_step action=end.",
+    ...ending,
+  ].join("\n");
+  if (!background) return text;
+  return [
+    `Chạy review PR ${repo} #${pr} ở nền để phiên này rảnh cho PR khác. Gọi tool subagent đúng một lần: agent=review-runner, async=true, cwd=${background}, task = nguyên văn khối dưới đây, không sửa, không tóm tắt. Gọi xong chỉ trả lời một dòng, không tự làm bước nào của review.`,
+    `Khi subagent báo xong: nói ${reviewer} đọc bản nháp reports/reviews/${pr}.md. Chỉ khi họ nói OK mới tự làm tiếp bước 06 và 07 (review_step pr=${pr}); subagent nền không ghi được lên GitHub.`,
+    "```",
+    text,
+    "```",
   ].join("\n");
 }
 
@@ -444,7 +467,6 @@ export default function (pi: ExtensionAPI): void {
   const reviews = new Map<string, Active>();
   let board: Ctx["ui"] | undefined;
   let shown = "";
-  let toolRegistered = false;
 
   function stop(review: Active): void {
     if (review.timer) clearInterval(review.timer);
@@ -463,13 +485,23 @@ export default function (pi: ExtensionAPI): void {
     board.setStatus(WIDGET, status);
   }
 
+  // A process that never ran /review-pr (a background subagent) takes the environment the checkout's tools folder holds.
+  function fromDisk(pr: string): Active | undefined {
+    const root = findRoot(process.cwd());
+    const env = root ? readPipelineEnv(join(root, TOOLS, ".pipeline-env")) : undefined;
+    return root && env ? { pr, script: join(root, TOOLS, "v2", "pipeline_step.py"), env, widget: "" } : undefined;
+  }
+
   function pick(pr: string | undefined): Active {
-    if (reviews.size === 0) throw new Error("Không có review đang chạy: gõ /review-pr <link PR> trước");
     if (pr) {
-      const found = reviews.get(pr);
-      if (!found) throw new Error(`PR #${pr} chưa chạy /review-pr trong phiên này (đang có: ${[...reviews.keys()].map((key) => `#${key}`).join(", ")})`);
+      const found = reviews.get(pr) ?? fromDisk(pr);
+      if (!found) {
+        const known = [...reviews.keys()].map((key) => `#${key}`).join(", ") || "không có";
+        throw new Error(`PR #${pr} chưa chạy /review-pr trong phiên này (đang có: ${known}) và ${process.cwd()} không có ${join(TOOLS, ".pipeline-env")}`);
+      }
       return found;
     }
+    if (reviews.size === 0) throw new Error("Không có review đang chạy: gõ /review-pr <link PR> trước, hoặc truyền pr=<số PR> nếu checkout này đã chạy /review-pr");
     const open = [...reviews.values()].filter((review) => !review.finished);
     const pool = open.length > 0 ? open : [...reviews.values()];
     if (pool.length > 1) throw new Error(`Đang có ${pool.length} review (${pool.map((review) => `#${review.pr}`).join(", ")}): truyền pr=<số PR> để chọn`);
@@ -494,8 +526,6 @@ export default function (pi: ExtensionAPI): void {
   }
 
   function registerTool(): void {
-    if (toolRegistered) return;
-    toolRegistered = true;
     pi.registerTool({
       name: "review_step",
       label: "Review step",
@@ -530,8 +560,6 @@ export default function (pi: ExtensionAPI): void {
         const step = params.step === undefined ? undefined : String(params.step);
         const message =
           params.message === undefined ? undefined : String(params.message);
-        if (reviews.size === 0)
-          throw new Error("Không có review đang chạy: gõ /review-pr <link PR> trước");
         if (!ACTIONS.includes(action))
           throw new Error(`action phải là một trong ${ACTIONS.join(", ")}`);
         if (action !== "end" && (!step || !STEPS.includes(step)))
@@ -555,13 +583,14 @@ export default function (pi: ExtensionAPI): void {
 
   pi.registerCommand("review-pr", {
     description:
-      "Start or resume a PR review with the live pipeline UI, in the review checkout of the PR's repo: /review-pr <GitHub PR link> [--takeover | --restart]",
+      "Start or resume a PR review with the live pipeline UI, in the review checkout of the PR's repo: /review-pr <GitHub PR link> [--takeover | --restart] [--bg]; --bg hands the work to a background subagent so this session stays free",
     handler: async (args, ctx) => {
       const { rest, flags } = splitFlags(args);
+      const background = flags.includes("--bg");
       const link = parsePrLink(rest);
       if (!link)
         return ctx.ui.notify(
-          "Usage: /review-pr <GitHub PR link> [--takeover | --restart]",
+          "Usage: /review-pr <GitHub PR link> [--takeover | --restart] [--bg]",
           "warning",
         );
       const root = findRoot(ctx.cwd);
@@ -612,7 +641,7 @@ export default function (pi: ExtensionAPI): void {
       const pr = link.pr;
       const begin = await pipeline(
         script,
-        ["begin", pr, "--owner", String(process.pid), ...flags],
+        ["begin", pr, "--owner", String(process.pid), ...flags.filter((flag) => flag !== "--bg")],
         env,
       );
       if (begin.code !== 0)
@@ -628,13 +657,12 @@ export default function (pi: ExtensionAPI): void {
       if (previous) stop(previous);
       const active: Active = { pr, script, env, widget };
       reviews.set(pr, active);
-      registerTool();
       if (ctx.hasUI !== false) watch(ctx, active);
       ctx.ui.notify(
         `Review #${pr}: UI ở ${url}${opened.resumed ? " (tiếp tục review dang dở)" : ""}`,
         "info",
       );
-      pi.sendUserMessage(kickoff(repo, reviewer, rules, pr, url, opened));
+      pi.sendUserMessage(kickoff(repo, reviewer, rules, pr, url, opened, background ? root : undefined));
     },
   });
 
@@ -678,5 +706,6 @@ export default function (pi: ExtensionAPI): void {
     },
   });
 
+  registerTool();
   pi.on("session_shutdown", () => reviews.forEach(stop));
 }

@@ -7,7 +7,7 @@ import test from "node:test";
 
 process.env.SWAG_REVIEW_PYTHON = "python3";
 
-const { parsePrLink, parseBegin, repoOf, splitFlags, findRoot, handbookOf, assembleTools, claimProjectRules, renderTimes, readPolicy, ruleRoots, projectRulesDir, readWidget, kickoff, withIdleWarning, IDLE_MS, STALE_TOOLS_MS, POLL_MS, default: reviewPipeline } =
+const { parsePrLink, parseBegin, readPipelineEnv, repoOf, splitFlags, findRoot, handbookOf, assembleTools, claimProjectRules, renderTimes, readPolicy, ruleRoots, projectRulesDir, readWidget, kickoff, withIdleWarning, IDLE_MS, STALE_TOOLS_MS, POLL_MS, default: reviewPipeline } =
   await import(`../extensions/review-pipeline.ts?test=${Date.now()}`);
 
 const STUB = `import json, os, pathlib, sys
@@ -431,10 +431,11 @@ test("/review-pr refuses a checkout without a readable origin remote and starts 
   assert.equal(existsSync(join(work, "calls.txt")), false);
 });
 
-test("review_step is not available before /review-pr and rejects bad calls after it", async () => {
+test("review_step exists from load, refuses a call before any review, and rejects bad calls after /review-pr", async () => {
   const { root } = repo();
   const { commands, tools, ctx, handlers } = setup();
-  assert.equal(tools.review_step, undefined);
+  assert.ok(tools.review_step);
+  await assert.rejects(tools.review_step!("0", { action: "start", step: "00" }), /Không có review đang chạy/);
   await commands["review-pr"]("https://github.com/swaglive/swag-server/pull/19233", ctx(root));
   const call = (params: Record<string, unknown>) => tools.review_step!("1", params);
   await assert.rejects(call({ action: "start" }), /cần step/);
@@ -442,6 +443,76 @@ test("review_step is not available before /review-pr and rejects bad calls after
   await assert.rejects(call({ action: "note", step: "01" }), /cần message/);
   await assert.rejects(call({ action: "jump", step: "01" }), /action phải là/);
   handlers.session_shutdown();
+});
+
+test("readPipelineEnv reads back what assembleTools wrote, quotes included, and nothing without RV", () => {
+  const { root } = repo();
+  const env = { REPO: "o/r", RV: root, HANDBOOK: join(root, "AGENTS.local.md"), REVIEWER: "me", RULES: "/r'ules:/b" };
+  assert.equal(assembleTools(root, [], env), undefined);
+  const file = join(root, "reports", "reviews", "tools", ".pipeline-env");
+  assert.deepEqual(readPipelineEnv(file), env);
+  assert.equal(readPipelineEnv(join(root, "missing")), undefined);
+  writeFileSync(join(root, "no-rv"), "export REPO='o/r'\n");
+  assert.equal(readPipelineEnv(join(root, "no-rv")), undefined);
+});
+
+test("review_step works in a process that never ran /review-pr, from the environment the checkout's tools folder holds", async () => {
+  const { root, work } = repo();
+  assert.equal(assembleTools(root, [], { REPO: "o/r", RV: root, HANDBOOK: join(root, "AGENTS.local.md"), REVIEWER: "me", RULES: "/r'ules" }), undefined);
+  const { tools } = setup();
+  const before = process.cwd();
+  process.chdir(root);
+  try {
+    assert.equal((await tools.review_step!("1", { action: "start", step: "00", pr: "77" })).content[0].text, "ok start");
+    assert.match(readFileSync(join(work, "env.txt"), "utf8"), /^o\/r .* me \/r'ules\n$/);
+    assert.deepEqual(readWidget(join(work, "calls.txt")), ["start 77 00"]);
+    await assert.rejects(tools.review_step!("2", { action: "start", step: "00" }), /Không có review đang chạy/);
+  } finally {
+    process.chdir(before);
+  }
+});
+
+test("review_step says why when neither the session nor the checkout knows the PR", async () => {
+  const { root } = repo();
+  const { tools } = setup();
+  const before = process.cwd();
+  process.chdir(root);
+  try {
+    await assert.rejects(tools.review_step!("1", { action: "start", step: "00", pr: "77" }), /PR #77 chưa chạy \/review-pr.*không có reports\/reviews\/tools\/\.pipeline-env/);
+  } finally {
+    process.chdir(before);
+  }
+});
+
+test("kickoff for a background run wraps the task, ends it after step 05 and leaves steps 06 and 07 to this session", () => {
+  const text = kickoff("swaglive/swag-server", "me", RULES, "19233", "http://u", undefined, "/co");
+  assert.match(text, /agent=review-runner, async=true, cwd=\/co/);
+  assert.match(text, /review_step action=start step=<NN> pr=19233/);
+  assert.match(text, /KHÔNG làm bước 06 và 07, KHÔNG gọi action=end/);
+  assert.match(text, /Chỉ khi họ nói OK mới tự làm tiếp bước 06 và 07 \(review_step pr=19233\)/);
+  assert.doesNotMatch(text, /Dừng sau bước 05/);
+  const foreground = kickoff("swaglive/swag-server", "me", RULES, "19233", "http://u");
+  assert.doesNotMatch(foreground, /review-runner|KHÔNG làm bước 06/);
+  assert.match(foreground, /Dừng sau bước 05/);
+});
+
+test("/review-pr --bg keeps --bg away from begin and hands the agent a background kickoff", async () => {
+  const { root, work } = repo();
+  const { commands, sent, ctx, handlers } = setup();
+  await commands["review-pr"]("https://github.com/swaglive/swag-server/pull/19233 --bg --takeover", ctx(root));
+  assert.deepEqual(readWidget(join(work, "calls.txt")), [`begin 19233 --owner ${process.pid} --takeover`]);
+  assert.equal(sent.length, 1);
+  assert.match(sent[0], new RegExp(`agent=review-runner, async=true, cwd=${root}`));
+  handlers.session_shutdown();
+});
+
+test("the review-runner agent lists review_step and the tools a draft needs, and ships with the package", () => {
+  const dir = join(dirname(new URL(import.meta.url).pathname), "..");
+  const agent = readFileSync(join(dir, "agents", "review-runner.md"), "utf8");
+  const tools = /^tools: (.*)$/m.exec(agent)?.[1].split(/,\s*/) ?? [];
+  for (const tool of ["review_step", "bash", "edit", "write", "read"]) assert.ok(tools.includes(tool), tool);
+  assert.match(agent, /^name: review-runner$/m);
+  assert.ok((JSON.parse(readFileSync(join(dir, "package.json"), "utf8")) as { files: string[] }).files.includes("agents"));
 });
 
 test("review_step passes the call to the pipeline, returns a red gate as text, and throws when the script itself breaks", async () => {

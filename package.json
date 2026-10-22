@@ -4,7 +4,7 @@
   "description": "Pi extension that permits GitHub reads and confirms remote writes",
   "type": "module",
   "license": "MIT",
-  "files": ["extensions", "config", "review-pipeline", "packages"],
+  "files": ["extensions", "config", "review-pipeline", "packages", "agents"],
   "peerDependencies": {
     "typebox": "*"
   },

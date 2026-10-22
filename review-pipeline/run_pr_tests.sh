@@ -12,6 +12,25 @@ WT="$(dirname "$REPO")/swag-pr-$PR"
 [ -d "$PR" ] && WT=$(cd "$PR" && pwd)
 [ -d "$WT" ] || { echo "no worktree at $WT" >&2; exit 1; }
 cd "$REPO"
+# Every run shares the swag_test databases and redis db 15, so two PRs testing at once would corrupt each other: take turns.
+# The lock is a link to our pid (ln -s is atomic). A lock whose pid is gone, or now belongs to some other process (pids are reused after a reboot), is taken over.
+# shortcut: two waiters taking over the same stale lock can both run; waiting stops after TESTS_LOCK_WAIT seconds (default 30 min).
+LOCK="$REPO/reports/reviews/.tests.lock"
+trap 'exit 1' INT TERM HUP
+trap '[ "$(readlink "$LOCK")" != "$$" ] || rm -f "$LOCK"' EXIT
+waited=0
+while ! ln -s "$$" "$LOCK" 2>/dev/null; do
+  holder=$(readlink "$LOCK")
+  [ -n "$holder" ] || continue
+  if ps -p "$holder" -o command= 2>/dev/null | grep -q run_pr_tests.sh; then
+    [ "$waited" -gt 0 ] || echo "đợi lượt chạy test: pid $holder đang chạy (mọi PR dùng chung DB test)" >&2
+    [ "$waited" -lt "${TESTS_LOCK_WAIT:-1800}" ] || { echo "ABORT: đợi quá ${TESTS_LOCK_WAIT:-1800}s, pid $holder vẫn giữ $LOCK: dừng nó hoặc xoá khoá rồi chạy lại" >&2; exit 2; }
+    waited=$((waited + 1))
+    sleep 1
+  else
+    rm -f "$LOCK"
+  fi
+done
 docker compose run --rm -T \
   -v "$WT/swag:/usr/src/app/swag:ro" -v "$WT/tests:/usr/src/app/tests:ro" -v "$WT/libs:/usr/src/app/libs:ro" \
   ${EXTRA_DOCKER_ARGS:-} \

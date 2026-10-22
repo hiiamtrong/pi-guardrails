@@ -147,6 +147,8 @@ type Active = {
   env: Env;
   widget: string;
   timer?: ReturnType<typeof setInterval>;
+  lines?: string[];
+  finished?: boolean;
 };
 
 const PR_LINK =
@@ -398,7 +400,8 @@ export function kickoff(repo: string, reviewer: string, rules: string[], pr: str
     `Bước 06 và mọi lệnh gh trong pipeline đọc repo ${repo} qua biến REPO; khi cụ thể hoá post_guard.template.sh thì điền __REPO__ = ${repo} và __REVIEWER__ = ${reviewer}. Thư mục rule, ưu tiên từ trên xuống (file nào có ở cả hai thì lấy bản trên): ${rules.join(", ")}.`,
     ...resumeLines,
     "Làm lần lượt các bước 00 intake, 01 comments, 02 map, 03 verify, 04 outside-diff, 05 draft, 06 post, 07 after.",
-    "- Trước mỗi bước gọi review_step action=start step=<NN>: tool trả hướng dẫn của bước đó, đọc kỹ rồi làm đúng.",
+    `- Mọi lần gọi review_step phải kèm pr=${pr}: phiên này có thể đang chạy review PR khác song song.`,
+    `- Trước mỗi bước gọi review_step action=start step=<NN> pr=${pr}: tool trả hướng dẫn của bước đó, đọc kỹ rồi làm đúng.`,
     "- Khi chuyển sang việc khác trong bước, gọi review_step action=note với một dòng ngắn để UI hiện bạn đang làm gì.",
     "- Hết bước gọi review_step action=done: tool tự chạy gate của bước, kết quả đó là kết luận, không tự khai pass. Gate đỏ thì sửa rồi gọi done lại.",
     `- Dừng sau bước 05 để ${reviewer} đọc và nói OK post. Chưa làm bước 06 và chưa ghi gì lên GitHub trước đó.`,
@@ -438,25 +441,52 @@ async function pipeline(
 }
 
 export default function (pi: ExtensionAPI): void {
-  let active: Active | undefined;
+  const reviews = new Map<string, Active>();
+  let board: Ctx["ui"] | undefined;
+  let shown = "";
   let toolRegistered = false;
 
-  function stop(): void {
-    if (active?.timer) clearInterval(active.timer);
-    if (active) active.timer = undefined;
+  function stop(review: Active): void {
+    if (review.timer) clearInterval(review.timer);
+    review.timer = undefined;
+  }
+
+  function render(): void {
+    const blocks = [...reviews.values()].flatMap((review) => (review.lines ? [review.lines] : []));
+    if (!board || blocks.length === 0) return;
+    const lines = blocks.length === 1 ? blocks[0] : blocks.map((block) => block[0]);
+    const status = blocks.map((block) => block[0]).join(" | ");
+    const frame = `${lines.join("\n")}\n${status}`;
+    if (frame === shown) return;
+    shown = frame;
+    board.setWidget(WIDGET, lines);
+    board.setStatus(WIDGET, status);
+  }
+
+  function pick(pr: string | undefined): Active {
+    if (reviews.size === 0) throw new Error("Không có review đang chạy: gõ /review-pr <link PR> trước");
+    if (pr) {
+      const found = reviews.get(pr);
+      if (!found) throw new Error(`PR #${pr} chưa chạy /review-pr trong phiên này (đang có: ${[...reviews.keys()].map((key) => `#${key}`).join(", ")})`);
+      return found;
+    }
+    const open = [...reviews.values()].filter((review) => !review.finished);
+    const pool = open.length > 0 ? open : [...reviews.values()];
+    if (pool.length > 1) throw new Error(`Đang có ${pool.length} review (${pool.map((review) => `#${review.pr}`).join(", ")}): truyền pr=<số PR> để chọn`);
+    return pool[0];
   }
 
   function watch(ctx: Ctx, current: Active): void {
-    let shown = "";
+    board = ctx.ui;
     const tick = () => {
       const read = readWidget(current.widget);
       if (!read) return;
-      const lines = renderTimes(withIdleWarning(read, idleMs(current.widget), current.pr), Date.now());
-      if (lines.join("\n") === shown) return;
-      shown = lines.join("\n");
-      ctx.ui.setWidget(WIDGET, lines);
-      ctx.ui.setStatus(WIDGET, lines[0]);
-      if (lines[0].startsWith(`Review #${current.pr}: Xong`)) stop();
+      current.lines = renderTimes(withIdleWarning(read, idleMs(current.widget), current.pr), Date.now());
+      render();
+      if (current.lines[0].startsWith(`Review #${current.pr}: Xong`)) {
+        current.finished = true;
+        stop(current);
+      }
     };
     tick();
     current.timer = setInterval(tick, POLL_MS);
@@ -470,14 +500,19 @@ export default function (pi: ExtensionAPI): void {
       name: "review_step",
       label: "Review step",
       description:
-        "Report progress of the active /review-pr run. start: begin a step and get its instructions. note: say what you are doing now. done: run that step's gate, whose verdict is final. end: finish the review.",
+        "Report progress of a /review-pr run. start: begin a step and get its instructions. note: say what you are doing now. done: run that step's gate, whose verdict is final. end: finish the review. Several PRs can be open at once: pass pr to say which.",
       promptGuidelines: [
         "During a /review-pr run, call review_step at every step boundary so the live UI shows the current step.",
+        "Pass pr=<PR number> on every review_step call; it is required when more than one review is open.",
       ],
       parameters: {
         type: "object",
         properties: {
           action: { type: "string", enum: ACTIONS },
+          pr: {
+            type: "string",
+            description: "PR number of the review this call is for, required when more than one review is open",
+          },
           step: {
             type: "string",
             enum: STEPS,
@@ -495,7 +530,7 @@ export default function (pi: ExtensionAPI): void {
         const step = params.step === undefined ? undefined : String(params.step);
         const message =
           params.message === undefined ? undefined : String(params.message);
-        if (!active)
+        if (reviews.size === 0)
           throw new Error("Không có review đang chạy: gõ /review-pr <link PR> trước");
         if (!ACTIONS.includes(action))
           throw new Error(`action phải là một trong ${ACTIONS.join(", ")}`);
@@ -503,11 +538,13 @@ export default function (pi: ExtensionAPI): void {
           throw new Error(`action=${action} cần step là một trong ${STEPS.join(" ")}`);
         if (action === "note" && !message)
           throw new Error("action=note cần message");
+        const target = pick(params.pr === undefined ? undefined : String(params.pr).replace(/^#/, ""));
         const argv =
-          action === "end" ? [action, active.pr] : [action, active.pr, step!];
+          action === "end" ? [action, target.pr] : [action, target.pr, step!];
         if (message) argv.push("--msg", message);
-        const { code, out, err } = await pipeline(active.script, argv, active.env);
+        const { code, out, err } = await pipeline(target.script, argv, target.env);
         if (code !== 0 && code !== RED_GATE) throw new Error(err || out);
+        if (action === "end") target.finished = true;
         return {
           content: [{ type: "text", text: out }],
           details: { action, step, code },
@@ -530,6 +567,9 @@ export default function (pi: ExtensionAPI): void {
       const root = findRoot(ctx.cwd);
       if (!root)
         return ctx.ui.notify("Không thấy repo git: chạy /review-pr trong review checkout của repo cần review", "error");
+      const open = reviews.get(link.pr);
+      if (open && !open.finished && open.env.RV !== root)
+        return ctx.ui.notify(`PR #${link.pr} đang mở ở ${open.env.RV}: dùng chung số PR với ${root} thì review_step không phân biệt được, xong review đó (action=end) hoặc mở phiên Pi khác`, "error");
       const repo = await checkoutRepo(root);
       if (!repo)
         return ctx.ui.notify(
@@ -584,8 +624,10 @@ export default function (pi: ExtensionAPI): void {
           "error",
         );
       const { url, widget } = opened;
-      stop();
-      active = { pr, script, env, widget };
+      const previous = reviews.get(pr);
+      if (previous) stop(previous);
+      const active: Active = { pr, script, env, widget };
+      reviews.set(pr, active);
       registerTool();
       if (ctx.hasUI !== false) watch(ctx, active);
       ctx.ui.notify(
@@ -636,5 +678,5 @@ export default function (pi: ExtensionAPI): void {
     },
   });
 
-  pi.on("session_shutdown", stop);
+  pi.on("session_shutdown", () => reviews.forEach(stop));
 }

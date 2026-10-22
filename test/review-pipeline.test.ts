@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { execFileSync, spawnSync } from "node:child_process";
+import { execFileSync, spawn, spawnSync } from "node:child_process";
 import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, readlinkSync, realpathSync, rmSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -23,8 +23,9 @@ if cmd == "begin":
     if "STUB_REFUSE" in os.environ:
         print(os.environ["STUB_REFUSE"], file=sys.stderr)
         sys.exit(3)
-    (work / "widget.txt").write_text(f"Review #{pr}: Đang ở bước 00 intake\\n▶ 00 intake\\n")
-    print(os.environ["STUB_BEGIN"] if "STUB_BEGIN" in os.environ else json.dumps({"url": "http://127.0.0.1:9", "widget": str(work / "widget.txt")}))
+    wfile = work / (f"widget-{pr}.txt" if "STUB_PER_PR" in os.environ else "widget.txt")
+    wfile.write_text(f"Review #{pr}: Đang ở bước 00 intake\\n▶ 00 intake\\n")
+    print(os.environ["STUB_BEGIN"] if "STUB_BEGIN" in os.environ else json.dumps({"url": "http://127.0.0.1:9", "widget": str(wfile)}))
     if "STUB_STDERR" in os.environ:
         print(os.environ["STUB_STDERR"], file=sys.stderr)
 elif cmd == "done":
@@ -465,6 +466,57 @@ test("review_step passes the call to the pipeline, returns a red gate as text, a
   handlers.session_shutdown();
 });
 
+test("two reviews in one session keep their own widget line, and review_step goes to the PR it names", async () => {
+  await perPr(async () => {
+    const { root, work } = repo();
+    const { commands, tools, ctx, widgets, statuses, handlers } = setup();
+    await commands["review-pr"]("https://github.com/swaglive/swag-server/pull/101", ctx(root));
+    await commands["review-pr"]("https://github.com/swaglive/swag-server/pull/202", ctx(root));
+    assert.deepEqual(widgets.at(-1), ["Review #101: Đang ở bước 00 intake", "Review #202: Đang ở bước 00 intake"]);
+    assert.equal(statuses.at(-1), "Review #101: Đang ở bước 00 intake | Review #202: Đang ở bước 00 intake");
+
+    const step = tools.review_step!;
+    await assert.rejects(step("1", { action: "start", step: "00" }), /2 review \(#101, #202\).*pr=/);
+    await assert.rejects(step("2", { action: "start", step: "00", pr: "303" }), /PR #303 chưa chạy.*#101, #202/);
+    await step("3", { action: "start", step: "01", pr: "202" });
+    await step("4", { action: "note", step: "01", pr: "#101", message: "đọc" });
+
+    writeFileSync(join(work, "widget-202.txt"), "Review #202: Đang ở bước 01 comments (3s)\n▶ 01 comments\n");
+    await new Promise((resolve) => setTimeout(resolve, POLL_MS + 400));
+    assert.deepEqual(widgets.at(-1), ["Review #101: Đang ở bước 00 intake", "Review #202: Đang ở bước 01 comments (3s)"]);
+
+    const calls = readWidget(join(work, "calls.txt")) ?? [];
+    assert.deepEqual(calls.slice(-2), ["start 202 01", "note 101 01 --msg đọc"]);
+    handlers.session_shutdown();
+  });
+});
+
+test("review_step without pr goes to the only review still open, and a finished one does not block it", async () => {
+  await perPr(async () => {
+    const { root, work } = repo();
+    const { commands, tools, ctx, handlers } = setup();
+    await commands["review-pr"]("https://github.com/swaglive/swag-server/pull/101", ctx(root));
+    await commands["review-pr"]("https://github.com/swaglive/swag-server/pull/202", ctx(root));
+    await tools.review_step!("1", { action: "end", pr: "101" });
+    await tools.review_step!("2", { action: "note", step: "02", message: "map" });
+    const calls = readWidget(join(work, "calls.txt")) ?? [];
+    assert.deepEqual(calls.slice(-2), ["end 101", "note 202 02 --msg map"]);
+    handlers.session_shutdown();
+  });
+});
+
+test("running /review-pr again for a PR replaces its entry instead of adding a second one", async () => {
+  await perPr(async () => {
+    const { root } = repo();
+    const { commands, tools, ctx, widgets, handlers } = setup();
+    await commands["review-pr"]("https://github.com/swaglive/swag-server/pull/101", ctx(root));
+    await commands["review-pr"]("https://github.com/swaglive/swag-server/pull/101", ctx(root));
+    assert.equal(widgets.at(-1)?.length, 2);
+    assert.equal((await tools.review_step!("1", { action: "note", step: "00", message: "x" })).content[0].text, "ok note");
+    handlers.session_shutdown();
+  });
+});
+
 test("parseBegin returns url and widget only when both are strings on the last line", () => {
   const good = JSON.stringify({ url: "http://127.0.0.1:8765", widget: "/w.txt" });
   assert.deepEqual(parseBegin(good), { url: "http://127.0.0.1:8765", widget: "/w.txt" });
@@ -681,6 +733,106 @@ test("assembleTools is not stopped by a .tools-* entry it cannot read", () => {
   symlinkSync(join(f.root, "gone"), join(reviews, ".tools-dangling"));
   assert.equal(assembleTools(f.root, []), undefined);
   assert.equal(existsSync(join(reviews, "tools", ".review-pipeline-managed")), true);
+});
+
+// The stub writes one widget file per PR only when asked, so the single-review tests keep their shared widget.txt.
+async function perPr(body: () => Promise<void>): Promise<void> {
+  process.env.STUB_PER_PR = "1";
+  try {
+    await body();
+  } finally {
+    delete process.env.STUB_PER_PR;
+  }
+}
+
+function testRunner() {
+  const f = repo();
+  process.env.REVIEW_PIPELINE_ENGINE = join(dirname(new URL(import.meta.url).pathname), "..", "review-pipeline");
+  assert.equal(assembleTools(f.root, [], { REPO: "o/r", RV: f.root, HANDBOOK: join(f.root, "AGENTS.local.md"), REVIEWER: "me", WT_PREFIX: "wt-" }), undefined);
+  const bin = mkdtempSync(join(tmpdir(), "fake-docker-"));
+  const log = join(bin, "log.txt");
+  writeFileSync(join(bin, "docker"), `#!/bin/sh\necho "start $$" >> ${log}\nsleep 1\necho "end $$" >> ${log}\necho "1 passed"\n`, { mode: 0o755 });
+  const wt = mkdtempSync(join(tmpdir(), "wt-"));
+  const script = join(f.root, "reports", "reviews", "tools", "run_pr_tests.sh");
+  const lock = join(f.root, "reports", "reviews", ".tests.lock");
+  const run = (extraEnv: Record<string, string> = {}) =>
+    new Promise<{ code: number | null; stdout: string; stderr: string }>((resolve) => {
+      const child = spawn("sh", [script, wt, "tests/x.py"], { cwd: f.root, env: { PATH: `${bin}:${process.env.PATH}`, HOME: process.env.HOME, ...extraEnv } });
+      let stdout = "";
+      let stderr = "";
+      child.stdout.on("data", (d) => (stdout += d));
+      child.stderr.on("data", (d) => (stderr += d));
+      child.on("close", (code) => resolve({ code, stdout, stderr }));
+    });
+  return { run, log, lock };
+}
+
+test("run_pr_tests.sh lets two PRs take turns on the shared test databases, and cleans its lock", async () => {
+  const { run, log, lock } = testRunner();
+  const [a, b] = await Promise.all([run(), run()]);
+  assert.equal(a.code, 0);
+  assert.equal(b.code, 0);
+  assert.deepEqual(readFileSync(log, "utf8").trim().split("\n").map((line) => line.split(" ")[0]), ["start", "end", "start", "end"]);
+  assert.match([a.stderr, b.stderr].join(""), /đợi lượt chạy test/);
+  assert.equal(existsSync(lock), false);
+});
+
+test("run_pr_tests.sh takes over a lock left by a dead process instead of waiting forever", async () => {
+  const { run, lock, log } = testRunner();
+  const dead = spawnSync("sh", ["-c", "echo $$"], { encoding: "utf8" }).stdout.trim();
+  symlinkSync(dead, lock);
+  const result = await run();
+  assert.equal(result.code, 0);
+  assert.equal(readFileSync(log, "utf8").trim().split("\n").length, 2);
+  assert.equal(existsSync(lock), false);
+});
+
+test("run_pr_tests.sh takes over a lock whose pid now belongs to an unrelated process", async () => {
+  const { run, lock, log } = testRunner();
+  const other = spawn("sleep", ["300"]);
+  try {
+    symlinkSync(String(other.pid), lock);
+    const result = await run({ TESTS_LOCK_WAIT: "3" });
+    assert.equal(result.code, 0);
+    assert.equal(readFileSync(log, "utf8").trim().split("\n").length, 2);
+  } finally {
+    other.kill();
+  }
+});
+
+test("run_pr_tests.sh gives up with a clear message when a real test run holds the lock too long", async () => {
+  const { run, lock, log } = testRunner();
+  const holder = spawn("sh", ["-c", "sleep 30; true # run_pr_tests.sh"]);
+  try {
+    symlinkSync(String(holder.pid), lock);
+    const result = await run({ TESTS_LOCK_WAIT: "2" });
+    assert.equal(result.code, 2);
+    assert.match(result.stderr, /đợi quá 2s, pid \d+ vẫn giữ/);
+    assert.equal(existsSync(log), false);
+    assert.equal(readlinkSync(lock), String(holder.pid));
+  } finally {
+    holder.kill();
+  }
+});
+
+test("/review-pr refuses a PR number that is open for another checkout in the same session, and allows it once that review ended", async () => {
+  await perPr(async () => {
+    const first = repo();
+    const second = repo("https://github.com/swaglive/swag-openim.git");
+    mkdirSync(join(projectRulesDir(first.root), "steps"), { recursive: true });
+    const begins = () => (readFileSync(join(second.work, "calls.txt"), "utf8").match(/^begin /gm) ?? []).length;
+    const { commands, tools, ctx, notes, handlers } = setup();
+    await commands["review-pr"]("https://github.com/swaglive/swag-server/pull/55", ctx(first.root));
+    await commands["review-pr"]("https://github.com/swaglive/swag-openim/pull/55", ctx(second.root));
+    assert.match(notes.at(-1) ?? "", /PR #55 đang mở ở .*review-pipeline-/);
+    assert.equal(begins(), 1);
+    await commands["review-pr"]("https://github.com/swaglive/swag-server/pull/55", ctx(first.root));
+    assert.equal(begins(), 2);
+    await tools.review_step!("1", { action: "end", pr: "55" });
+    await commands["review-pr"]("https://github.com/swaglive/swag-openim/pull/55", ctx(second.root));
+    assert.match(notes.at(-1) ?? "", /Review #55: UI ở/);
+    handlers.session_shutdown();
+  });
 });
 
 test("gate 00 checks the author only against the authorPattern the project set", () => {

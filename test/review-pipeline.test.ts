@@ -887,23 +887,64 @@ function testRunner() {
   const f = repo();
   process.env.REVIEW_PIPELINE_ENGINE = join(dirname(new URL(import.meta.url).pathname), "..", "review-pipeline");
   assert.equal(assembleTools(f.root, [], { REPO: "o/r", RV: f.root, HANDBOOK: join(f.root, "AGENTS.local.md"), REVIEWER: "me", WT_PREFIX: "wt-" }), undefined);
+  writeFileSync(join(f.root, "compose.yaml"), "services: {}\n");
   const bin = mkdtempSync(join(tmpdir(), "fake-docker-"));
   const log = join(bin, "log.txt");
-  writeFileSync(join(bin, "docker"), `#!/bin/sh\necho "start $$" >> ${log}\nsleep 1\necho "end $$" >> ${log}\necho "1 passed"\n`, { mode: 0o755 });
+  writeFileSync(join(bin, "docker"), `#!/bin/sh\necho "start $$" >> ${log}\necho "argv $*" >> ${join(bin, "argv.txt")}\nsleep 1\necho "end $$" >> ${log}\necho "1 passed"\n`, { mode: 0o755 });
   const wt = mkdtempSync(join(tmpdir(), "wt-"));
   const script = join(f.root, "reports", "reviews", "tools", "run_pr_tests.sh");
   const lock = join(f.root, "reports", "reviews", ".tests.lock");
-  const run = (extraEnv: Record<string, string> = {}) =>
+  const run = (extraEnv: Record<string, string> = {}, cwd = f.root, path = script) =>
     new Promise<{ code: number | null; stdout: string; stderr: string }>((resolve) => {
-      const child = spawn("sh", [script, wt, "tests/x.py"], { cwd: f.root, env: { PATH: `${bin}:${process.env.PATH}`, HOME: process.env.HOME, ...extraEnv } });
+      const child = spawn("sh", [path, wt, "tests/x.py"], { cwd, env: { PATH: `${bin}:${process.env.PATH}`, HOME: process.env.HOME, ...extraEnv } });
       let stdout = "";
       let stderr = "";
       child.stdout.on("data", (d) => (stdout += d));
       child.stderr.on("data", (d) => (stderr += d));
       child.on("close", (code) => resolve({ code, stdout, stderr }));
     });
-  return { run, log, lock };
+  return { run, log, lock, root: f.root, argv: join(bin, "argv.txt") };
 }
+
+test("run_pr_tests.sh runs the tests under compose.review.yaml, which mounts the checkout read-only and gives /tmp to the run alone", async () => {
+  const { run, root, argv } = testRunner();
+  assert.equal((await run()).code, 0);
+  const call = readFileSync(argv, "utf8");
+  const override = join(root, "reports", "reviews", "tools", "compose.review.yaml");
+  assert.match(call, new RegExp(`^argv compose -f ${root}/compose.yaml -f ${override} --project-directory ${root} run --rm -T `));
+  const yaml = readFileSync(override, "utf8");
+  assert.match(yaml, /volumes: !override\n\s+- \.:\/usr\/src\/app\/:ro\n\s+- \/usr\/src\/app\/\.venv\n/);
+  assert.match(yaml, /tmpfs:\n\s+- \/tmp\n/);
+  assert.doesNotMatch(yaml, /tmp:\/tmp|:\/usr\/src\/app\/\s*$/m);
+});
+
+test("run_pr_tests.sh stops with a message when the lock path is taken by something that is not its link, instead of spinning forever", async () => {
+  const { run, lock, log } = testRunner();
+  writeFileSync(lock, "");
+  const started = Date.now();
+  const result = await run();
+  assert.equal(result.code, 2);
+  assert.match(result.stderr, /không tạo được khoá .*\.tests\.lock/);
+  assert.ok(Date.now() - started < 15_000);
+  assert.equal(existsSync(log), false);
+});
+
+test("run_pr_tests.sh refuses a checkout without compose.yaml before it touches the lock", async () => {
+  const { run, root, lock, log } = testRunner();
+  rmSync(join(root, "compose.yaml"));
+  const result = await run();
+  assert.equal(result.code, 2);
+  assert.match(result.stderr, /no compose\.yaml in /);
+  assert.equal(existsSync(lock), false);
+  assert.equal(existsSync(log), false);
+});
+
+test("run_pr_tests.sh finds compose.review.yaml when called by a relative path from a subdirectory of the checkout", async () => {
+  const { run, root, argv } = testRunner();
+  assert.equal((await run({}, join(root, "reports", "reviews"), join("tools", "run_pr_tests.sh"))).code, 0);
+  // pwd inside the script gives the physical path when the shell inherits a cwd, and /var/folders is a link on macOS; tools/ itself is a link, so only root is resolved
+  assert.ok(readFileSync(argv, "utf8").includes(` -f ${join(realpathSync(root), "reports", "reviews", "tools", "compose.review.yaml")} `));
+});
 
 test("run_pr_tests.sh lets two PRs take turns on the shared test databases, and cleans its lock", async () => {
   const { run, log, lock } = testRunner();

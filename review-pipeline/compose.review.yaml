@@ -1,0 +1,10 @@
+# Overrides the project's compose.yaml for run_pr_tests.sh: the PR's test code runs in here, and the gates read
+# reports/reviews/ on the host, so the container must not be able to write anywhere the review reads.
+# The project mounts the checkout read-write and shares /tmp between runs (a volume on PYTHONPATH).
+services:
+  api:
+    volumes: !override
+      - .:/usr/src/app/:ro
+      - /usr/src/app/.venv
+    tmpfs:
+      - /tmp

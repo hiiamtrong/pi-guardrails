@@ -7,7 +7,7 @@ import test from "node:test";
 
 process.env.SWAG_REVIEW_PYTHON = "python3";
 
-const { parsePrLink, parseBegin, readPipelineEnv, repoOf, splitFlags, findRoot, handbookOf, assembleTools, claimProjectRules, renderTimes, readPolicy, ruleRoots, projectRulesDir, readWidget, kickoff, withIdleWarning, IDLE_MS, STALE_TOOLS_MS, POLL_MS, default: reviewPipeline } =
+const { parsePrLink, parseBegin, readPipelineEnv, activeFor, STEP_MS, repoOf, splitFlags, findRoot, handbookOf, assembleTools, claimProjectRules, renderTimes, readPolicy, ruleRoots, projectRulesDir, readWidget, kickoff, withIdleWarning, IDLE_MS, STALE_TOOLS_MS, POLL_MS, default: reviewPipeline } =
   await import(`../extensions/review-pipeline.ts?test=${Date.now()}`);
 
 const STUB = `import json, os, pathlib, sys
@@ -571,6 +571,64 @@ test("review_board returns the board text for the checkout's repo and reviewer, 
   const bare = repo(null);
   writeFileSync(join(bare.engine, "v2", "review_board.py"), BOARD_STUB);
   await assert.rejects(inCheckout(bare.root, () => tools.review_board!("2", {})), /Không đọc được remote origin/);
+});
+
+function writeEvents(root: string, pr: string, states: string[], ageMs = 0): string {
+  const dir = join(root, "reports", "reviews", "evidence", pr, "gates");
+  mkdirSync(dir, { recursive: true });
+  const file = join(dir, "events.jsonl");
+  writeFileSync(file, states.map((state) => JSON.stringify({ ts: 1, step: "01", state, msg: "" })).join("\n") + "\n");
+  const when = new Date(Date.now() - ageMs);
+  utimesSync(file, when, when);
+  return file;
+}
+
+test("activeFor reports seconds since the last event only while the review is open and the file was written within five minutes", () => {
+  const { root } = repo();
+  assert.equal(activeFor(root, "7"), undefined);
+  writeEvents(root, "7", ["begin", "start"], 20_000);
+  const seconds = activeFor(root, "7");
+  assert.ok(seconds !== undefined && seconds >= 20 && seconds <= 25);
+  writeEvents(root, "7", ["begin", "note"], IDLE_MS + 1000);
+  assert.equal(activeFor(root, "7"), undefined);
+  writeEvents(root, "7", ["begin", "done"], IDLE_MS + 1000);
+  assert.equal(activeFor(root, "7"), undefined);
+  writeEvents(root, "7", ["begin", "start"], IDLE_MS + 290_000);
+  assert.ok(activeFor(root, "7") !== undefined, "a step in progress stays alive past five minutes");
+  writeEvents(root, "7", ["begin", "start"], STEP_MS + 1000);
+  assert.equal(activeFor(root, "7"), undefined);
+  writeEvents(root, "7", ["begin", "start", "end"]);
+  assert.equal(activeFor(root, "7"), undefined);
+  const file = writeEvents(root, "7", ["begin"]);
+  writeFileSync(file, '{"state":"star');
+  assert.equal(activeFor(root, "7"), undefined);
+});
+
+test("/review-pr and review_start refuse a PR that another runner wrote to in the last five minutes, and --takeover or silence lets it through", async () => {
+  const { root, work } = repo();
+  const { commands, tools, ctx, notes, handlers } = setup();
+  const link = "https://github.com/swaglive/swag-server/pull/19323";
+  const begins = () => (existsSync(join(work, "calls.txt")) ? (readFileSync(join(work, "calls.txt"), "utf8").match(/^begin /gm) ?? []).length : 0);
+
+  writeEvents(root, "19323", ["begin", "start"], 10_000);
+  await commands["review-pr"](link, ctx(root));
+  assert.match(notes.at(-1) ?? "", /PR #19323 đang có runner làm việc, sự kiện cuối \d+ giây trước.*--takeover/);
+  await assert.rejects(inCheckout(root, () => tools.review_start!("1", { link })), /đang có runner làm việc.*tool không có cờ này/);
+  assert.doesNotMatch(notes.at(-1) ?? "", /tool không có cờ này/);
+  assert.equal(begins(), 0);
+
+  await commands["review-pr"](`${link} --takeover`, ctx(root));
+  assert.equal(begins(), 1);
+
+  writeEvents(root, "19323", ["begin", "start"], 10 * 60_000);
+  await commands["review-pr"](link, ctx(root));
+  assert.match(notes.at(-1) ?? "", /đang có runner làm việc/);
+  assert.equal(begins(), 1);
+
+  writeEvents(root, "19323", ["begin", "done"], IDLE_MS + 1000);
+  await commands["review-pr"](link, ctx(root));
+  assert.equal(begins(), 2);
+  handlers.session_shutdown();
 });
 
 test("the review-runner agent lists review_step and the tools a draft needs, and ships with the package", () => {

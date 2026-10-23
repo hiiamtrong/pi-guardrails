@@ -391,6 +391,22 @@ function idleMs(widgetPath: string): number {
   }
 }
 
+// A step in progress writes nothing until it is done: #19323 had 587 s between a start and the next event, longer than IDLE_MS.
+// Equal to the default TESTS_LOCK_WAIT in run_pr_tests.sh: a runner queued for the test lock is silent that long, so raise both together.
+export const STEP_MS = 1_800_000;
+
+// The owner lock in begin separates Pi processes only: every runner started by one Pi has the same pid, so it cannot see a second runner on the same PR.
+export function activeFor(root: string, pr: string): number | undefined {
+  const file = join(root, "reports", "reviews", "evidence", pr, "gates", "events.jsonl");
+  try {
+    const age = Date.now() - statSync(file).mtimeMs;
+    const last = JSON.parse(readFileSync(file, "utf8").trimEnd().split("\n").pop() ?? "") as { state?: string };
+    return age < (last.state === "start" ? STEP_MS : IDLE_MS) && last.state !== "end" ? Math.round(age / 1000) : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 export function kickoff(repo: string, reviewer: string, rules: string[], pr: string, url: string, resume?: Begin, background?: string): string {
   const resumeLines = resume?.resumed
     ? [
@@ -603,6 +619,9 @@ export default function (pi: ExtensionAPI): void {
     const open = reviews.get(link.pr);
     if (open && !open.finished && open.env.RV !== root)
       throw new Refusal(`PR #${link.pr} đang mở ở ${open.env.RV}: dùng chung số PR với ${root} thì review_step không phân biệt được, xong review đó (action=end) hoặc mở phiên Pi khác`);
+    const quiet = flags.includes("--takeover") ? undefined : activeFor(root, link.pr);
+    if (quiet !== undefined)
+      throw new Refusal(`PR #${link.pr} đang có runner làm việc, sự kiện cuối ${quiet} giây trước: hai runner cùng ghi một review sẽ giẫm lên nhau. Đợi nó xong hoặc dừng nó, hoặc ${fromTool ? "nhờ người dùng gõ /review-pr với --takeover (tool không có cờ này)" : "thêm --takeover"} nếu chắc nó đã chết`);
     const others = [...reviews.values()].filter((review) => !review.finished && review.pr !== link.pr);
     if (fromTool && others.length >= MAX_OPEN)
       throw new Refusal(`Đã có ${others.length} review đang mở (${others.map((review) => `#${review.pr}`).join(", ")}): xong bớt một cái (review_step action=end, mất khả năng tiếp tục review đó) rồi mới mở thêm, tối đa ${MAX_OPEN} mỗi phiên Pi; người dùng gõ /review-pr thì không bị giới hạn`);

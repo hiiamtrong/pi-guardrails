@@ -463,8 +463,19 @@ async function pipeline(
   }
 }
 
+export const MAX_OPEN = 3;
+
+class Refusal extends Error {
+  level: "warning" | "error";
+  constructor(message: string, level: "warning" | "error" = "error") {
+    super(message);
+    this.level = level;
+  }
+}
+
 export default function (pi: ExtensionAPI): void {
   const reviews = new Map<string, Active>();
+  let lastCtx: Ctx | undefined;
   let board: Ctx["ui"] | undefined;
   let shown = "";
 
@@ -581,88 +592,107 @@ export default function (pi: ExtensionAPI): void {
     });
   }
 
+  // The command and the review_start tool share this; only the command has an agent to wait for, only the tool has a limit.
+  async function startReview(args: string, cwd: string, ctx: Ctx | undefined, fromTool: boolean): Promise<{ notice: string; message: string }> {
+    const { rest, flags } = splitFlags(args);
+    const background = flags.includes("--bg");
+    const link = parsePrLink(rest);
+    if (!link) throw new Refusal("Usage: /review-pr <GitHub PR link> [--takeover | --restart] [--bg]", "warning");
+    const root = findRoot(cwd);
+    if (!root) throw new Refusal("Không thấy repo git: chạy /review-pr trong review checkout của repo cần review");
+    const open = reviews.get(link.pr);
+    if (open && !open.finished && open.env.RV !== root)
+      throw new Refusal(`PR #${link.pr} đang mở ở ${open.env.RV}: dùng chung số PR với ${root} thì review_step không phân biệt được, xong review đó (action=end) hoặc mở phiên Pi khác`);
+    const others = [...reviews.values()].filter((review) => !review.finished && review.pr !== link.pr);
+    if (fromTool && others.length >= MAX_OPEN)
+      throw new Refusal(`Đã có ${others.length} review đang mở (${others.map((review) => `#${review.pr}`).join(", ")}): xong bớt một cái (review_step action=end, mất khả năng tiếp tục review đó) rồi mới mở thêm, tối đa ${MAX_OPEN} mỗi phiên Pi; người dùng gõ /review-pr thì không bị giới hạn`);
+    const repo = await checkoutRepo(root);
+    if (!repo) throw new Refusal(`Không đọc được remote origin của ${root}: gate cần biết review checkout thuộc repo nào`);
+    if (link.repo.toLowerCase() !== repo.toLowerCase())
+      throw new Refusal(`Review checkout này là ${repo}, không phải ${link.repo}: các gate đọc repo của checkout, hãy chạy /review-pr trong review checkout của ${link.repo}`);
+    const handbook = handbookOf(root);
+    if (!handbook) throw new Refusal(`Không thấy ${HANDBOOKS.join(" hoặc ")} trong ${root}: sổ tay reviewer của dự án`);
+    const reviewer = await reviewerOf(root);
+    if (!reviewer) throw new Refusal(`Không đọc được identity.guard.user trong git config của ${root}: cần biết tài khoản GitHub của reviewer`);
+    const rules = ruleRoots(root);
+    if (rules.length === 0) throw new Refusal(`Không thấy rule: đặt steps/ trong ${projectRulesDir(root)} (dự án) hoặc ${globalRules()} (global)`);
+    let policy: Policy;
+    try {
+      policy = readPolicy(rules);
+    } catch (error) {
+      throw new Refusal((error as Error).message);
+    }
+    if (!fromTool && ctx && !ctx.isIdle()) throw new Refusal("Agent đang bận, đợi xong rồi /review-pr lại", "warning");
+    claimProjectRules(root);
+    const env: Env = { REPO: repo, RV: root, HANDBOOK: handbook, REVIEWER: reviewer, RULES: rules.join(delimiter), ...policyEnv(policy, repo) };
+    const linkError = assembleTools(root, rules, env);
+    if (linkError) throw new Refusal(linkError);
+    const script = join(root, TOOLS, "v2", "pipeline_step.py");
+    const pr = link.pr;
+    const begin = await pipeline(script, ["begin", pr, "--owner", String(process.pid), ...flags.filter((flag) => flag !== "--bg")], env);
+    if (begin.code !== 0) throw new Refusal(`Không bật được UI: ${begin.err || begin.out}`);
+    const opened = parseBegin(begin.out);
+    if (!opened) throw new Refusal(`Không đọc được đầu ra của begin: ${begin.out || "(rỗng)"}`);
+    const { url, widget } = opened;
+    const previous = reviews.get(pr);
+    if (previous) stop(previous);
+    const active: Active = { pr, script, env, widget };
+    reviews.set(pr, active);
+    if (ctx && ctx.hasUI !== false) watch(ctx, active);
+    return {
+      notice: `Review #${pr}: UI ở ${url}${opened.resumed ? " (tiếp tục review dang dở)" : ""}`,
+      message: kickoff(repo, reviewer, rules, pr, url, opened, background ? root : undefined),
+    };
+  }
+
+  async function loadBoard(cwd: string): Promise<string> {
+    const root = findRoot(cwd);
+    if (!root) throw new Refusal("Không thấy repo git: chạy /review-board trong review checkout của repo cần xem");
+    const repo = await checkoutRepo(root);
+    if (!repo) throw new Refusal(`Không đọc được remote origin của ${root}: cần biết checkout thuộc repo nào`);
+    const reviewer = await reviewerOf(root);
+    if (!reviewer) throw new Refusal(`Không đọc được identity.guard.user trong git config của ${root}: cần biết tài khoản GitHub của reviewer`);
+    let policy: Policy;
+    try {
+      policy = readPolicy(ruleRoots(root));
+    } catch (error) {
+      throw new Refusal((error as Error).message);
+    }
+    const argv = ["--repo", repo, "--reviewer", reviewer, "--no-color"];
+    if (policy.authorPattern) argv.push("--author-pattern", policy.authorPattern);
+    // The board only reads GitHub (about 13 s for 16 PRs), so a stuck gh must not hold the command for the pipeline's 15 minutes.
+    // The script sees a pipe, not the terminal, so hand it the width for its line cut.
+    const columns: Record<string, string> = process.stdout.columns ? { COLUMNS: String(process.stdout.columns) } : {};
+    // The command is silent for ~13 s otherwise: show a status that counts seconds, and always clear it.
+    const started = Date.now();
+    const ui = lastCtx?.ui;
+    const show = () => ui?.setStatus("review-board", `⏳ review-board: đang tải PR từ GitHub... ${Math.round((Date.now() - started) / 1000)}s`);
+    show();
+    const ticker = setInterval(show, 1000);
+    let result: Awaited<ReturnType<typeof pipeline>>;
+    try {
+      result = await pipeline(join(engineDir(), "v2", "review_board.py"), argv, columns, Number(process.env.REVIEW_BOARD_TIMEOUT_MS) || 60_000, root);
+    } finally {
+      clearInterval(ticker);
+      ui?.setStatus("review-board", undefined);
+    }
+    if (result.code !== 0) throw new Refusal(result.err || result.out || "review_board.py lỗi không rõ");
+    return [result.out, result.err].filter(Boolean).join("\n");
+  }
+
   pi.registerCommand("review-pr", {
     description:
       "Start or resume a PR review with the live pipeline UI, in the review checkout of the PR's repo: /review-pr <GitHub PR link> [--takeover | --restart] [--bg]; --bg hands the work to a background subagent so this session stays free",
     handler: async (args, ctx) => {
-      const { rest, flags } = splitFlags(args);
-      const background = flags.includes("--bg");
-      const link = parsePrLink(rest);
-      if (!link)
-        return ctx.ui.notify(
-          "Usage: /review-pr <GitHub PR link> [--takeover | --restart] [--bg]",
-          "warning",
-        );
-      const root = findRoot(ctx.cwd);
-      if (!root)
-        return ctx.ui.notify("Không thấy repo git: chạy /review-pr trong review checkout của repo cần review", "error");
-      const open = reviews.get(link.pr);
-      if (open && !open.finished && open.env.RV !== root)
-        return ctx.ui.notify(`PR #${link.pr} đang mở ở ${open.env.RV}: dùng chung số PR với ${root} thì review_step không phân biệt được, xong review đó (action=end) hoặc mở phiên Pi khác`, "error");
-      const repo = await checkoutRepo(root);
-      if (!repo)
-        return ctx.ui.notify(
-          `Không đọc được remote origin của ${root}: gate cần biết review checkout thuộc repo nào`,
-          "error",
-        );
-      if (link.repo.toLowerCase() !== repo.toLowerCase())
-        return ctx.ui.notify(
-          `Review checkout này là ${repo}, không phải ${link.repo}: các gate đọc repo của checkout, hãy chạy /review-pr trong review checkout của ${link.repo}`,
-          "error",
-        );
-      const handbook = handbookOf(root);
-      if (!handbook)
-        return ctx.ui.notify(`Không thấy ${HANDBOOKS.join(" hoặc ")} trong ${root}: sổ tay reviewer của dự án`, "error");
-      const reviewer = await reviewerOf(root);
-      if (!reviewer)
-        return ctx.ui.notify(
-          `Không đọc được identity.guard.user trong git config của ${root}: cần biết tài khoản GitHub của reviewer`,
-          "error",
-        );
-      const rules = ruleRoots(root);
-      if (rules.length === 0)
-        return ctx.ui.notify(
-          `Không thấy rule: đặt steps/ trong ${projectRulesDir(root)} (dự án) hoặc ${globalRules()} (global)`,
-          "error",
-        );
-      let policy: Policy;
+      lastCtx = ctx;
       try {
-        policy = readPolicy(rules);
+        const started = await startReview(args, ctx.cwd, ctx, false);
+        ctx.ui.notify(started.notice, "info");
+        pi.sendUserMessage(started.message);
       } catch (error) {
-        return ctx.ui.notify((error as Error).message, "error");
+        if (!(error instanceof Refusal)) throw error;
+        ctx.ui.notify(error.message, error.level);
       }
-      if (!ctx.isIdle())
-        return ctx.ui.notify("Agent đang bận, đợi xong rồi /review-pr lại", "warning");
-      claimProjectRules(root);
-      const env: Env = { REPO: repo, RV: root, HANDBOOK: handbook, REVIEWER: reviewer, RULES: rules.join(delimiter), ...policyEnv(policy, repo) };
-      const linkError = assembleTools(root, rules, env);
-      if (linkError) return ctx.ui.notify(linkError, "error");
-      const script = join(root, TOOLS, "v2", "pipeline_step.py");
-      const pr = link.pr;
-      const begin = await pipeline(
-        script,
-        ["begin", pr, "--owner", String(process.pid), ...flags.filter((flag) => flag !== "--bg")],
-        env,
-      );
-      if (begin.code !== 0)
-        return ctx.ui.notify(`Không bật được UI: ${begin.err || begin.out}`, "error");
-      const opened = parseBegin(begin.out);
-      if (!opened)
-        return ctx.ui.notify(
-          `Không đọc được đầu ra của begin: ${begin.out || "(rỗng)"}`,
-          "error",
-        );
-      const { url, widget } = opened;
-      const previous = reviews.get(pr);
-      if (previous) stop(previous);
-      const active: Active = { pr, script, env, widget };
-      reviews.set(pr, active);
-      if (ctx.hasUI !== false) watch(ctx, active);
-      ctx.ui.notify(
-        `Review #${pr}: UI ở ${url}${opened.resumed ? " (tiếp tục review dang dở)" : ""}`,
-        "info",
-      );
-      pi.sendUserMessage(kickoff(repo, reviewer, rules, pr, url, opened, background ? root : undefined));
     },
   });
 
@@ -670,39 +700,51 @@ export default function (pi: ExtensionAPI): void {
     description:
       "Show every open PR you reviewed or were asked to review, grouped by what needs you next, in the review checkout of the repo: /review-board",
     handler: async (_args, ctx) => {
-      const root = findRoot(ctx.cwd);
-      if (!root)
-        return ctx.ui.notify("Không thấy repo git: chạy /review-board trong review checkout của repo cần xem", "error");
-      const repo = await checkoutRepo(root);
-      if (!repo) return ctx.ui.notify(`Không đọc được remote origin của ${root}: cần biết checkout thuộc repo nào`, "error");
-      const reviewer = await reviewerOf(root);
-      if (!reviewer)
-        return ctx.ui.notify(`Không đọc được identity.guard.user trong git config của ${root}: cần biết tài khoản GitHub của reviewer`, "error");
-      let policy: Policy;
+      lastCtx = ctx;
       try {
-        policy = readPolicy(ruleRoots(root));
+        ctx.ui.notify(await loadBoard(ctx.cwd), "info");
       } catch (error) {
-        return ctx.ui.notify((error as Error).message, "error");
+        if (!(error instanceof Refusal)) throw error;
+        ctx.ui.notify(error.message, error.level);
       }
-      const argv = ["--repo", repo, "--reviewer", reviewer, "--no-color"];
-      if (policy.authorPattern) argv.push("--author-pattern", policy.authorPattern);
-      // The board only reads GitHub (about 13 s for 16 PRs), so a stuck gh must not hold the command for the pipeline's 15 minutes.
-      // The script sees a pipe, not the terminal, so hand it the width for its line cut.
-      const columns: Record<string, string> = process.stdout.columns ? { COLUMNS: String(process.stdout.columns) } : {};
-      // The command is silent for ~13 s otherwise: show a status that counts seconds, and always clear it.
-      const started = Date.now();
-      const show = () => ctx.ui.setStatus("review-board", `⏳ review-board: đang tải PR từ GitHub... ${Math.round((Date.now() - started) / 1000)}s`);
-      show();
-      const ticker = setInterval(show, 1000);
-      let board: Awaited<ReturnType<typeof pipeline>>;
-      try {
-        board = await pipeline(join(engineDir(), "v2", "review_board.py"), argv, columns, Number(process.env.REVIEW_BOARD_TIMEOUT_MS) || 60_000, root);
-      } finally {
-        clearInterval(ticker);
-        ctx.ui.setStatus("review-board", undefined);
-      }
-      if (board.code !== 0) return ctx.ui.notify(board.err || board.out || "review_board.py lỗi không rõ", "error");
-      ctx.ui.notify([board.out, board.err].filter(Boolean).join("\n"), "info");
+    },
+  });
+
+  pi.registerTool({
+    name: "review_start",
+    label: "Review start",
+    description:
+      "Start or resume the PR review pipeline for a GitHub PR link, in the review checkout of the current directory, like /review-pr. By default the review runs in a background review-runner subagent; the result tells you how to launch it. At most 3 reviews can be open at once.",
+    promptGuidelines: [
+      "Use review_start only when the user asked to review a PR; follow the instructions it returns exactly.",
+    ],
+    parameters: {
+      type: "object",
+      properties: {
+        link: { type: "string", description: "Full GitHub PR link, e.g. https://github.com/owner/repo/pull/123" },
+        background: { type: "boolean", description: "Run in a background subagent (default true); false makes this session do the review itself" },
+      },
+      required: ["link"],
+    },
+    async execute(_id, params) {
+      const background = params.background !== false;
+      // The whole string must be one link: startReview reads flags out of its arguments, and the agent may not pass --takeover or --restart.
+      const link = parsePrLink(String(params.link ?? ""));
+      if (!link) throw new Refusal("link phải là đúng một link PR GitHub, không kèm cờ nào. Usage: /review-pr <GitHub PR link>", "warning");
+      const started = await startReview(`https://github.com/${link.repo}/pull/${link.pr}${background ? " --bg" : ""}`, process.cwd(), lastCtx, true);
+      return { content: [{ type: "text", text: `${started.notice}\n\n${started.message}` }], details: { background } };
+    },
+  });
+
+  pi.registerTool({
+    name: "review_board",
+    label: "Review board",
+    description:
+      "List every open PR the reviewer has reviewed or been asked to review in the current review checkout, grouped by the next action (review again, not reviewed, new replies, waiting for the author, done), like /review-board. Reads GitHub only and takes about 15 seconds.",
+    promptGuidelines: ["Use review_board to decide which PR to review next, before calling review_start."],
+    parameters: { type: "object", properties: {} },
+    async execute() {
+      return { content: [{ type: "text", text: await loadBoard(process.cwd()) }], details: {} };
     },
   });
 

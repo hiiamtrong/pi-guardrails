@@ -506,6 +506,73 @@ test("/review-pr --bg keeps --bg away from begin and hands the agent a backgroun
   handlers.session_shutdown();
 });
 
+async function inCheckout<T>(root: string, body: () => Promise<T>): Promise<T> {
+  const before = process.cwd();
+  process.chdir(root);
+  try {
+    return await body();
+  } finally {
+    process.chdir(before);
+  }
+}
+
+test("review_start and review_board are registered when the extension loads", () => {
+  const { tools } = setup();
+  assert.ok(tools.review_start);
+  assert.ok(tools.review_board);
+});
+
+test("review_start opens the review without an idle agent, begins it as /review-pr does, and returns the background kickoff", async () => {
+  const { root, work } = repo();
+  const { commands, tools, ctx, sent, handlers } = setup();
+  await commands["review-board"]("", ctx(root, false));
+  const result = await inCheckout(root, () => tools.review_start!("1", { link: "https://github.com/swaglive/swag-server/pull/19233" }));
+  const text = result.content[0].text;
+  assert.match(text, /^Review #19233: UI ở http:\/\/127\.0\.0\.1:9/);
+  assert.match(text, /agent=review-runner, async=true, cwd=/);
+  assert.deepEqual(readWidget(join(work, "calls.txt")), [`begin 19233 --owner ${process.pid}`]);
+  assert.equal(sent.length, 0);
+  await tools.review_step!("2", { action: "note", step: "00", message: "x", pr: "19233" });
+  handlers.session_shutdown();
+});
+
+test("review_start with background=false hands back the foreground kickoff", async () => {
+  const { root } = repo();
+  const { tools } = setup();
+  const text = (await inCheckout(root, () => tools.review_start!("1", { link: "https://github.com/swaglive/swag-server/pull/19233", background: false }))).content[0].text;
+  assert.doesNotMatch(text, /review-runner/);
+  assert.match(text, /Dừng sau bước 05/);
+});
+
+test("review_start refuses a bad link, a checkout that is not the PR's repo and a fourth open review, but not a rerun of an open one", async () => {
+  const { root, work } = repo();
+  const { tools, commands, ctx, handlers } = setup();
+  const start = (n: number | string) => inCheckout(root, () => tools.review_start!("1", { link: `https://github.com/swaglive/swag-server/pull/${n}` }));
+  await assert.rejects(inCheckout(root, () => tools.review_start!("1", { link: "19233" })), /Usage: \/review-pr/);
+  for (const link of ["https://github.com/swaglive/swag-server/pull/9 --restart", "https://github.com/swaglive/swag-server/pull/9 --takeover --bg", "https://github.com/swaglive/swag-server/pull/9\n--restart"])
+    await assert.rejects(inCheckout(root, () => tools.review_start!("1", { link })), /không kèm cờ nào/);
+  assert.equal(existsSync(join(work, "calls.txt")), false);
+  await assert.rejects(inCheckout(root, () => tools.review_start!("1", { link: "https://github.com/swaglive/other/pull/5" })), /không phải swaglive\/other/);
+  for (const n of [1, 2, 3]) await start(n);
+  await assert.rejects(start(4), /Đã có 3 review đang mở \(#1, #2, #3\).*tối đa 3 mỗi phiên Pi.*\/review-pr thì không bị giới hạn/);
+  await start(2);
+  await tools.review_step!("2", { action: "end", pr: "2" });
+  await start(4);
+  await commands["review-pr"]("https://github.com/swaglive/swag-server/pull/5", ctx(root));
+  handlers.session_shutdown();
+});
+
+test("review_board returns the board text for the checkout's repo and reviewer, and says why it cannot", async () => {
+  const f = repo();
+  writeFileSync(join(f.engine, "v2", "review_board.py"), BOARD_STUB);
+  const { tools } = setup();
+  const text = (await inCheckout(f.root, () => tools.review_board!("1", {}))).content[0].text;
+  assert.match(text, /^BOARD --repo swaglive\/swag-server --reviewer Sotatek-TheoNguyen2 --no-color/);
+  const bare = repo(null);
+  writeFileSync(join(bare.engine, "v2", "review_board.py"), BOARD_STUB);
+  await assert.rejects(inCheckout(bare.root, () => tools.review_board!("2", {})), /Không đọc được remote origin/);
+});
+
 test("the review-runner agent lists review_step and the tools a draft needs, and ships with the package", () => {
   const dir = join(dirname(new URL(import.meta.url).pathname), "..");
   const agent = readFileSync(join(dir, "agents", "review-runner.md"), "utf8");

@@ -4,9 +4,11 @@ Usage: python3.12 scan_triggers.py <worktree> <base> <head> [description.txt]   
 Mô tả chỉ được thêm trigger, không bớt: bước index chạy tay của #18729 chỉ nằm trong Rollout Plan.
 TSV: trigger, path:line, hàm bao quanh, code. Không có gì thì in NONE.
 """
+import ast
 import re
 import subprocess
 import sys
+import warnings
 
 DELETE = re.compile(r'(?i)(delete|\bdrop|_drop|prune|purge|truncate|\bremove|_remove|cleanup|clean_up|discard|\$unset|\$pull|re-?key|expire\()')
 ROLLOUT_PATH = re.compile(r'^(alembic/|deploy/|.*/jobs/.*\.ya?ml$|charts?/|.*values[^/]*\.ya?ml$|.*\.sql$)')
@@ -16,6 +18,23 @@ CROSS = re.compile(r'(go_chat|openim|OpenIM|SwagServerClient|outbox|pusher|Pushe
 CROSS_FILE = re.compile(r'(go_chat|openim|OpenIM|SwagServerClient)')
 DESC_ROLLOUT = re.compile(r'(?i)(createIndex|create_index|manually|by hand|pre-deploy|post-deploy|before deploy|after deploy|run (it )?once|one-off)')
 FLAG = re.compile(r'(?i)(migration_state|MigrationState|growthbook|kill_switch|ledger|wallet|payment|points\.|escrow)')
+
+# Dòng đọc một giá trị rồi xử lý rỗng hoặc đặt mặc định: nơi một giả định về dữ liệu thật nằm.
+GUARD = re.compile(r"""(?x)
+    \bor\s+(?:['"\d\[\{]|None\b|True\b|False\b|[A-Z]\w*\.[A-Z_]+)
+  | \band\b
+  | \bif\b.+\belse\b
+  | \.get\(\s*['"]\w+['"]\s*,
+  | getattr\([^,()]+,\s*['"]\w+['"]\s*,
+  | \bis\s+(?:not\s+)?None\b
+  | \bOptional\[
+  | \|\s*None\b
+  | =\s*None\b
+  | nullable\s*=\s*True
+""")
+KEYED = re.compile(r"""(?:\[\s*['"]|\.get\(\s*['"]|getattr\([^,()]+,\s*['"])([A-Za-z_]\w{2,})\b""")
+CHAIN = re.compile(r'\b[A-Za-z_]\w*((?:\.[A-Za-z_]\w*)+)')
+GENERIC = {'self', 'cls', 'get', 'items', 'keys', 'values', 'datetime'}
 
 
 def git(wt, *args):
@@ -57,6 +76,89 @@ def scan_hunk(wt, head, path, hunk, cache, out):
             out.append(('FLAG_SLACK', loc, fn, c[:120]))
 
 
+def reads(text):
+    """Đường dẫn thuộc tính bỏ biến đầu: `session.mode.nbf` cho `mode` và `mode.nbf`, nên `show.nbf` ở chỗ khác trong file không che nó."""
+    keys = set(KEYED.findall(text))
+    for m in CHAIN.finditer(text):
+        parts = m.group(1).split('.')[1:]
+        if text[m.end():m.end() + 1] == '(':
+            parts = parts[:-1]
+        keys.update('.'.join(parts[:i]) for i in range(1, len(parts) + 1))
+    return {k for k in keys if len(k.split('.')[-1]) >= 3 and k.split('.')[-1] not in GENERIC and not k.split('.')[-1][:1].isupper()}
+
+
+def show(wt, rev, path):
+    try:
+        return git(wt, 'show', f'{rev}:{path}')
+    except subprocess.CalledProcessError:
+        return ''  # file mới của PR chưa có ở base
+
+
+def docstring_lines(src):
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter('ignore', SyntaxWarning)
+            tree = ast.parse(src)
+    except SyntaxError:
+        return set()
+    return {n for node in ast.walk(tree) if isinstance(node, ast.Expr) and isinstance(node.value, ast.Constant)
+            and isinstance(node.value.value, str) for n in range(node.lineno, node.end_lineno + 1)}
+
+
+def writers(wt, head, ident, near, skip):
+    """Chỗ ghi `ident` trong code không phải test. Lệnh ghi vào DB (`set_on_insert__mode=`, `set__mode__nbf=` của MongoEngine) đứng
+    trước, rồi file cùng thư mục với dòng đang xét: một giá trị như `mode` có hàng chục chỗ ghi, chỗ tạo ra bản ghi mới mới là chỗ cần mở."""
+    pat = re.compile(rf'(?:(?<!\w)|(?<=__)){ident}(?:__\w+)?\s*=[^=]|[\'"]{ident}[\'"]\s*:')
+    persist = re.compile(rf'__{ident}(?:__\w+)?\s*=[^=]')
+    found = []
+    for row in git(wt, 'grep', '-n', '-F', ident, head, '--', '*.py', ':!tests').splitlines():
+        f, ln, text = row.removeprefix(head + ':').split(':', 2)
+        if (f, int(ln)) not in skip and pat.search(text):
+            found.append((f, int(ln), bool(persist.search(text))))
+    prefix = '/'.join(near.split('/')[:3])
+    found.sort(key=lambda w: (not w[2], not w[0].startswith(prefix), w[0], w[1]))
+    return [f'{f}:{n}' for f, n, _ in found]
+
+
+def added_lines(wt, base, head):
+    path, n, out = None, 0, []
+    for line in git(wt, 'diff', '-U0', base, head, '--', '*.py').splitlines():
+        if line.startswith('+++ '):
+            path = line[6:] if line.startswith('+++ b/') else None
+        elif line.startswith('@@'):
+            n = int(re.match(r'@@ -\S+ \+(\d+)', line).group(1))
+        elif path and line.startswith('+') and not line.startswith('+++'):
+            if not path.startswith('tests/'):
+                out.append((path, n, line[1:]))
+            n += 1
+    return out
+
+
+def value_origins(wt, base, head):
+    """Giá trị PR bắt đầu đọc trong một file, trên dòng có xử lý rỗng hoặc mặc định, kèm nơi code khác ghi ra nó.
+    #19308 đọc session.mode.nbf và test dựng session không có mode; activate_session ghi mode=free, nbf=now thì không ai mở.
+    Heuristic để buộc truy về chỗ ghi, không phải phán quyết."""
+    rows = added_lines(wt, base, head)
+    skip = {(p, n) for p, n, _ in rows}
+    old, src, doc, seen = {}, {}, {}, {}
+    for path, n, text in rows:
+        if path not in src:
+            src[path] = show(wt, head, path)
+            doc[path] = docstring_lines(src[path])
+            old[path] = reads(show(wt, base, path))
+        c = text.strip().split('  #', 1)[0]
+        if not c or c.startswith('#') or n in doc[path] or not GUARD.search(c):
+            continue
+        for key in sorted(reads(c) - old[path]):
+            seen.setdefault(key.split('.')[-1], (path, n, c))
+    out = []
+    for ident, (path, n, c) in seen.items():
+        found = writers(wt, head, ident, path, skip)
+        where = ('ghi ở ' + ', '.join(found[:3]) + (f' (+{len(found) - 3})' if len(found) > 3 else '')) if found else 'không có chỗ ghi trong code'
+        out.append(('VALUE_ORIGIN', f'{path}:{n}', enclosing(src[path].splitlines(), n), f'{ident} | {where} | {c[:80]}'))
+    return out
+
+
 def main(wt, base, head, desc=None):
     out = []
     for p in git(wt, 'diff', '--name-only', '--diff-filter=d', base, head).split():
@@ -94,6 +196,7 @@ def main(wt, base, head, desc=None):
             old_no += line[0] == ' '
     if path and hunk:
         scan_hunk(wt, head, path, hunk, cache, out)
+    out.extend(value_origins(wt, base, head))
     seen = set()
     for row in out:
         if row[:2] not in seen:

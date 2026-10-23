@@ -400,6 +400,168 @@ elif 'issues/9' in a[1]:
         self.assertIn('FAIL   base=feat/parent', out)
 
 
+class ValueOrigin(unittest.TestCase):
+    """scan_triggers VALUE_ORIGIN and check_draft origin: a value the PR starts reading with a None/default guard must be traced to
+    the code that writes it (#19308: the test built a session without a mode, activate_session always writes one)."""
+
+    @classmethod
+    def setUpClass(cls):
+        sys.path.insert(0, str(HERE))
+        import check_draft
+        import scan_triggers
+        cls.cd, cls.st = check_draft, scan_triggers
+
+    def repo(self, files_base, files_head):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        root = pathlib.Path(tmp.name)
+
+        def commit(files, msg):
+            for name, text in files.items():
+                (root / name).parent.mkdir(parents=True, exist_ok=True)
+                (root / name).write_text(text)
+            subprocess.run(['git', '-C', str(root), 'add', '-A'], check=True)
+            subprocess.run(['git', '-C', str(root), '-c', 'user.name=t', '-c', 'user.email=t@t', 'commit', '-qm', msg], check=True)
+            return subprocess.run(['git', '-C', str(root), 'rev-parse', 'HEAD'], capture_output=True, text=True, check=True).stdout.strip()
+
+        subprocess.run(['git', '-C', str(root), 'init', '-q'], check=True)
+        base = commit(files_base, 'base')
+        return str(root), base, commit(files_head, 'head')
+
+    STATE_BASE = 'def build(session):\n    return {"title": session.title}\n'
+    STATE_HEAD = (
+        'def build(session):\n'
+        '    """The room as web reads it: session.deadline and session.mode, or a default when there is none."""\n'
+        '    return {\n'
+        '        "title": session.title,\n'
+        '        "mode": session.mode.name if session.mode else FREE,\n'
+        '        "label": session.title or "x",\n'
+        '    }\n')
+    TASKS = ('def activate(now):\n'
+             '    return Session.objects.modify(set_on_insert__mode=Mode(name="free", nbf=now))\n')
+    NOISE = 'def other():\n    return open("f", mode="rb")\n'
+    NEIGHBOUR = 'def call():\n    return build(mode="x")\n'
+
+    def rows(self, head_files=None):
+        root, base, head = self.repo(
+            {'app/live/state.py': self.STATE_BASE, 'app/live/tasks.py': self.TASKS, 'app/live/aaa.py': self.NEIGHBOUR, 'app/other.py': self.NOISE},
+            {'app/live/state.py': self.STATE_HEAD, 'app/live/tasks.py': self.TASKS, 'app/live/aaa.py': self.NEIGHBOUR, 'app/other.py': self.NOISE,
+             **(head_files or {})})
+        return self.st.value_origins(root, base, head)
+
+    def test_a_value_the_pr_starts_reading_with_a_guard_is_traced_to_where_it_is_written(self):
+        rows = self.rows()
+        mode = [r for r in rows if r[3].startswith('mode | ')]
+        self.assertEqual(len(mode), 1)
+        self.assertEqual(mode[0][0], 'VALUE_ORIGIN')
+        self.assertEqual(mode[0][1], 'app/live/state.py:5')
+        self.assertIn('ghi ở app/live/tasks.py:2', mode[0][3])
+
+    def test_the_database_write_comes_before_a_plain_keyword_of_the_same_name_even_in_a_file_that_sorts_first(self):
+        where = [r for r in self.rows() if r[3].startswith('mode | ')][0][3]
+        self.assertIn('app/live/aaa.py:2', where)
+        self.assertLess(where.index('app/live/tasks.py:2'), where.index('app/live/aaa.py:2'))
+        self.assertLess(where.index('app/live/aaa.py:2'), where.index('app/other.py:2'))
+
+    def test_a_value_the_file_already_read_before_the_pr_is_not_listed(self):
+        self.assertFalse([r for r in self.rows() if r[3].startswith('title | ')])
+
+    def test_prose_in_a_docstring_and_a_default_constant_are_not_values(self):
+        idents = {r[3].split(' | ')[0] for r in self.rows()}
+        self.assertIn('mode', idents)
+        self.assertNotIn('deadline', idents)
+        self.assertNotIn('FREE', idents)
+
+    def test_a_value_nobody_writes_says_so(self):
+        head = {'app/live/state.py': 'def build(r):\n    return r.retry_after or 0\n'}
+        root, base, head = self.repo({'app/live/state.py': 'def build(r):\n    return 1\n'}, head)
+        rows = self.st.value_origins(root, base, head)
+        self.assertEqual([r[3].split(' | ')[:2] for r in rows], [['retry_after', 'không có chỗ ghi trong code']])
+
+    def test_a_test_file_and_a_new_file_are_handled(self):
+        head = {'app/new.py': 'def f(s):\n    return s.expiry or 0\n', 'tests/test_x.py': 'def test_a(s):\n    assert s.only_in_tests or 1\n'}
+        idents = {r[3].split(' | ')[0] for r in self.rows(head)}
+        self.assertIn('expiry', idents)
+        self.assertNotIn('only_in_tests', idents)
+
+    def test_a_name_the_file_read_on_another_object_does_not_hide_the_new_path(self):
+        base = {'app/live/state.py': 'def build(show):\n    return {"nbf": show.nbf}\n', 'app/live/tasks.py': self.TASKS}
+        head = {'app/live/state.py': 'def build(show, session):\n    return {"nbf": show.nbf, "m": session.mode and session.mode.nbf}\n', 'app/live/tasks.py': self.TASKS}
+        root, b, h = self.repo(base, head)
+        idents = {r[3].split(' | ')[0] for r in self.st.value_origins(root, b, h)}
+        self.assertTrue({'mode', 'nbf'} <= idents)
+
+    def test_the_same_path_under_another_variable_name_is_still_old(self):
+        base = {'app/live/state.py': 'def build(a):\n    return a.mode.nbf\n'}
+        head = {'app/live/state.py': 'def build(a, session):\n    return a.mode.nbf, session.mode and session.mode.nbf\n'}
+        root, b, h = self.repo(base, head)
+        self.assertEqual(self.st.value_origins(root, b, h), [])
+
+    def test_class_enum_and_constant_names_are_not_values(self):
+        self.assertEqual(self.st.reads('Session.SessionStatus.preset or ModeEnum.FREE or models.Goal'), {'SessionStatus.preset'})
+        root, b, h = self.repo({'app/a.py': 'x = 1\n'}, {'app/a.py': 'def f(x: models.Goal | None):\n    return x\n'})
+        self.assertEqual(self.st.value_origins(root, b, h), [])
+
+    def test_a_method_call_ends_the_path(self):
+        self.assertEqual(self.st.reads('x = utils.as_utc(session.mode.nbf).isoformat()'), {'mode', 'mode.nbf'})
+
+    def worktree(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        wt = pathlib.Path(tmp.name)
+        (wt / 'app').mkdir()
+        (wt / 'app/tasks.py').write_text('def activate(now):\n    return Session.objects.modify(\n        set_on_insert__mode=Mode(nbf=now),\n    )\n' + '\n' * 20 + 'x = 1\n')
+        return str(wt)
+
+    ROW = [('VALUE_ORIGIN', 'a.py:1', 'f', 'mode | ghi ở app/tasks.py:3 | x')]
+
+    def test_the_draft_needs_a_line_naming_the_value_and_citing_the_place_that_writes_it(self):
+        wt = self.worktree()
+        rows = self.ROW + [('VALUE_ORIGIN', 'a.py:2', 'f', 'retry_after | không có chỗ ghi trong code | y')]
+        self.assertEqual(self.cd.origin_missing('', rows, wt), ['mode', 'retry_after'])
+        sec = '- `mode`: ghi ở app/tasks.py:3 với nbf now; test dựng qua activate.\n- `retry_after`: không có chỗ ghi trong code, đến từ thư viện.\n'
+        self.assertEqual(self.cd.origin_missing(sec, rows, wt), [])
+
+    def test_a_line_with_only_the_name_or_only_a_location_does_not_count(self):
+        wt = self.worktree()
+        self.assertEqual(self.cd.origin_missing('- mode: đã xem, không sao\n', self.ROW, wt), ['mode'])
+        self.assertEqual(self.cd.origin_missing('- ghi ở app/tasks.py:3\n', self.ROW, wt), ['mode'])
+        self.assertEqual(self.cd.origin_missing('- model: ghi ở app/tasks.py:3\n', self.ROW, wt), ['mode'])
+
+    def test_a_made_up_location_does_not_count(self):
+        wt = self.worktree()
+        for line in (
+            '- mode: ghi ở zzz_unrelated.py:1',
+            '- mode: ghi ở app/missing.py:3',
+            '- mode: ghi ở app/tasks.py:3999',
+            '- mode: ghi ở app/tasks.py:25',
+        ):
+            with self.subTest(line=line):
+                self.assertEqual(self.cd.origin_missing(line + '\n', self.ROW, wt), ['mode'])
+
+    def test_a_location_a_couple_of_lines_off_and_an_absolute_path_both_count(self):
+        wt = self.worktree()
+        self.assertEqual(self.cd.origin_missing('- mode: ghi ở app/tasks.py:1\n', self.ROW, wt), [])
+        self.assertEqual(self.cd.origin_missing('- mode: ghi ở app/tasks.py:5\n', self.ROW, wt), [])
+        self.assertEqual(self.cd.origin_missing(f'- mode: ghi ở {wt}/app/tasks.py:3\n', self.ROW, wt), [])
+
+    def test_names_that_often_carry_a_default_are_reported(self):
+        idents = {r[3].split(' | ')[0] for r in self.rows({'app/new.py': 'def f(s):\n    return s.status or s.owner or 0\n'})}
+        self.assertTrue({'status', 'owner'} <= idents)
+
+    def test_a_pr_with_many_guarded_reads_gets_a_row_for_each(self):
+        body = ''.join(f'    a{i:02} = s.attr{i:02} or 0\n' for i in range(15))
+        rows = self.rows({'app/many.py': 'def f(s):\n' + body})
+        self.assertEqual(len([r for r in rows if r[1].startswith('app/many.py')]), 15)
+
+    def test_a_source_with_an_invalid_escape_is_scanned_without_a_warning(self):
+        import warnings
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter('always')
+            self.st.docstring_lines('pattern = "\\.py"\n')
+        self.assertEqual(caught, [])
+
+
 if __name__ == '__main__':
     unittest.main()
 

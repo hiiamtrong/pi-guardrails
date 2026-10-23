@@ -71,6 +71,23 @@ def tsv(path, kind=None):
     return [r for r in rows if kind is None or r[0] == kind]
 
 
+def origin_missing(sec, rows, wt):
+    """Giá trị của VALUE_ORIGIN chưa có dòng nào trong mục vừa nêu tên, vừa trích một chỗ ghi thật (file.py:dòng trong worktree, tên
+    nằm trong 2 dòng quanh đó) hoặc nói không có chỗ ghi: một `file.py:dòng` bịa không qua được."""
+    def cited(ident, line):
+        for path, n in re.findall(r'([\w./-]+\.py):(\d+)', line):
+            try:
+                src = (pathlib.Path(wt) / path).read_text().splitlines()
+            except OSError:
+                continue
+            if re.search(rf'(?<![A-Za-z0-9]){re.escape(ident)}', '\n'.join(src[max(0, int(n) - 3):int(n) + 2])):
+                return True
+        return False
+
+    return [i for i in dict.fromkeys(r[3].split(' | ')[0] for r in rows)
+            if not any(re.search(rf'\b{re.escape(i)}\b', l) and ('không có chỗ ghi' in l or cited(i, l)) for l in sec.splitlines())]
+
+
 def check_points(body, event):
     answers = {}
     for i, label in enumerate(POINTS, 1):
@@ -180,6 +197,11 @@ def main():
         sec = section(text, 'Request thật qua service kia') or ''
         ok = 'evidence/' in sec or ('chưa kiểm' in sec and (event != 'APPROVE' or override))
         say('PASS' if ok else 'FAIL', 'cross', f'theo request thật qua service kia (#19011, AGENTS.local.md:282): {"có bằng chứng" if "evidence/" in sec else "chưa kiểm" if sec else "thiếu mục"}, event {event}')
+    origins = tsv(a.triggers, 'VALUE_ORIGIN')
+    if origins:
+        miss = origin_missing(section(text, 'Giá trị có thể rỗng do ai ghi') or '', origins, a.wt)
+        say('FAIL' if miss else 'PASS', 'origin', f'{len(origins) - len(miss)}/{len(origins)} giá trị đã truy về chỗ ghi' + (f'; thiếu {miss[0]}…: dòng phải nêu tên giá trị và trích file.py:dòng có thật, tên nằm trong 2 dòng quanh đó' if miss else '') + ' (#19308: test dựng dữ liệu khác với activate_session thật)')
+        say('MANUAL', 'origin-test', 'test dựng dữ liệu qua đúng chỗ ghi đó, không tự dựng: chỉ người kiểm được')
     tests = tsv(a.expected)
     if tests:
         sec = section(text, 'Test có độc lập với code không') or ''

@@ -544,7 +544,7 @@ test("review_start with background=false hands back the foreground kickoff", asy
   assert.match(text, /Dừng sau bước 05/);
 });
 
-test("review_start refuses a bad link, a checkout that is not the PR's repo and a fourth open review, but not a rerun of an open one", async () => {
+test("review_start refuses a bad link, a checkout that is not the PR's repo and an eleventh open review, but not a rerun of an open one", async () => {
   const { root, work } = repo();
   const { tools, commands, ctx, handlers } = setup();
   const start = (n: number | string) => inCheckout(root, () => tools.review_start!("1", { link: `https://github.com/swaglive/swag-server/pull/${n}` }));
@@ -553,11 +553,11 @@ test("review_start refuses a bad link, a checkout that is not the PR's repo and 
     await assert.rejects(inCheckout(root, () => tools.review_start!("1", { link })), /không kèm cờ nào/);
   assert.equal(existsSync(join(work, "calls.txt")), false);
   await assert.rejects(inCheckout(root, () => tools.review_start!("1", { link: "https://github.com/swaglive/other/pull/5" })), /không phải swaglive\/other/);
-  for (const n of [1, 2, 3]) await start(n);
-  await assert.rejects(start(4), /Đã có 3 review đang mở \(#1, #2, #3\).*tối đa 3 mỗi phiên Pi.*\/review-pr thì không bị giới hạn/);
+  for (const n of [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]) await start(n);
+  await assert.rejects(start(11), /Đã có 10 review đang mở \(#1, #2, #3.*#10\).*tối đa 10 mỗi phiên Pi.*\/review-pr thì không bị giới hạn/);
   await start(2);
   await tools.review_step!("2", { action: "end", pr: "2" });
-  await start(4);
+  await start(11);
   await commands["review-pr"]("https://github.com/swaglive/swag-server/pull/5", ctx(root));
   handlers.session_shutdown();
 });

@@ -481,7 +481,7 @@ async function pipeline(
   }
 }
 
-export const MAX_OPEN = 3;
+export const MAX_OPEN = 10;
 
 class Refusal extends Error {
   level: "warning" | "error";
@@ -735,7 +735,7 @@ export default function (pi: ExtensionAPI): void {
     name: "review_start",
     label: "Review start",
     description:
-      "Start or resume the PR review pipeline for a GitHub PR link, in the review checkout of the current directory, like /review-pr. By default the review runs in a background review-runner subagent; the result tells you how to launch it. At most 3 reviews can be open at once.",
+      "Start or resume the PR review pipeline for a GitHub PR link, in the review checkout of the current directory, like /review-pr. By default the review runs in a background review-runner subagent; the result tells you how to launch it. At most 10 reviews can be open at once.",
     promptGuidelines: [
       "Use review_start only when the user asked to review a PR; follow the instructions it returns exactly.",
     ],

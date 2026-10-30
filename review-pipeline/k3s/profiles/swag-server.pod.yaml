@@ -1,0 +1,70 @@
+# One swag-server test run: the databases and the runner share the pod's network (localhost), so nothing outside can reach them and
+# nothing inside is shared with another run. The words between double underscores are filled in by rv_k3s.sh.
+# shortcut: the Mongo here is one replica set, not the sharded mongos the compose stack runs (tests/services.py makes the same choice).
+apiVersion: v1
+kind: Pod
+metadata:
+  name: __POD__
+  labels:
+    app: review-env
+    rv/repo: __REPO__
+    rv/pr: "__PR__"
+    rv/net: none
+spec:
+  priorityClassName: review-env
+  automountServiceAccountToken: false
+  enableServiceLinks: false
+  restartPolicy: Never
+  terminationGracePeriodSeconds: 1
+  activeDeadlineSeconds: __DEADLINE__
+  securityContext:
+    seccompProfile:
+      type: RuntimeDefault
+  containers:
+    - name: postgres
+      image: postgres:16-alpine
+      args: ["-c", "fsync=off", "-c", "synchronous_commit=off", "-c", "full_page_writes=off"]
+      env:
+        - { name: POSTGRES_USER, value: swag }
+        - { name: POSTGRES_PASSWORD, value: swag }
+        - { name: POSTGRES_DB, value: swag_test }
+      volumeMounts:
+        - { name: pgdata, mountPath: /var/lib/postgresql/data }
+      resources:
+        requests: { cpu: 100m, memory: 64Mi }
+        limits: { memory: 512Mi }
+    - name: mongo
+      image: __MONGO_IMAGE__
+      command: ["mongod", "--replSet", "swag-test", "--bind_ip_all", "--wiredTigerCacheSizeGB", "0.25"]
+      volumeMounts:
+        - { name: mongodata, mountPath: /data/db }
+      resources:
+        requests: { cpu: 100m, memory: 128Mi }
+        limits: { memory: 768Mi }
+    - name: redis
+      image: redis/redis-stack-server:7.2.0-v11
+      env:
+        - { name: REDIS_ARGS, value: "--protected-mode no --maxmemory 100000000 --maxmemory-policy volatile-ttl --save ''" }
+      resources:
+        requests: { cpu: 50m, memory: 32Mi }
+        limits: { memory: 384Mi }
+    - name: runner
+      image: __IMAGE__
+      imagePullPolicy: Never
+      command: ["sleep", "infinity"]
+      workingDir: /usr/src/app
+      env:
+        - { name: HOME, value: /tmp }
+        - { name: SWAG_RUNNING_IN_TESTS, value: "1" }
+        - { name: PYTHONOPTIMIZE, value: "0" }
+        - { name: PYTHONPATH, value: /usr/src/app }
+      securityContext:
+        allowPrivilegeEscalation: false
+        capabilities:
+          drop: ["ALL"]
+      resources:
+        requests: { cpu: 500m, memory: 384Mi }
+        limits: { memory: 2Gi }
+  volumes:
+    - { name: pgdata, emptyDir: {} }
+    - { name: mongodata, emptyDir: {} }

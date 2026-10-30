@@ -11,6 +11,8 @@ WT=${2:-$(dirname "$RV")/${WT_PREFIX:?set WT_PREFIX}$N}
 export GH_TOKEN="$(gh auth token -h github.com -u "$REVIEWER")" || { echo "INTAKE: ABORT no token"; exit 2; }
 J=$(gh api "repos/$REPO/pulls/$N" --jq '"\(.state) \(.merged) \(.merged_at) \(.user.login) \(.head.sha) \(.base.ref)"') || { echo "INTAKE: ABORT GET failed"; exit 2; }
 read -r STATE MERGED MERGED_AT AUTHOR HEAD BASE <<<"$J"
+# The head this review starts from: check_head.sh stops later steps once GitHub has another one.
+[ -z "${WORK:-}" ] || { mkdir -p "$WORK" && printf '%s\n' "$HEAD" > "$WORK/head.sha"; }
 DEV=$(gh api repos/$REPO/branches/develop --jq .commit.sha) || exit 2
 rc=0
 check() { if [ "$2" = ok ]; then echo "INTAKE: PASS   $1"; else echo "INTAKE: FAIL   $1"; rc=1; fi; }

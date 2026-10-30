@@ -352,7 +352,7 @@ elif 'issues/9' in a[1]:
     print('type/feature')
 """
 
-    def run_gate(self, base, body, parent_ref):
+    def run_gate(self, base, body, parent_ref, work=None):
         with tempfile.TemporaryDirectory() as tmp:
             tmp = pathlib.Path(tmp)
             repo = tmp / 'repo'
@@ -370,9 +370,16 @@ elif 'issues/9' in a[1]:
             handbook = tmp / 'handbook.md'
             handbook.write_text('x')
             env = {'PATH': f'{bin_dir}:/usr/bin:/bin', 'RV': str(repo), 'HANDBOOK': str(handbook), 'REVIEWER': 'r', 'REPO': 'o/r',
-                   'WT_PREFIX': 'wt-', 'FAKE_HEAD': head, 'FAKE_BASE': base, 'FAKE_BODY': body, 'FAKE_PARENT_REF': parent_ref}
+                   'WT_PREFIX': 'wt-', 'FAKE_HEAD': head, 'FAKE_BASE': base, 'FAKE_BODY': body, 'FAKE_PARENT_REF': parent_ref,
+                   **({'WORK': str(work)} if work else {})}
             done = subprocess.run(['/bin/bash', str(HERE / 'gate_intake.sh'), '9', str(repo)], capture_output=True, text=True, env=env)
         return done.returncode, done.stdout
+
+    def test_the_head_it_saw_is_recorded_for_the_later_steps(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            work = pathlib.Path(tmp) / 'gates'
+            self.run_gate('develop', '', '', work)
+            self.assertRegex((work / 'head.sha').read_text(), r'^[0-9a-f]{40}\n$')
 
     def test_develop_passes(self):
         code, out = self.run_gate('develop', '## PR Dependencies\n- None\n', '')
@@ -398,6 +405,60 @@ elif 'issues/9' in a[1]:
     def test_a_pr_mentioned_after_the_dependencies_section_does_not_count(self):
         code, out = self.run_gate('feat/parent', '## PR Dependencies\n- None\n\n## Description\nfollows #5', 'feat/parent')
         self.assertIn('FAIL   base=feat/parent', out)
+
+
+class HeadMoved(unittest.TestCase):
+    """The author pushes while a runner works: later steps stop instead of judging a head nobody reviewed."""
+
+    FAKE_GH = """#!/bin/sh
+case "$1" in
+  auth) echo token ;;
+  api) [ -z "$FAKE_GH_DOWN" ] || exit 1; echo "$FAKE_HEAD" ;;
+esac
+"""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.rv = self.tmp.name
+        bin_dir = pathlib.Path(self.rv, 'bin')
+        bin_dir.mkdir()
+        (bin_dir / 'gh').write_text(self.FAKE_GH)
+        (bin_dir / 'gh').chmod(0o755)
+        self.work = gates(self.rv, '9')
+        self.work.mkdir(parents=True)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def run_step(self, action, step_no, now_head, down=False):
+        env = {'RV': self.rv, 'PATH': f'{self.rv}/bin:/usr/bin:/bin', 'REPO': 'o/r', 'REVIEWER': 'r', 'FAKE_HEAD': now_head,
+               'PYTHONDONTWRITEBYTECODE': '1', **({'FAKE_GH_DOWN': '1'} if down else {})}
+        return subprocess.run([sys.executable, '-I', str(HERE / 'pipeline_step.py'), action, '9', step_no], env=env, capture_output=True, text=True)
+
+    def test_a_step_after_00_stops_when_github_has_a_newer_head(self):
+        (self.work / 'head.sha').write_text('a' * 40 + '\n')
+        done = self.run_step('start', '01', 'b' * 40)
+        self.assertEqual(done.returncode, 5)
+        self.assertIn('HEAD_MOVED', done.stderr)
+        self.assertIn('aaaaaaaaaa', done.stderr)
+        self.assertEqual(json.loads((self.work / 'events.jsonl').read_text().splitlines()[-1])['state'], 'note')
+
+    def test_done_stops_too_so_a_gate_does_not_pass_on_the_old_head(self):
+        (self.work / 'head.sha').write_text('a' * 40 + '\n')
+        self.assertEqual(self.run_step('done', '03', 'b' * 40).returncode, 5)
+
+    def test_the_same_head_lets_the_step_run(self):
+        (self.work / 'head.sha').write_text('a' * 40 + '\n')
+        self.assertEqual(self.run_step('start', '01', 'a' * 40).returncode, 0)
+
+    def test_step_00_is_how_a_review_takes_the_new_head_so_it_is_never_stopped(self):
+        (self.work / 'head.sha').write_text('a' * 40 + '\n')
+        self.assertEqual(self.run_step('start', '00', 'b' * 40).returncode, 0)
+
+    def test_no_recorded_head_or_a_github_that_does_not_answer_does_not_stop_the_review(self):
+        self.assertEqual(self.run_step('start', '01', 'b' * 40).returncode, 0)
+        (self.work / 'head.sha').write_text('a' * 40 + '\n')
+        self.assertEqual(self.run_step('start', '01', 'b' * 40, down=True).returncode, 0)
 
 
 class ValueOrigin(unittest.TestCase):

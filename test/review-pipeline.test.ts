@@ -17,7 +17,7 @@ work.mkdir(exist_ok=True)
 log = work / "calls.txt"
 with open(log, "a") as f:
     f.write(" ".join(sys.argv[1:]) + "\\n")
-(work / "policy.txt").write_text(" ".join(os.environ.get(k, "-") for k in ("WT_PREFIX", "GATES", "IMPACT_SECTIONS", "DRAFT_CHECK", "AUTHOR_PATTERN")) + "\\n")
+(work / "policy.txt").write_text(" ".join(os.environ.get(k, "-") for k in ("WT_PREFIX", "GATES", "IMPACT_SECTIONS", "DRAFT_CHECK", "AUTHOR_PATTERN", "K3S_SSH")) + "\\n")
 (work / "env.txt").write_text(" ".join(os.environ.get(k, "-") for k in ("REPO", "RV", "HANDBOOK", "REVIEWER", "RULES")) + "\\n")
 if cmd == "begin":
     if "STUB_REFUSE" in os.environ:
@@ -273,7 +273,7 @@ test("readPolicy merges pipeline.json with the project over global, and rejects 
   writeFileSync(join(f.globalRules, "pipeline.json"), JSON.stringify({ worktreePrefix: "g-", impactSections: 8, gates: ["00", "06"] }));
   writeFileSync(join(projectRulesDir(f.root), "pipeline.json"), JSON.stringify({ worktreePrefix: "p-", draftCheck: "check.py", authorPattern: "^(a|b)-" }));
   assert.deepEqual(readPolicy(ruleRoots(f.root)), { worktreePrefix: "p-", impactSections: 8, gates: ["00", "06"], draftCheck: "check.py", authorPattern: "^(a|b)-" });
-  for (const bad of [{ gate: ["00"] }, { gates: ["99"] }, { impactSections: 0 }, { draftCheck: "../x.py" }, { worktreePrefix: 3 }, { authorPattern: "" }, { authorPattern: "(" }, { authorPattern: 5 }]) {
+  for (const bad of [{ gate: ["00"] }, { gates: ["99"] }, { impactSections: 0 }, { draftCheck: "../x.py" }, { worktreePrefix: 3 }, { authorPattern: "" }, { authorPattern: "(" }, { authorPattern: 5 }, { k3sHost: "k3s" }, { k3sHost: "root@k3s; rm -rf /" }, { k3sHost: 3 }]) {
     writeFileSync(join(projectRulesDir(f.root), "pipeline.json"), JSON.stringify(bad));
     assert.throws(() => readPolicy(ruleRoots(f.root)), /lạ hoặc giá trị sai kiểu/);
   }
@@ -285,11 +285,11 @@ test("/review-pr exports the policy to the pipeline, always keeps intake, and de
   const f = repo("https://github.com/swaglive/swag-op-console-server.git");
   const { commands, ctx, handlers } = setup();
   await commands["review-pr"]("https://github.com/swaglive/swag-op-console-server/pull/1076", ctx(f.root));
-  assert.equal(readFileSync(join(f.work, "policy.txt"), "utf8"), "swag-op-console-server-pr- - - - -\n");
+  assert.equal(readFileSync(join(f.work, "policy.txt"), "utf8"), "swag-op-console-server-pr- - - - - -\n");
   handlers.session_shutdown();
-  writeFileSync(join(projectRulesDir(f.root), "pipeline.json"), JSON.stringify({ worktreePrefix: "swag-op-pr-", gates: ["02", "06"], impactSections: 9, draftCheck: "check_draft_opc.py", authorPattern: "^acme-" }));
+  writeFileSync(join(projectRulesDir(f.root), "pipeline.json"), JSON.stringify({ worktreePrefix: "swag-op-pr-", gates: ["02", "06"], impactSections: 9, draftCheck: "check_draft_opc.py", authorPattern: "^acme-", k3sHost: "root@k3s.example.ts.net" }));
   await commands["review-pr"]("https://github.com/swaglive/swag-op-console-server/pull/1076", ctx(f.root));
-  assert.equal(readFileSync(join(f.work, "policy.txt"), "utf8"), "swag-op-pr- 00 02 06 9 check_draft_opc.py ^acme-\n");
+  assert.equal(readFileSync(join(f.work, "policy.txt"), "utf8"), "swag-op-pr- 00 02 06 9 check_draft_opc.py ^acme- root@k3s.example.ts.net\n");
   handlers.session_shutdown();
 });
 
@@ -948,7 +948,12 @@ function testRunner() {
   writeFileSync(join(f.root, "compose.yaml"), "services: {}\n");
   const bin = mkdtempSync(join(tmpdir(), "fake-docker-"));
   const log = join(bin, "log.txt");
-  writeFileSync(join(bin, "docker"), `#!/bin/sh\necho "start $$" >> ${log}\necho "argv $*" >> ${join(bin, "argv.txt")}\nsleep 1\necho "end $$" >> ${log}\necho "1 passed"\n`, { mode: 0o755 });
+  // `docker rm -f <name>` kills a hung fake run the way it would remove the real container; FAKE_HANG makes the run hang until then.
+  writeFileSync(
+    join(bin, "docker"),
+    `#!/bin/sh\nif [ "$1" = rm ]; then echo "rm $*" >> ${join(bin, "argv.txt")}; [ ! -f ${join(bin, "pid")} ] || kill $(cat ${join(bin, "pid")}) 2>/dev/null; exit 0; fi\necho "start $$" >> ${log}\necho "argv $*" >> ${join(bin, "argv.txt")}\nif [ -n "$FAKE_HANG" ]; then echo $$ > ${join(bin, "pid")}; exec sleep 30; fi\nsleep 1\necho "end $$" >> ${log}\necho "1 passed"\n`,
+    { mode: 0o755 },
+  );
   const wt = mkdtempSync(join(tmpdir(), "wt-"));
   const script = join(f.root, "reports", "reviews", "tools", "run_pr_tests.sh");
   const lock = join(f.root, "reports", "reviews", ".tests.lock");
@@ -1050,6 +1055,32 @@ test("run_pr_tests.sh gives up with a clear message when a real test run holds t
   } finally {
     holder.kill();
   }
+});
+
+test("run_pr_tests.sh does not count the time spent waiting for the lock against the run", async () => {
+  const { run, lock, log } = testRunner();
+  const holder = spawn("sh", ["-c", "sleep 3; true # run_pr_tests.sh"]);
+  try {
+    symlinkSync(String(holder.pid), lock);
+    const result = await run({ TESTS_RUN_TIMEOUT: "2" });
+    assert.equal(result.code, 0);
+    assert.match(result.stderr, /đợi lượt chạy test/);
+    assert.equal(readFileSync(log, "utf8").trim().split("\n").length, 2);
+  } finally {
+    holder.kill();
+  }
+});
+
+test("run_pr_tests.sh kills a run that hangs once it has the lock, removes its container and frees the lock", async () => {
+  const { run, lock, argv } = testRunner();
+  const started = Date.now();
+  const result = await run({ TESTS_RUN_TIMEOUT: "2", FAKE_HANG: "1" });
+  assert.equal(result.code, 124);
+  assert.match(result.stderr, /test chạy quá 2s .*dừng container rvtest-\d+/);
+  assert.ok(Date.now() - started < 15_000);
+  assert.match(readFileSync(argv, "utf8"), /run --rm -T --name rvtest-\d+ /);
+  assert.match(readFileSync(argv, "utf8"), /rm -f rvtest-\d+/);
+  assert.equal(existsSync(lock), false);
 });
 
 test("/review-pr refuses a PR number that is open for another checkout in the same session, and allows it once that review ended", async () => {
@@ -1205,4 +1236,214 @@ test("/review-board shows a counting status while it loads and clears it on succ
   delete process.env.REVIEW_BOARD_TIMEOUT_MS;
   assert.ok(statuses.some((s) => /1s$/.test(s ?? "")), "the status ticks while waiting");
   assert.equal(statuses.at(-1), undefined);
+});
+
+// The k3s driver against a fake ssh that plays the node: it answers kubectl calls from a list of pod states and records every call.
+const FAKE_NODE = `#!/bin/sh
+for a; do cmd="$a"; done
+[ "$cmd" = exit ] && exit 0
+echo "$cmd" >> "$NODE_DIR/calls.txt"
+case "$cmd" in
+  *range*) echo "mongo" ;;
+  *"get pod"*)
+    n=$(( $(cat "$NODE_DIR/n" 2>/dev/null || echo 0) + 1 )); echo $n > "$NODE_DIR/n"
+    line=$(sed -n "\${n}p" "$NODE_DIR/states"); [ -n "$line" ] || line=$(tail -1 "$NODE_DIR/states"); echo "$line" ;;
+  *"create -f -"*) cat > "$NODE_DIR/pod.yaml" ;;
+  *"tar -x"*) cat > "$NODE_DIR/shipped.tar" ;;
+  *"bash -s"*) cat > "$NODE_DIR/sweep.sh" ;;
+  *"logs"*) echo "mongod: illegal instruction" ;;
+  *"sh -s"*)
+    script=$(cat)
+    case "$script" in
+      "# Runs in the runner container"*) [ -z "$FAKE_SETUP_FAIL" ] || { echo "alembic: boom"; exit 1; }; [ -z "$FAKE_SETUP_HANG" ] || sleep 30 ;;
+      *) printf '%s\\n' "$script" > "$NODE_DIR/run.sh"; [ -z "$FAKE_HANG" ] || exec sleep 30; sleep "\${FAKE_RUN_SECONDS:-0}"; echo "5 passed"; exit "\${FAKE_RUN_RC:-0}" ;;
+    esac ;;
+esac
+exit 0
+`;
+
+function k3sNode(states: string[]) {
+  const dir = mkdtempSync(join(tmpdir(), "fake-node-"));
+  writeFileSync(join(dir, "ssh"), FAKE_NODE, { mode: 0o755 });
+  writeFileSync(join(dir, "states"), states.join("\n") + "\n");
+  const wt = mkdtempSync(join(tmpdir(), "wt-"));
+  writeFileSync(join(wt, "marker.txt"), "pr head");
+  const engine = join(dirname(new URL(import.meta.url).pathname), "..", "review-pipeline");
+  const run = (extraEnv: Record<string, string> = {}, pr = "19372", command = "echo hi") =>
+    new Promise<{ code: number | null; stdout: string; stderr: string }>((resolve) => {
+      const child = spawn("bash", [join(engine, "k3s", "rv_k3s.sh"), "run", "swag-server", pr, wt, command], {
+        env: { PATH: `${dir}:${process.env.PATH}`, HOME: process.env.HOME, TMPDIR: dir, NODE_DIR: dir, K3S_SSH: "root@node", REPO: "o/swag-server", RV_POLL: "1", ...extraEnv },
+      });
+      let stdout = "";
+      let stderr = "";
+      child.stdout.on("data", (d) => (stdout += d));
+      child.stderr.on("data", (d) => (stderr += d));
+      child.on("close", (code) => resolve({ code, stdout, stderr }));
+    });
+  const calls = () => (existsSync(join(dir, "calls.txt")) ? readFileSync(join(dir, "calls.txt"), "utf8") : "");
+  return { dir, run, calls, engine, wt };
+}
+
+const READY = "Running True W: T:";
+const PENDING = "Pending False W:ContainerCreating T:";
+
+test("rv_k3s.sh creates one pod for the run, ships the worktree, sets up, runs, and deletes the pod", async () => {
+  const node = k3sNode([PENDING, READY]);
+  const result = await node.run({}, "19372", "python -m pytest tests/x.py");
+  assert.equal(result.code, 0, result.stderr);
+  assert.match(result.stdout, /5 passed/);
+  const yaml = readFileSync(join(node.dir, "pod.yaml"), "utf8");
+  assert.match(yaml, /name: rv-swag-server-19372-[a-z0-9]{6}\n/);
+  assert.match(yaml, /rv\/pr: "19372"/);
+  assert.match(yaml, /activeDeadlineSeconds: 5400/);
+  assert.doesNotMatch(yaml, /__[A-Z_]+__/);
+  assert.match(yaml, /automountServiceAccountToken: false/);
+  assert.match(readFileSync(join(node.dir, "run.sh"), "utf8"), /^\[ ! -f \/tmp\/rv\.env \] \|\| \. \/tmp\/rv\.env\ncd \/usr\/src\/app\nexec 2>&1\npython -m pytest tests\/x\.py\n$/);
+  const calls = node.calls();
+  assert.match(calls, /ctr images ls -q \| grep -qx docker\.io\/library\/rv-swag-server:dev \|\| \{ docker image inspect rv-swag-server:dev/);
+  assert.ok(calls.indexOf("ctr images ls") < calls.indexOf("create -f -"), "the image is back in k3s before the pod needs it");
+  assert.match(calls, /kubectl -n review-env create -f -/);
+  assert.match(calls, /exec -i rv-swag-server-19372-\S+ -c runner -- tar -x -o -C \/usr\/src\/app/);
+  assert.match(calls, /kubectl -n review-env delete pod rv-swag-server-19372-\S+ --wait=false/);
+  assert.ok(calls.indexOf("tar -x") < calls.indexOf("-- sh -s"), "the code goes up before anything runs");
+  assert.match(execFileSync("tar", ["-tf", join(node.dir, "shipped.tar")], { encoding: "utf8" }), /marker\.txt/);
+});
+
+test("rv_k3s.sh does not count the time in the queue against the run", async () => {
+  const node = k3sNode([PENDING, PENDING, PENDING, PENDING, PENDING, READY]);
+  const result = await node.run({ RV_RUN_TIMEOUT: "3", FAKE_RUN_SECONDS: "1" });
+  assert.equal(result.code, 0, result.stderr);
+  assert.match(result.stderr, /pod sẵn sàng sau [4-9]s/);
+  assert.match(result.stdout, /5 passed/);
+});
+
+test("rv_k3s.sh stops a run that hangs after the run limit, with exit 124, and still deletes the pod", async () => {
+  const node = k3sNode([READY]);
+  const started = Date.now();
+  const result = await node.run({ RV_RUN_TIMEOUT: "2", FAKE_HANG: "1" });
+  assert.equal(result.code, 124);
+  assert.match(result.stderr, /test chạy quá 2s/);
+  assert.ok(Date.now() - started < 15_000);
+  assert.match(node.calls(), /delete pod rv-swag-server-19372-/);
+});
+
+test("rv_k3s.sh gives the setup its own limit, and reports a setup that fails instead of running the tests on a broken pod", async () => {
+  const hang = await k3sNode([READY]).run({ RV_SETUP_TIMEOUT: "2", FAKE_SETUP_HANG: "1" });
+  assert.equal(hang.code, 124);
+  assert.match(hang.stderr, /dựng môi trường quá 2s/);
+  const node = k3sNode([READY]);
+  const failed = await node.run({ FAKE_SETUP_FAIL: "1" });
+  assert.equal(failed.code, 125);
+  assert.match(failed.stderr, /alembic: boom/);
+  assert.equal(existsSync(join(node.dir, "run.sh")), false);
+  assert.match(node.calls(), /delete pod/);
+});
+
+test("rv_k3s.sh reports a container that died while the pod was starting, with its log, instead of waiting for a pod that cannot become ready", async () => {
+  const node = k3sNode(["Running False W: T:Error"]);
+  const result = await node.run({ RV_QUEUE_WAIT: "5" });
+  assert.equal(result.code, 125);
+  assert.match(result.stderr, /một container của pod .* đã dừng/);
+  assert.match(result.stderr, /illegal instruction/);
+});
+
+test("rv_k3s.sh gives up waiting for room on the node after RV_QUEUE_WAIT, and says the wait is not part of the run limit", async () => {
+  const node = k3sNode([PENDING]);
+  const result = await node.run({ RV_QUEUE_WAIT: "3" });
+  assert.equal(result.code, 125);
+  assert.match(result.stderr, /đợi quá 3s mà node vẫn chưa có chỗ/);
+  assert.match(node.calls(), /delete pod/);
+});
+
+test("rv_k3s.sh sweeps old pods by age on the node, and leaves the finished pods of a review that is still running alone", async () => {
+  const node = k3sNode([READY]);
+  await node.run();
+  const sweep = readFileSync(join(node.dir, "sweep.sh"), "utf8");
+  assert.doesNotMatch(node.calls(), /--field-selector/);
+  // finished pods wait an hour; anything else (a Pending pod whose creator died) waits for the deadline, the longest queue and 5 minutes
+  assert.match(sweep, /Failed\|Succeeded\) \[ "\$age" -gt 3600 \]/);
+  assert.match(sweep, /-gt 6900 \]/);
+  // run for real against a fake kubectl: only the old pods go (a Running pod past the deadline is stuck by definition)
+  const fake = mkdtempSync(join(tmpdir(), "fake-kubectl-"));
+  const old = new Date(Date.now() - 7200_000).toISOString().replace(/\.\d+Z$/, "Z");
+  const fresh = new Date(Date.now() - 60_000).toISOString().replace(/\.\d+Z$/, "Z");
+  writeFileSync(
+    join(fake, "kubectl"),
+    `#!/bin/sh\ncase "$*" in\n  *"get pods"*) printf 'old-failed ${old} Failed\\nfresh-failed ${fresh} Failed\\nold-running ${old} Running\\nfresh-pending ${fresh} Pending\\n' ;;\n  *delete*) echo "$*" >> ${join(fake, "deleted.txt")} ;;\nesac\n`,
+    { mode: 0o755 },
+  );
+  writeFileSync(join(fake, "date"), `#!/bin/sh\nif [ "$1" = "-d" ]; then exec python3 -c 'import sys,datetime;print(int(datetime.datetime.fromisoformat(sys.argv[1].replace("Z","+00:00")).timestamp()))' "$2"; fi\nexec /bin/date "$@"\n`, { mode: 0o755 });
+  spawnSync("bash", ["-s"], { input: sweep, env: { PATH: `${fake}:${process.env.PATH}` } });
+  assert.deepEqual(readFileSync(join(fake, "deleted.txt"), "utf8").trim().split("\n").map((l) => l.match(/pod (\S+)/)![1]), ["old-failed", "old-running"]);
+});
+
+test("rv_k3s.sh refuses a PR that is not a number before it uses it anywhere", async () => {
+  const node = k3sNode([READY]);
+  const result = await node.run({}, "1|touch /tmp/pwned");
+  assert.equal(result.code, 125);
+  assert.match(result.stderr, /PR phải là số/);
+  assert.equal(node.calls(), "");
+});
+
+test("rv_k3s.sh refuses to start without the node's address, before it touches anything", async () => {
+  const node = k3sNode([READY]);
+  const result = await node.run({ K3S_SSH: "" });
+  assert.equal(result.code, 125);
+  assert.match(result.stderr, /K3S_SSH trống/);
+  assert.equal(node.calls(), "");
+});
+
+test("rv_k3s.sh stops with exit 123 before it creates a pod when the PR head already moved, and while it waits in the queue", async () => {
+  const rv = mkdtempSync(join(tmpdir(), "rv-head-"));
+  const work = join(rv, "reports", "reviews", "evidence", "19372", "gates");
+  mkdirSync(work, { recursive: true });
+  writeFileSync(join(work, "head.sha"), `${"a".repeat(40)}\n`);
+  const node = k3sNode([READY]);
+  writeFileSync(join(node.dir, "gh"), `#!/bin/sh\ncase "$1" in auth) echo token ;; api) echo ${"b".repeat(40)} ;; esac\n`, { mode: 0o755 });
+  const result = await node.run({ RV: rv, REVIEWER: "me" });
+  assert.equal(result.code, 123);
+  assert.match(result.stderr, /HEAD_MOVED/);
+  assert.equal(node.calls(), "");
+  const queued = k3sNode([PENDING]);
+  writeFileSync(join(queued.dir, "gh"), `#!/bin/sh\ncase "$1" in auth) echo token ;; api) echo "$(cat ${join(queued.dir, "head")})" ;; esac\n`, { mode: 0o755 });
+  writeFileSync(join(queued.dir, "head"), "a".repeat(40));
+  const slow = queued.run({ RV: rv, REVIEWER: "me", RV_QUEUE_WAIT: "200", RV_HEAD_CHECK: "2" });
+  await new Promise((resolve) => setTimeout(resolve, 2500));
+  writeFileSync(join(queued.dir, "head"), "b".repeat(40));
+  const moved = await slow;
+  assert.equal(moved.code, 123);
+  assert.match(queued.calls(), /delete pod/);
+});
+
+test("run_pr_tests.sh with a k3s host runs on the node, filters the pod's output like the local run, and passes the infrastructure exit codes on", async () => {
+  const node = k3sNode([READY]);
+  const f = repo();
+  process.env.REVIEW_PIPELINE_ENGINE = node.engine;
+  assert.equal(assembleTools(f.root, [], { REPO: "o/swag-server", RV: f.root, HANDBOOK: join(f.root, "AGENTS.local.md"), REVIEWER: "me", WT_PREFIX: "wt-", K3S_SSH: "root@node" }), undefined);
+  const script = join(f.root, "reports", "reviews", "tools", "run_pr_tests.sh");
+  const wt = join(mkdtempSync(join(tmpdir(), "wts-")), "swag-pr-19372");
+  mkdirSync(wt, { recursive: true });
+  writeFileSync(join(wt, "marker.txt"), "pr head");
+  const go = (extraEnv: Record<string, string> = {}) =>
+    new Promise<{ code: number | null; stdout: string; stderr: string }>((resolve) => {
+      const child = spawn("sh", [script, wt, "tests/x.py", "; echo R0::pytest_rc=$?"], {
+        cwd: f.root,
+        env: { PATH: `${node.dir}:${process.env.PATH}`, HOME: process.env.HOME, NODE_DIR: node.dir, RV_POLL: "1", ...extraEnv },
+      });
+      let stdout = "";
+      let stderr = "";
+      child.stdout.on("data", (d) => (stdout += d));
+      child.stderr.on("data", (d) => (stderr += d));
+      child.on("close", (code) => resolve({ code, stdout, stderr }));
+    });
+  const ok = await go();
+  assert.equal(ok.code, 0, ok.stderr);
+  assert.equal(ok.stdout.trim(), "5 passed");
+  assert.match(readFileSync(join(node.dir, "run.sh"), "utf8"), /python -m pytest -q -s -p no:cacheprovider -rfE tests\/x\.py ; echo R0::pytest_rc=\$\?\n$/);
+  assert.equal(existsSync(join(f.root, "reports", "reviews", ".tests.lock")), false);
+  const hung = await go({ RV_RUN_TIMEOUT: "2", FAKE_HANG: "1" });
+  assert.equal(hung.code, 124);
+  assert.match(hung.stderr, /test chạy quá 2s/);
+  const local = await go({ REVIEW_ENV: "local" });
+  assert.match(local.stderr, /no compose\.yaml/);
 });

@@ -1,0 +1,55 @@
+# One op-console test run. PRIVILEGED: the dind container is root-equivalent on the node, and the PR's code can talk to it, so this profile
+# trusts the PR's author as much as running their code on the node would. The network policy keeps the pod off the cluster and the tailnet.
+# The words between double underscores are filled in by rv_k3s.sh.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: __POD__
+  labels:
+    app: review-env
+    rv/repo: __REPO__
+    rv/pr: "__PR__"
+    rv/net: internet
+spec:
+  priorityClassName: review-env
+  automountServiceAccountToken: false
+  enableServiceLinks: false
+  restartPolicy: Never
+  terminationGracePeriodSeconds: 1
+  activeDeadlineSeconds: __DEADLINE__
+  containers:
+    - name: dind
+      image: docker:27.3-dind
+      env:
+        - { name: DOCKER_TLS_CERTDIR, value: "" }
+      securityContext:
+        privileged: true
+      volumeMounts:
+        - { name: dockerdata, mountPath: /var/lib/docker }
+      resources:
+        requests: { cpu: 200m, memory: 256Mi }
+        limits: { memory: 3Gi }
+    - name: runner
+      image: __IMAGE__
+      imagePullPolicy: Never
+      command: ["sleep", "infinity"]
+      workingDir: /work
+      env:
+        - { name: HOME, value: /tmp }
+        - { name: DOCKER_HOST, value: "tcp://127.0.0.1:2375" }
+        - { name: TESTCONTAINERS_HOST_OVERRIDE, value: "127.0.0.1" }
+        - { name: TESTCONTAINERS_RYUK_DISABLED, value: "true" }
+        - { name: JWT_ACCESS_TOKEN_EXPIRE_MINUTES, value: "15" }
+        - { name: JWT_REFRESH_TOKEN_EXPIRE_DAYS, value: "7" }
+      securityContext:
+        allowPrivilegeEscalation: false
+        capabilities:
+          drop: ["ALL"]
+      volumeMounts:
+        - { name: work, mountPath: /work }
+      resources:
+        requests: { cpu: 500m, memory: 384Mi }
+        limits: { memory: 2Gi }
+  volumes:
+    - { name: dockerdata, emptyDir: {} }
+    - { name: work, emptyDir: {} }

@@ -169,8 +169,26 @@ def check_step(step):
         sys.exit(f'ABORT: bước {step!r} không có, dùng một trong {" ".join(NAMES)}')
 
 
+HEAD_MOVED = 5
+
+
+def head_guard(pr, step, work):
+    """Stops a step that would run on an older head than the one GitHub has now; step 00 is how a review takes the new one."""
+    if step == '00':
+        return
+    try:
+        r = subprocess.run([str(HERE / 'check_head.sh'), pr], env=dict(os.environ, WORK=str(work)), capture_output=True, text=True, timeout=60)
+    except subprocess.TimeoutExpired:
+        return  # a gh that hangs says nothing about the head
+    if r.returncode == HEAD_MOVED:
+        emit(work, pr, step, 'note', r.stderr.strip())
+        print(r.stderr.strip(), file=sys.stderr)
+        sys.exit(HEAD_MOVED)
+
+
 def cmd_start(a):
     check_step(a.step)
+    head_guard(a.pr, a.step, work_dir(a.pr))
     emit(work_dir(a.pr), a.pr, a.step, 'start', a.msg)
     revive(a.pr, work_dir(a.pr))
     roots = rule_roots()
@@ -189,6 +207,7 @@ def cmd_note(a):
 def cmd_done(a):
     check_step(a.step)
     work = work_dir(a.pr)
+    head_guard(a.pr, a.step, work)
     revive(a.pr, work)
     enabled = os.environ.get('GATES', '').split()
     if enabled and a.step != '00' and GATES[a.step] not in enabled:

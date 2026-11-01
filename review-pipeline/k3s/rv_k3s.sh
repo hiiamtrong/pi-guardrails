@@ -5,7 +5,7 @@
 #   queue:  the pod waits (Pending) until the node has room for it. Waiting is free: RV_QUEUE_WAIT (default 1200 s) only caps how long we are willing to wait, so a slot is found well inside an agent tool call.
 #   setup:  starts databases, builds the schema. Capped by RV_SETUP_TIMEOUT (default 600 s).
 #   run:    <command> in the pod. RV_RUN_TIMEOUT (default 1500 s) starts only here, once the pod is ready and set up.
-#   kept:   the pod stays for the next run of the same PR (name rv-<profile>-<PR>-keep): a fresh pod cost 2 s to start, 1 s to ship the code and
+#   kept:   the pod stays for the next run of the same PR from this machine (name rv-<profile>-<PR>-<host>-keep): a fresh pod cost 2 s to start, 1 s to ship the code and
 #           5 s to build the databases on every run, and most runs of a review are under 5 s of tests. A run reuses it only while it is Running,
 #           has RV_RUN_TIMEOUT left before the node's deadline, and was set up with the same migration files (RV_SCHEMA_DIRS of the profile,
 #           hashed into the label rv/schema); otherwise the old pod goes and a new one is built. The databases keep what earlier runs left.
@@ -36,17 +36,18 @@ kc() { local line="kubectl -n $NS" a; for a in "$@"; do line+=" $(printf '%q' "$
 POD="rv-$PROFILE-$PR-$(LC_ALL=C tr -dc 'a-z0-9' < /dev/urandom | head -c 6)"
 KILLED=
 CREATED=
-KEEP=
 LOCK=
 REUSE=
 READY=
+# Kept pod and lock carry this machine's name: two machines reviewing the same PR must not share a pod, and the lock is local.
+HOST=$(hostname -s 2>/dev/null | tr 'A-Z' 'a-z' | tr -c 'a-z0-9\n' - | cut -c1-8)
 cleanup() {
   local rc=$?
   [ -z "${WATCH_PIDS:-}" ] || kill $WATCH_PIDS 2>/dev/null
   # A kept pod outlives the run only once it is set up and the run did not show it broken: a pod left behind before its setup
   # (the head moved while it queued) would be reused next time with empty databases.
-  if [ -n "$CREATED" ] && { [ -z "$KEEP" ] || [ -z "$READY" ] || [ "$rc" -eq 124 ] || [ "$rc" -eq 125 ]; }; then kc delete pod "$POD" --wait=false --grace-period=1 >/dev/null 2>&1; fi
-  [ -z "$LOCK" ] || rm -rf "$LOCK"
+  if [ -n "$CREATED" ] && { [ -z "$LOCK" ] || [ -z "$READY" ] || [ "$rc" -eq 124 ] || [ "$rc" -eq 125 ]; }; then kc delete pod "$POD" --wait=false --grace-period=1 >/dev/null 2>&1; fi
+  [ -z "$LOCK" ] || rm -f "$LOCK"
   "${SSH[@]}" -O exit >/dev/null 2>&1
   rm -rf "$CTL"
 }
@@ -76,13 +77,14 @@ head_moved() {
 }
 if head_moved; then cat "$CTL/head" >&2; RC=123; exit 123; fi
 
-# One kept pod per PR, one run in it at a time: the lock is a directory holding our pid, and a lock whose pid is gone is taken over.
+# One kept pod per PR, one run in it at a time: the lock is a link to our pid (ln -s is atomic, as in run_pr_tests.sh), and a lock
+# whose pid is gone is taken over. Two runs started in the same instant (develop and trial, step 03) must not both get the pod.
 if [ -z "${RV_FRESH_POD:-}" ] && [ "$PR" != 0 ]; then
-  LOCK="${TMPDIR:-/tmp}/rv-k3s-keep-$PROFILE-$PR"
+  LOCK="${TMPDIR:-/tmp}/rv-k3s-keep-$PROFILE-$PR-$HOST"
   for _ in 1 2; do
-    if mkdir "$LOCK" 2>/dev/null; then echo $$ > "$LOCK/pid"; break; fi
-    if kill -0 "$(cat "$LOCK/pid" 2>/dev/null)" 2>/dev/null; then LOCK=; break; fi
-    rm -rf "$LOCK"
+    if ln -s "$$" "$LOCK" 2>/dev/null; then break; fi
+    if kill -0 "$(readlink "$LOCK" 2>/dev/null)" 2>/dev/null; then LOCK=; break; fi
+    rm -f "$LOCK"
   done
 fi
 SCHEMA=-
@@ -91,16 +93,16 @@ if [ -n "${RV_SCHEMA_DIRS:-}" ]; then
   SCHEMA=$(cd "$WT" && find $RV_SCHEMA_DIRS -type f 2>/dev/null | LC_ALL=C sort | while read -r f; do cat "$f"; done | shasum -a 256 | cut -c1-12)
 fi
 if [ -n "$LOCK" ]; then
-  KEEP=1
-  POD="rv-$PROFILE-$PR-keep"
-  read -r phase ready created schema <<<"$(kc get pod "$POD" -o jsonpath='{.status.phase} {.status.conditions[?(@.type=="Ready")].status} {.metadata.creationTimestamp} {.metadata.labels.rv/schema}' 2>/dev/null)"
+  POD="rv-$PROFILE-$PR-$HOST-keep"
+  # A pod being deleted (the last run broke it) still reports Running and Ready for a second or two: deletionTimestamp tells.
+  read -r phase ready created schema going <<<"$(kc get pod "$POD" -o jsonpath='{.status.phase} {.status.conditions[?(@.type=="Ready")].status} {.metadata.creationTimestamp} {.metadata.labels.rv/schema} {.metadata.deletionTimestamp}' 2>/dev/null)"
   if [ -n "${phase:-}" ]; then
     born=$(date -u -j -f '%Y-%m-%dT%H:%M:%SZ' "$created" +%s 2>/dev/null || date -d "$created" +%s 2>/dev/null || echo 0)
     age=$(( $(date +%s) - born ))
-    if [ "$phase $ready" = "Running True" ] && [ "${schema:-}" = "$SCHEMA" ] && [ "$age" -lt $(( ${RV_POD_DEADLINE:-5400} - ${RV_RUN_TIMEOUT:-1500} - 120 )) ]; then
+    if [ "$phase $ready" = "Running True" ] && [ -z "${going:-}" ] && [ "${schema:-}" = "$SCHEMA" ] && [ "$age" -lt $(( ${RV_POD_DEADLINE:-5400} - ${RV_RUN_TIMEOUT:-1500} - 120 )) ]; then
       REUSE=1
     else
-      echo "k3s: pod $POD cũ ($phase ${ready:-}, ${age}s, schema ${schema:-?}), xoá để dựng lại" >&2
+      echo "k3s: pod $POD cũ ($phase ${ready:-}${going:+, đang xoá}, ${age}s, schema ${schema:-?}), xoá để dựng lại" >&2
       kc delete pod "$POD" --wait=true --grace-period=1 >/dev/null 2>&1
     fi
   fi

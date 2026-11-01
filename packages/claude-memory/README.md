@@ -17,7 +17,7 @@ Private file-based memory for Pi, modeled after Claude Code Auto Memory.
         └── skills/
 ```
 
-`MEMORY.md` is processed on every turn up to 200 lines or 25 KiB, but only an opaque type/hash topic manifest is injected. Model-authored titles, summaries, and topic bodies stay retrieval-only to avoid persistent system-prompt injection. Topic files have no 5,000-character total-memory cap and are loaded with `memory_search` / `memory_read` only when relevant.
+`MEMORY.md` is processed on every turn up to 200 lines or 25 KiB. The injected manifest lists each topic as `file: title`, where the title is taken from the index link, stripped of control/format characters, `<`, `>` and backticks, and cut to 80 characters. The prompt tells the model to treat titles as labels, never as instructions. Descriptions and topic bodies stay retrieval-only to limit persistent system-prompt injection. Topic files have no 5,000-character total-memory cap and are loaded with `memory_search` / `memory_read` only when relevant.
 
 Project identity uses the canonical Git root. Linked worktrees resolve through `.git` + `commondir` to the main repository, and `.project.json` prevents collisions between paths that encode to the same directory name. Non-Git directories use their canonical absolute path.
 
@@ -25,7 +25,7 @@ Project identity uses the canonical Git root. Linked worktrees resolve through `
 
 - `memory_add`: save global/user/failure or current-project memory and report same-type lexical near-duplicates (80% word overlap). Optionally set `refs` (project scope only) to project-relative files the memory depends on; each ref's SHA-256 is captured at save time.
 - `memory_merge`: after the agent reads both candidates and confirms semantic redundancy, replace the canonical topic with merged content and remove the redundant topic. Refs carry forward re-hashed unless replaced explicitly.
-- `memory_search`: search global and current-project topics; results flag `stale: true` when any ref's file no longer matches its stored hash.
+- `memory_search`: search global and current-project topics, ranked with BM25 over whole words (terms of 4+ characters also match word starts; `đ` folds to `d`); results flag `stale: true` when any ref's file no longer matches its stored hash.
 - `memory_read`: read one topic; appends a `[stale refs]` note when a ref's file has changed or gone missing.
 - `/memory status`: show paths and index limits.
 - `/memory check-refs`: scan the current project store and list every topic with at least one stale ref.

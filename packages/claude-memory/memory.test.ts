@@ -648,3 +648,17 @@ test("refuses a symlinked topic", () => {
   symlinkSync(outside, join(store.dir, "linked.md"));
   assert.throws(() => readTopic(store, "linked.md"), /regular file/);
 });
+
+test("search weighs rare whole words above common substrings", () => {
+  const store = globalStore(temp());
+  const wanted = addMemory(store, { content: "Export darktable edits to the preview folder.", type: "user" });
+  addMemory(store, { content: "Extra grade of integrated arguments, extra care, extra extra.", type: "reference" });
+  assert.equal(searchMemories([store], "ra darktable")[0].file, wanted.file);
+  assert.equal(searchMemories([store], "ra").length, 0);
+});
+
+test("search folds Vietnamese đ so unaccented queries match", () => {
+  const store = globalStore(temp());
+  const added = addMemory(store, { content: "Đường dẫn xuất ảnh nằm trong thư mục xem trước.", type: "user" });
+  assert.equal(searchMemories([store], "duong")[0].file, added.file);
+});

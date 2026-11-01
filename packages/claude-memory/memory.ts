@@ -682,10 +682,10 @@ function renderTopic(input: AddMemoryInput & {
 }
 
 export function searchMemories(stores: MemoryStore[], query: string, limit = 10): SearchResult[] {
-  const terms = normalizeSearch(query).split(" ").filter(Boolean);
+  const terms = [...new Set(normalizeSearch(query).split(" ").filter(Boolean))];
   if (!terms.length) return [];
-  type Candidate = SearchResult & { refs?: MemoryRef[]; store: MemoryStore };
-  const results: Candidate[] = [];
+  type Doc = { file: string; metadata: ReturnType<typeof topicMetadata>; refs?: MemoryRef[]; store: MemoryStore; text: string; tokens: string[] };
+  const docs: Doc[] = [];
   for (const store of stores) {
     let files: string[];
     try {
@@ -700,17 +700,29 @@ export function searchMemories(stores: MemoryStore[], query: string, limit = 10)
         if (!stat.isFile() || stat.isSymbolicLink()) continue;
         text = readRegularText(path, MAX_TOPIC_READ_BYTES);
       } catch { continue; }
-      const normalized = normalizeSearch(`${file} ${text}`);
-      const score = terms.reduce((sum, term) => sum + occurrences(normalized, term), 0);
-      if (!score) continue;
-      const metadata = topicMetadata(text);
-      results.push({
-        description: metadata.description || firstSentence(stripFrontmatter(text)), file,
-        refs: parseTopicMetadata(text).refs, scope: store.scope, score,
-        snippet: oneLine(stripFrontmatter(text), 300), store, type: metadata.type,
+      docs.push({
+        file, metadata: topicMetadata(text), refs: parseTopicMetadata(text).refs, store, text,
+        tokens: normalizeSearch(`${file} ${text}`).split(" "),
       });
     }
   }
+  // BM25: rare terms outweigh common ones, repeats saturate, long topics don't win by size alone.
+  const avgLength = docs.reduce((sum, doc) => sum + doc.tokens.length, 0) / (docs.length || 1);
+  const counts = docs.map((doc) => terms.map((term) => doc.tokens.filter((token) => tokenMatches(token, term)).length));
+  const idf = terms.map((_, i) => {
+    const containing = counts.filter((row) => row[i] > 0).length;
+    return Math.log(1 + (docs.length - containing + 0.5) / (containing + 0.5));
+  });
+  const results = docs.flatMap((doc, d) => {
+    const lengthNorm = BM25_K1 * (1 - BM25_B + BM25_B * (doc.tokens.length / avgLength));
+    const score = terms.reduce((sum, _, i) => sum + idf[i] * (counts[d][i] * (BM25_K1 + 1)) / (counts[d][i] + lengthNorm), 0);
+    if (!score) return [];
+    return [{
+      description: doc.metadata.description || firstSentence(stripFrontmatter(doc.text)), file: doc.file,
+      refs: doc.refs, scope: doc.store.scope, score: Math.round(score * 100) / 100,
+      snippet: oneLine(stripFrontmatter(doc.text), 300), store: doc.store, type: doc.metadata.type,
+    }];
+  });
   return results.sort((a, b) => b.score - a.score || a.file.localeCompare(b.file))
     .slice(0, Math.max(1, Math.min(limit, 20)))
     .map(({ refs, store, ...result }) => {
@@ -771,16 +783,14 @@ function shortHash(value: string): string {
 }
 function yamlString(value: string): string { return JSON.stringify(oneLine(value, 240)); }
 function escapeMarkdown(value: string): string { return value.replace(/[\[\]\\]/g, "\\$&"); }
-function normalizeSearch(value: string): string {
-  return value.normalize("NFKD").replace(/[\u0300-\u036f]/g, "").toLowerCase()
-    .replace(/[^a-z0-9]+/g, " ").trim();
+const BM25_K1 = 1.2;
+const BM25_B = 0.75;
+const PREFIX_MIN_TERM = 4;
+// Whole-word match; terms of 4+ chars also match word starts ("export" finds "exported"), shorter ones never match inside other words.
+function tokenMatches(token: string, term: string): boolean {
+  return token === term || (term.length >= PREFIX_MIN_TERM && token.startsWith(term));
 }
-function occurrences(value: string, term: string): number {
-  let count = 0;
-  let position = 0;
-  while ((position = value.indexOf(term, position)) >= 0) {
-    count++;
-    position += term.length;
-  }
-  return count;
+function normalizeSearch(value: string): string {
+  return value.normalize("NFKD").replace(/[\u0300-\u036f]/g, "").toLowerCase().replace(/đ/g, "d")
+    .replace(/[^a-z0-9]+/g, " ").trim();
 }

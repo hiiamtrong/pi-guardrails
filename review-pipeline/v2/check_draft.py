@@ -100,6 +100,39 @@ def check_points(body, event):
     say('FAIL' if bad else 'PASS', 'yes=>RC', f'Yes ở {yes or "không điểm nào"}, event {event}')
 
 
+# Same shape as the block build_payload.py turns into an inline comment; a heading that does not match is dropped without a word.
+INLINE_BLOCK = re.compile(
+    r'^### \d+\. `([^`]+)` L(\d+)(?:-L(\d+))? \((?:RIGHT|LEFT)\)\s*\n\n'
+    r'\*\*Comment \(EN, sẽ post\):\*\*\n\n(.*?)\n\n\*\*Vì sao', re.S | re.M)
+CODE_LINE = re.compile(r'`[\w./-]+\.(?:py|go|ts|js|sql|sh|ya?ml):\d+(?:-\d+)?`')
+
+
+def check_inline(text, body, event=None):
+    """A finding tied to a line goes in an inline comment the author can apply with a click, not only in the body (#19323: a type-hint
+    finding on four lines sat in the body of four reviews with no inline comment)."""
+    marked = len(re.findall(r'(?m)^\*\*Comment \(EN, sẽ post\):\*\*', text))
+    blocks = INLINE_BLOCK.findall(text)
+    if marked != len(blocks):
+        say('FAIL', 'inline-form', f'{marked} khối "Comment (EN, sẽ post)" nhưng build_payload chỉ đọc được {len(blocks)}: heading phải là "### N. `path` L12 (RIGHT)" rồi dòng trống, "**Comment (EN, sẽ post):**", "**Vì sao"')
+    if blocks:
+        say('PASS', 'inline', f'{len(blocks)} inline comment trong {len({b[0] for b in blocks})} file')
+        return
+    yes = [i for i, label in enumerate(POINTS[:6], 1) if re.search(rf'(?m)^{i}\. {re.escape(label)}: Yes\b', body)]
+    cited = CODE_LINE.findall(body)
+    if yes or cited or event == 'REQUEST_CHANGES':
+        why = []
+        if yes:
+            why.append(f'điểm {yes} trả lời Yes')
+        if cited:
+            why.append(f'body trỏ {cited[0]}')
+        if event == 'REQUEST_CHANGES':
+            why.append('event REQUEST_CHANGES')
+        why = ', '.join(why)
+        say('MANUAL', 'inline', f'không có inline comment mà {why}: finding gắn dòng nên là inline kèm `suggestion` (AGENTS.local.md:197, :426); bỏ qua nếu là finding cấp PR (mô tả, nhãn, stack)')
+    else:
+        say('PASS', 'inline', 'không có finding nào cần gắn dòng')
+
+
 def check_risk(text, event, override):
     risk = re.search(r'(?m)^- \*\*Rủi ro chưa kiểm:\*\*[ \t]*(.*)$', text)
     txt = risk.group(1).strip() if risk else ''
@@ -110,6 +143,11 @@ def check_risk(text, event, override):
     unchecked = re.findall(r'(?m)^\|[^|\n]*\|[^|\n]*\|[^|\n]*\|\s*\**chưa kiểm', section(text, 'Comment đã có') or '')
     bad = unchecked and event == 'APPROVE' and not override
     say('FAIL' if bad else 'PASS', 'unchecked', f'{len(unchecked)} comment "chưa kiểm", event {event}')
+
+
+def source_def(name):
+    """git grep -P pattern for the definition of `name`: a Python def, a Go func or a Go method."""
+    return rf'(?:def |func (?:\([^)]*\) )?){name}\('
 
 
 def check_deletes(text, body, deletes, wt, root, event, override):
@@ -130,9 +168,9 @@ def check_deletes(text, body, deletes, wt, root, event, override):
             say('FAIL', 'data-row', f'dòng {r[0]!r} thiếu cột (cần 8)')
             continue
         fn = re.search(r'`(\w+)`', r[4])
-        found = fn and subprocess.run(['git', '-C', wt, 'grep', '-q', '-P', rf'def {fn.group(1)}\(', 'HEAD'],
+        found = fn and subprocess.run(['git', '-C', wt, 'grep', '-q', '-P', source_def(fn.group(1)), 'HEAD'],
                                       capture_output=True).returncode == 0
-        say('PASS' if found else 'FAIL', 'data-source', f'lệnh xoá ở nguồn {r[4]!r}: {"có def" if found else "không tìm thấy def"}')
+        say('PASS' if found else 'FAIL', 'data-source', f'lệnh xoá ở nguồn {r[4]!r}: {"có def" if found else "không tìm thấy def hay func"}')
         # Comparing with develop let #19233 pass: develop deleted even more. Only the source of truth can accept a loss.
         unsure = not r[5] or re.match(r'(?i)(chưa kiểm|không\b|\?)', r[5])
         bad = unsure and event == 'APPROVE' and not override
@@ -186,6 +224,7 @@ def main():
     posted = body + '\n'.join(re.findall(r'\*\*(?:Comment|Reply) \(EN, sẽ post\):\*\*\n\n(.*?)\n\n\*\*Vì sao', text, re.S))
 
     check_points(body, event)
+    check_inline(text, body, event)
     check_risk(text, event, override)
     check_deletes(text, body, tsv(a.triggers, 'DATA_DELETE'), a.wt, root, event, override)
     if tsv(a.triggers, 'ROLLOUT_MANUAL'):

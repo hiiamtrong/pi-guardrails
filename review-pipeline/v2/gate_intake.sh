@@ -13,7 +13,8 @@ J=$(gh api "repos/$REPO/pulls/$N" --jq '"\(.state) \(.merged) \(.merged_at) \(.u
 read -r STATE MERGED MERGED_AT AUTHOR HEAD BASE <<<"$J"
 # The head this review starts from: check_head.sh stops later steps once GitHub has another one.
 [ -z "${WORK:-}" ] || { mkdir -p "$WORK" && printf '%s\n' "$HEAD" > "$WORK/head.sha"; }
-DEV=$(gh api repos/$REPO/branches/develop --jq .commit.sha) || exit 2
+BB=${BASE_BRANCH:-develop}
+DEV=$(gh api repos/$REPO/branches/$BB --jq .commit.sha) || exit 2
 rc=0
 check() { if [ "$2" = ok ]; then echo "INTAKE: PASS   $1"; else echo "INTAKE: FAIL   $1"; rc=1; fi; }
 check "state=$STATE merged=$MERGED mergedAt=$MERGED_AT" "$([ "$STATE $MERGED" = "open false" ] && echo ok)"
@@ -28,8 +29,8 @@ LOCAL_PR=$(git -C "$RV" rev-parse "refs/remotes/pr/$N" 2>/dev/null)
 check "refs/remotes/pr/$N=${LOCAL_PR:0:10} API head=${HEAD:0:10}" "$([ "$LOCAL_PR" = "$HEAD" ] && echo ok)"
 WT_HEAD=$(git -C "$WT" rev-parse HEAD 2>/dev/null)
 check "worktree $WT HEAD=${WT_HEAD:0:10}" "$([ "$WT_HEAD" = "$HEAD" ] && echo ok)"
-LOCAL_DEV=$(git -C "$RV" rev-parse origin/develop)
-if [ "$LOCAL_DEV" = "$DEV" ]; then echo "INTAKE: PASS   origin/develop=${DEV:0:10} khớp API"; else echo "INTAKE: WARN   origin/develop=${LOCAL_DEV:0:10}, API ${DEV:0:10}: fetch với dấu + rồi trial lại"; fi
+LOCAL_DEV=$(git -C "$RV" rev-parse origin/$BB)
+if [ "$LOCAL_DEV" = "$DEV" ]; then echo "INTAKE: PASS   origin/$BB=${DEV:0:10} khớp API"; else echo "INTAKE: WARN   origin/$BB=${LOCAL_DEV:0:10}, API ${DEV:0:10}: fetch với dấu + rồi trial lại"; fi
 LABELS=$(gh api "repos/$REPO/issues/$N" --jq '[.labels[].name]|join(",")')
-echo "INTAKE: INFO   labels=$LABELS head=$HEAD develop=$DEV"
+echo "INTAKE: INFO   labels=$LABELS head=$HEAD $BB=$DEV"
 exit $rc

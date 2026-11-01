@@ -17,7 +17,7 @@ work.mkdir(exist_ok=True)
 log = work / "calls.txt"
 with open(log, "a") as f:
     f.write(" ".join(sys.argv[1:]) + "\\n")
-(work / "policy.txt").write_text(" ".join(os.environ.get(k, "-") for k in ("WT_PREFIX", "GATES", "IMPACT_SECTIONS", "DRAFT_CHECK", "AUTHOR_PATTERN", "K3S_SSH")) + "\\n")
+(work / "policy.txt").write_text(" ".join(os.environ.get(k, "-") for k in ("WT_PREFIX", "GATES", "IMPACT_SECTIONS", "DRAFT_CHECK", "AUTHOR_PATTERN", "BASE_BRANCH", "K3S_SSH")) + "\\n")
 (work / "env.txt").write_text(" ".join(os.environ.get(k, "-") for k in ("REPO", "RV", "HANDBOOK", "REVIEWER", "RULES")) + "\\n")
 if cmd == "begin":
     if "STUB_REFUSE" in os.environ:
@@ -271,9 +271,9 @@ test("readPolicy merges pipeline.json with the project over global, and rejects 
   const f = repo();
   mkdirSync(join(f.globalRules, "steps"), { recursive: true });
   writeFileSync(join(f.globalRules, "pipeline.json"), JSON.stringify({ worktreePrefix: "g-", impactSections: 8, gates: ["00", "06"] }));
-  writeFileSync(join(projectRulesDir(f.root), "pipeline.json"), JSON.stringify({ worktreePrefix: "p-", draftCheck: "check.py", authorPattern: "^(a|b)-" }));
-  assert.deepEqual(readPolicy(ruleRoots(f.root)), { worktreePrefix: "p-", impactSections: 8, gates: ["00", "06"], draftCheck: "check.py", authorPattern: "^(a|b)-" });
-  for (const bad of [{ gate: ["00"] }, { gates: ["99"] }, { impactSections: 0 }, { draftCheck: "../x.py" }, { worktreePrefix: 3 }, { authorPattern: "" }, { authorPattern: "(" }, { authorPattern: 5 }, { k3sHost: "k3s" }, { k3sHost: "root@k3s; rm -rf /" }, { k3sHost: 3 }]) {
+  writeFileSync(join(projectRulesDir(f.root), "pipeline.json"), JSON.stringify({ worktreePrefix: "p-", draftCheck: "check.py", authorPattern: "^(a|b)-", baseBranch: "release/1.x" }));
+  assert.deepEqual(readPolicy(ruleRoots(f.root)), { worktreePrefix: "p-", impactSections: 8, gates: ["00", "06"], draftCheck: "check.py", authorPattern: "^(a|b)-", baseBranch: "release/1.x" });
+  for (const bad of [{ gate: ["00"] }, { gates: ["99"] }, { impactSections: 0 }, { draftCheck: "../x.py" }, { worktreePrefix: 3 }, { authorPattern: "" }, { authorPattern: "(" }, { authorPattern: 5 }, { k3sHost: "k3s" }, { k3sHost: "root@k3s; rm -rf /" }, { k3sHost: 3 }, { baseBranch: "" }, { baseBranch: "a b" }, { baseBranch: "-x" }, { baseBranch: 3 }]) {
     writeFileSync(join(projectRulesDir(f.root), "pipeline.json"), JSON.stringify(bad));
     assert.throws(() => readPolicy(ruleRoots(f.root)), /lạ hoặc giá trị sai kiểu/);
   }
@@ -285,11 +285,11 @@ test("/review-pr exports the policy to the pipeline, always keeps intake, and de
   const f = repo("https://github.com/swaglive/swag-op-console-server.git");
   const { commands, ctx, handlers } = setup();
   await commands["review-pr"]("https://github.com/swaglive/swag-op-console-server/pull/1076", ctx(f.root));
-  assert.equal(readFileSync(join(f.work, "policy.txt"), "utf8"), "swag-op-console-server-pr- - - - - -\n");
+  assert.equal(readFileSync(join(f.work, "policy.txt"), "utf8"), "swag-op-console-server-pr- - - - - - -\n");
   handlers.session_shutdown();
-  writeFileSync(join(projectRulesDir(f.root), "pipeline.json"), JSON.stringify({ worktreePrefix: "swag-op-pr-", gates: ["02", "06"], impactSections: 9, draftCheck: "check_draft_opc.py", authorPattern: "^acme-", k3sHost: "root@k3s.example.ts.net" }));
+  writeFileSync(join(projectRulesDir(f.root), "pipeline.json"), JSON.stringify({ worktreePrefix: "swag-op-pr-", gates: ["02", "06"], impactSections: 9, draftCheck: "check_draft_opc.py", authorPattern: "^acme-", baseBranch: "main", k3sHost: "root@k3s.example.ts.net" }));
   await commands["review-pr"]("https://github.com/swaglive/swag-op-console-server/pull/1076", ctx(f.root));
-  assert.equal(readFileSync(join(f.work, "policy.txt"), "utf8"), "swag-op-pr- 00 02 06 9 check_draft_opc.py ^acme- root@k3s.example.ts.net\n");
+  assert.equal(readFileSync(join(f.work, "policy.txt"), "utf8"), "swag-op-pr- 00 02 06 9 check_draft_opc.py ^acme- main root@k3s.example.ts.net\n");
   handlers.session_shutdown();
 });
 
@@ -1111,16 +1111,16 @@ test("gate 00 checks the author only against the authorPattern the project set",
   writeFileSync(join(bin, "gh"), `#!/bin/sh
 case "$*" in
   *"auth token"*) echo token ;;
-  *"branches/develop"*) echo 0000000000000000000000000000000000000001 ;;
+  *"branches/"*) echo 0000000000000000000000000000000000000001 ;;
   *"issues/"*) echo "type/bug" ;;
-  *"pulls/"*) echo "open false null $FAKE_AUTHOR 0000000000000000000000000000000000000002 develop" ;;
+  *"pulls/"*) echo "open false null $FAKE_AUTHOR 0000000000000000000000000000000000000002 \${FAKE_BASE:-develop}" ;;
 esac
 `, { mode: 0o755 });
-  const gate = (author: string, pattern?: string) => {
-    const env = { REPO: "o/r", RV: f.root, HANDBOOK: join(f.root, "AGENTS.local.md"), REVIEWER: "me", WT_PREFIX: "wt-", ...(pattern ? { AUTHOR_PATTERN: pattern } : {}) };
+  const gate = (author: string, pattern?: string, base?: { branch?: string; pr: string }) => {
+    const env = { REPO: "o/r", RV: f.root, HANDBOOK: join(f.root, "AGENTS.local.md"), REVIEWER: "me", WT_PREFIX: "wt-", ...(pattern ? { AUTHOR_PATTERN: pattern } : {}), ...(base?.branch ? { BASE_BRANCH: base.branch } : {}) };
     assert.equal(assembleTools(f.root, [], env), undefined);
     return spawnSync("bash", [join(f.root, "reports", "reviews", "tools", "v2", "gate_intake.sh"), "1"], {
-      cwd: f.root, encoding: "utf8", env: { PATH: `${bin}:${process.env.PATH}`, HOME: process.env.HOME, FAKE_AUTHOR: author },
+      cwd: f.root, encoding: "utf8", env: { PATH: `${bin}:${process.env.PATH}`, HOME: process.env.HOME, FAKE_AUTHOR: author, ...(base ? { FAKE_BASE: base.pr } : {}) },
     }).stdout;
   };
   assert.match(gate("acme-dev", "^acme-"), /INTAKE: PASS   author=acme-dev/);
@@ -1128,6 +1128,11 @@ esac
   const unchecked = gate("outsider");
   assert.match(unchecked, /INTAKE: INFO   author=outsider \(pipeline.json không có authorPattern/);
   assert.doesNotMatch(unchecked, /FAIL   author/);
+  // the base branch is develop unless the project says otherwise
+  assert.match(gate("acme-dev", "^acme-", { pr: "develop" }), /INTAKE: PASS   base=develop/);
+  assert.match(gate("acme-dev", "^acme-", { pr: "main" }), /INTAKE: FAIL   base=main/);
+  assert.match(gate("acme-dev", "^acme-", { branch: "main", pr: "main" }), /INTAKE: PASS   base=main/);
+  assert.match(gate("acme-dev", "^acme-", { branch: "main", pr: "develop" }), /INTAKE: FAIL   base=develop/);
 });
 
 const BOARD_STUB = `import sys

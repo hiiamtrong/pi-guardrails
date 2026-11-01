@@ -623,6 +623,86 @@ class ValueOrigin(unittest.TestCase):
         self.assertEqual(caught, [])
 
 
+class InlineGate(unittest.TestCase):
+    """check_draft inline: a finding tied to a line must not live only in the body (#19323 sat four reviews with 0 inline comments)."""
+
+    @classmethod
+    def setUpClass(cls):
+        sys.path.insert(0, str(HERE))
+        import check_draft
+        cls.cd = check_draft
+
+    BLOCK = ('### 1. `app/mod.py` L12 (RIGHT)\n\n**Comment (EN, sẽ post):**\n\nUse the house sentinel:\n\n```suggestion\nX = UNSET\n```\n\n'
+             '**Vì sao:** conventions.\n')
+
+    def gate(self, text, body):
+        import contextlib
+        import io
+        self.cd.results.clear()
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.cd.check_inline(text, body)
+        return out.getvalue()
+
+    def gate_event(self, text, body, event):
+        import contextlib
+        import io
+        self.cd.results.clear()
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.cd.check_inline(text, body, event)
+        return out.getvalue()
+
+    def points(self, five):
+        return '\n'.join(f'{i}. {label}: {five if i == 5 else "No"}' for i, label in enumerate(self.cd.POINTS, 1))
+
+    def test_a_yes_with_no_inline_comment_is_left_to_the_human(self):
+        body = self.points('Yes. `Any` is back.')
+        self.assertIn('MANUAL inline', self.gate(body, body).replace('  ', ' '))
+
+    def test_a_body_that_cites_a_line_with_no_inline_comment_is_left_to_the_human(self):
+        body = self.points('No') + '\nSee `app/mod.py:12`.'
+        self.assertIn('body trỏ `app/mod.py:12`', self.gate(body, body))
+
+    def test_an_inline_block_passes_even_with_a_yes(self):
+        body = self.points('Yes. The sentinel.')
+        out = self.gate(body + '\n\n' + self.BLOCK, body)
+        self.assertIn('PASS   inline', out)
+        self.assertNotIn('MANUAL', out)
+
+    def test_all_no_and_no_citation_needs_no_inline_comment(self):
+        body = self.points('No')
+        self.assertIn('PASS   inline', self.gate(body, body))
+
+    def test_a_yes_on_the_description_point_is_pr_level_and_ignored(self):
+        body = self.points('No').replace('7. Hard to follow: No', '7. Hard to follow: Yes. The description is empty.')
+        self.assertIn('PASS   inline', self.gate(body, body))
+
+    def test_a_request_changes_with_no_inline_comment_is_left_to_the_human_even_when_every_point_is_no(self):
+        body = self.points('No').replace('7. Hard to follow: No', '7. Hard to follow: Yes. The description is out of date.')
+        out = self.gate_event(body, body, 'REQUEST_CHANGES')
+        self.assertIn('MANUAL inline', out)
+        self.assertIn('event REQUEST_CHANGES', out)
+
+    def test_an_approve_with_nothing_to_anchor_still_passes(self):
+        body = self.points('No')
+        self.assertIn('PASS   inline', self.gate_event(body, body, 'APPROVE'))
+
+    def test_a_request_changes_with_an_inline_block_passes(self):
+        body = self.points('Yes. The sentinel.')
+        self.assertIn('PASS   inline', self.gate_event(body + '\n\n' + self.BLOCK, body, 'REQUEST_CHANGES'))
+
+    def test_the_indented_example_in_the_template_is_not_a_block(self):
+        example = '    ### 1. `p.py` L1 (RIGHT)\n\n    **Comment (EN, sẽ post):**\n\n    text\n\n    **Vì sao:** x\n'
+        body = self.points('No')
+        self.assertNotIn('FAIL', self.gate(body + '\n\n' + example, body))
+
+    def test_a_block_build_payload_would_drop_fails(self):
+        bad = self.BLOCK.replace('### 1. `app/mod.py` L12 (RIGHT)', '### 1. app/mod.py line 12')
+        body = self.points('No')
+        self.assertIn('FAIL   inline-form', self.gate(body + '\n\n' + bad, body))
+
+
 if __name__ == '__main__':
     unittest.main()
 

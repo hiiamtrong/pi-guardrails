@@ -17,6 +17,9 @@ CROSS = re.compile(r'(go_chat|openim|OpenIM|SwagServerClient|outbox|pusher|Pushe
 # Whole-file scan: Mongo's Outbox model and Pusher sit in many files, so only names that mean our Go/OpenIM side.
 CROSS_FILE = re.compile(r'(go_chat|openim|OpenIM|SwagServerClient)')
 DESC_ROLLOUT = re.compile(r'(?i)(createIndex|create_index|manually|by hand|pre-deploy|post-deploy|before deploy|after deploy|run (it )?once|one-off)')
+# Go side (swag-openim): "openim" is in every import path there, so cross-service means a call to swag-server.
+GO_CROSS = re.compile(r'(SwagServerClient|swag_server|swagServer|send/validate|webhooks/(afterSend|sendFailed|shareFailed|shareDeliveryCompleted))')
+GO_CROSS_DIR = re.compile(r'^internal/infrastructure/client/')
 FLAG = re.compile(r'(?i)(migration_state|MigrationState|growthbook|kill_switch|ledger|wallet|payment|points\.|escrow)')
 
 # Dòng đọc một giá trị rồi xử lý rỗng hoặc đặt mặc định: nơi một giả định về dữ liệu thật nằm.
@@ -43,18 +46,18 @@ def git(wt, *args):
 
 def code_part(line):
     s = line.strip()
-    return '' if s.startswith(('#', '"', "'", 'def ', 'async def ')) else s.split('  #', 1)[0]
+    return '' if s.startswith(('#', '//', '"', "'", 'def ', 'async def ', 'func ')) else s.split('  #', 1)[0]
 
 
 def enclosing(lines, n):
     for i in range(min(n, len(lines)) - 1, -1, -1):
-        if m := re.match(r'\s*(?:async\s+)?def\s+(\w+)', lines[i]):
-            return m.group(1)
+        if m := re.match(r'\s*(?:async\s+)?def\s+(\w+)|func\s+(?:\([^)]*\)\s*)?(\w+)', lines[i]):
+            return m.group(1) or m.group(2)
     return '-'
 
 
 def scan_hunk(wt, head, path, hunk, cache, out):
-    if path.startswith('tests/'):
+    if path.startswith('tests/') or path.endswith('_test.go'):
         return
     src = cache.setdefault(path, git(wt, 'show', f'{head}:{path}').splitlines())
     for i, (k, n, t) in enumerate(hunk):
@@ -70,7 +73,7 @@ def scan_hunk(wt, head, path, hunk, cache, out):
             out.append(('DATA_DELETE', loc, fn, '(guarded by a changed line) ' + c[:100]))
         if k == '+' and ROLLOUT_LINE.search(c):
             out.append(('ROLLOUT_MANUAL', loc, fn, c[:120]))
-        if k != ' ' and CROSS.search(c):
+        if k != ' ' and (GO_CROSS if path.endswith('.go') else CROSS).search(c):
             out.append(('CROSS_SERVICE', loc, fn, c[:120]))
         if k != ' ' and FLAG.search(c):
             out.append(('FLAG_SLACK', loc, fn, c[:120]))
@@ -169,11 +172,13 @@ def main(wt, base, head, desc=None):
         # #19011 changed only lines inside a file that already calls Go; the changed lines named nothing cross-service.
         if p.endswith('.py') and not p.startswith('tests/') and (m := CROSS_FILE.search(git(wt, 'show', f'{head}:{p}'))):
             out.append(('CROSS_SERVICE', f'{p}:1', '-', f'(file uses {m.group(0)})'))
+        if GO_CROSS_DIR.match(p) and not p.endswith('_test.go'):
+            out.append(('CROSS_SERVICE', f'{p}:1', '-', '(swag-server client)'))
     for n, line in enumerate(open(desc).read().splitlines() if desc else [], 1):
         if DESC_ROLLOUT.search(line):
             out.append(('ROLLOUT_MANUAL', f'description:{n}', '-', line.strip()[:120]))
     path, hunk, cache, new_no, old_no = None, [], {}, 0, 0
-    for line in git(wt, 'diff', '-U3', base, head, '--', '*.py').splitlines():
+    for line in git(wt, 'diff', '-U3', base, head, '--', '*.py', '*.go').splitlines():
         if line.startswith('diff --git'):
             if path and hunk:
                 scan_hunk(wt, head, path, hunk, cache, out)

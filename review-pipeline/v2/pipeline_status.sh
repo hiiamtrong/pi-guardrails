@@ -28,7 +28,7 @@ gate() {
   [ "$st" = PASS ] || { echo "---- $step $name"; grep -E 'FAIL|ABORT|WARN|^  ' "$WORK/$step-$name.log" | head -14; }
 }
 HEAD=$(git -C "$WT" rev-parse HEAD) || exit 2
-BASE=$(git -C "$RV" merge-base origin/develop "$HEAD") || exit 2
+BASE=$(git -C "$RV" merge-base "origin/${BASE_BRANCH:-develop}" "$HEAD") || exit 2
 export GH_TOKEN="$(gh auth token -h github.com -u "$REVIEWER")"
 LABELS=$(gh api "repos/$REPO/issues/$N" --jq '[.labels[].name]|join(",")') || exit 2
 

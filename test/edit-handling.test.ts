@@ -88,7 +88,7 @@ test("ponytail tracks an edit whose edits arrive as a JSON string", async () => 
         sendUserMessage: (text: string) => sent.push(text),
     });
     handlers.tool_call({ toolName: "edit", input: { path: "src/a.ts", edits: JSON.stringify([{ oldText: "if (a) go();", newText: "if (a || b) go();" }]) } });
-    await handlers.agent_settled();
+    await handlers.agent_settled({ aborted: false });
     assert.deepEqual(sent, ["/skill:ponytail-review"]);
 });
 
@@ -125,7 +125,7 @@ test("null, empty and odd edit entries are ignored instead of throwing", async (
 
     const { run, handlers } = ponytailWith(0.1);
     handlers.tool_call({ toolName: "edit", input: { path: "src/a.ts", edits: [null, { oldText: "if (a) go();", newText: "if (a || b) go();" }] } });
-    await handlers.agent_settled();
+    await handlers.agent_settled({ aborted: false });
     assert.deepEqual(run.sent, ["/skill:ponytail-review"]);
 });
 
@@ -151,7 +151,7 @@ test("ponytail asks Jev for edits of exactly 60,000 characters and skips Jev for
         const { run, handlers } = ponytailWith(0.95);
         const after = "x".repeat(MAX_STATE_CHARS - overhead + extra);
         handlers.tool_call({ toolName: "edit", input: { path: "p.ts", edits: [{ oldText: "b", newText: after }] } });
-        await handlers.agent_settled();
+        await handlers.agent_settled({ aborted: false });
         assert.deepEqual([run.fetches, run.sent.length], [fetches, reviews], `extra ${extra}`);
     }
 });

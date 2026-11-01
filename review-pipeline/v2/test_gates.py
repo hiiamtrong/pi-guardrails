@@ -703,6 +703,50 @@ class InlineGate(unittest.TestCase):
         self.assertIn('FAIL   inline-form', self.gate(body + '\n\n' + bad, body))
 
 
+class ImpactMapGate(unittest.TestCase):
+    HEAD_SHA = 'e008ae0769' + 'f' * 30
+    BASE_SHA = '6cfa543ec1' + 'a' * 30
+    SECTIONS = ''.join(f'## s{i}\n\n- none\n\n' for i in range(9))
+
+    def gate(self, text, head=None, base=None):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = pathlib.Path(tmp) / 'impact-map.txt'
+            if text is not None:
+                path.write_text(text)
+            done = subprocess.run([sys.executable, '-I', str(HERE / 'check_impact.py'), str(path),
+                                   '--head', head or self.HEAD_SHA, '--base', base or self.BASE_SHA],
+                                  capture_output=True, text=True)
+        return done.returncode, done.stdout
+
+    def test_a_map_of_this_range_passes(self):
+        rc, out = self.gate(f'# Impact map {OLD}..{HEAD}\n\n' + self.SECTIONS)
+        self.assertEqual((rc, 'PASS' in out), (0, True), out)
+
+    def test_a_map_of_another_head_fails_even_with_every_heading(self):
+        rc, out = self.gate(f'# Impact map {OLD}..{OLD}\n\n' + self.SECTIONS)
+        self.assertEqual(rc, 1)
+        self.assertIn('FAIL', out)
+
+    def test_a_missing_file_and_too_few_headings_fail(self):
+        self.assertEqual(self.gate(None)[0], 1)
+        self.assertEqual(self.gate(f'# Impact map {OLD}..{HEAD}\n\n## only one\n')[0], 1)
+
+    def test_another_base_is_a_warning_for_a_stacked_pr(self):
+        rc, out = self.gate(f'# Impact map {HEAD}..{HEAD}\n\n' + self.SECTIONS)
+        self.assertEqual(rc, 0)
+        self.assertIn('WARN', out)
+        self.assertNotIn('FAIL', out)
+
+    def test_a_header_with_ref_names_cannot_be_checked_and_says_so(self):
+        rc, out = self.gate('# Impact map (Go) origin/main..pr/7\n\n' + self.SECTIONS)
+        self.assertEqual(rc, 0)
+        self.assertIn('WARN', out)
+
+    def test_the_go_header_with_shas_is_checked_too(self):
+        rc, _ = self.gate(f'# Impact map (Go) {OLD}..{OLD}\n\n' + self.SECTIONS)
+        self.assertEqual(rc, 1)
+
+
 if __name__ == '__main__':
     unittest.main()
 

@@ -1,3 +1,5 @@
+import json
+import os
 import pathlib
 import subprocess
 import sys
@@ -5,6 +7,9 @@ import tempfile
 import unittest
 
 HERE = pathlib.Path(__file__).resolve().parent
+# What swag-openim's pipeline.json declares: the engine itself names no service.
+OPENIM = {'crossByExt': {'.go': r'(SwagServerClient|swag_server|swagServer|send/validate|webhooks/(afterSend|sendFailed|shareFailed|shareDeliveryCompleted))'},
+          'crossDirs': r'^internal/infrastructure/client/'}
 
 
 def git(wt, *args):
@@ -22,7 +27,8 @@ class GoTriggersTest(unittest.TestCase):
             git(wt, 'commit', '-qm', 'base')
             (wt / path).write_text(after)
             git(wt, 'commit', '-qam', 'head')
-            r = subprocess.run([sys.executable, str(HERE / 'scan_triggers.py'), str(wt), 'HEAD~1', 'HEAD'], capture_output=True, text=True, check=True)
+            r = subprocess.run([sys.executable, str(HERE / 'scan_triggers.py'), str(wt), 'HEAD~1', 'HEAD'], capture_output=True, text=True, check=True,
+                               env={**os.environ, 'TRIGGERS': json.dumps(OPENIM)})
             return [line.split('\t') for line in r.stdout.splitlines()]
 
     def test_a_go_delete_names_its_function(self):

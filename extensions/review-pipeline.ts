@@ -313,7 +313,7 @@ function validPattern(value: string): boolean {
   }
 }
 
-type Policy = { worktreePrefix?: string; gates?: string[]; impactSections?: number; draftCheck?: string; authorPattern?: string; baseBranch?: string; k3sHost?: string };
+type Policy = { worktreePrefix?: string; gates?: string[]; impactSections?: number; draftCheck?: string; authorPattern?: string; baseBranch?: string; k3sHost?: string; triggers?: Record<string, unknown>; watchPaths?: string };
 
 // shortcut: a typo in pipeline.json fails loudly instead of silently turning a gate on or off; no schema library for six keys.
 export function readPolicy(rules: string[]): Policy {
@@ -335,6 +335,9 @@ export function readPolicy(rules: string[]): Policy {
       else if (key === "draftCheck" && typeof value === "string" && /^[\w.-]+$/.test(value)) policy.draftCheck = value;
       else if (key === "authorPattern" && typeof value === "string" && validPattern(value)) policy.authorPattern = value;
       else if (key === "baseBranch" && typeof value === "string" && /^[\w][\w./-]*$/.test(value)) policy.baseBranch = value;
+      else if (key === "triggers" && value !== null && typeof value === "object" && !Array.isArray(value))
+        policy.triggers = { ...policy.triggers, ...(value as Record<string, unknown>) };
+      else if (key === "watchPaths" && typeof value === "string" && validPattern(value)) policy.watchPaths = value;
       else if (key === "k3sHost" && typeof value === "string" && /^[\w.-]+@[\w.-]+$/.test(value)) policy.k3sHost = value;
       else throw new Error(`${file}: khóa "${key}" lạ hoặc giá trị sai kiểu`);
     }
@@ -351,6 +354,8 @@ function policyEnv(policy: Policy, repo: string): Env {
     ...(policy.authorPattern ? { AUTHOR_PATTERN: policy.authorPattern } : {}),
     ...(policy.baseBranch ? { BASE_BRANCH: policy.baseBranch } : {}),
     ...(policy.k3sHost ? { K3S_SSH: policy.k3sHost } : {}),
+    ...(policy.triggers ? { TRIGGERS: JSON.stringify(policy.triggers) } : {}),
+    ...(policy.watchPaths ? { WATCH_PATHS: policy.watchPaths } : {}),
   };
 }
 

@@ -3,24 +3,28 @@
 Usage: python3.12 scan_triggers.py <worktree> <base> <head> [description.txt]   (chỉ git diff / git show)
 Mô tả chỉ được thêm trigger, không bớt: bước index chạy tay của #18729 chỉ nằm trong Rollout Plan.
 TSV: trigger, path:line, hàm bao quanh, code. Không có gì thì in NONE.
+Từ khoá của từng trigger nằm trong triggers_config.py; một repo đổi chúng bằng khoá `triggers` của pipeline.json.
+Trigger: DATA_DELETE, ROLLOUT_MANUAL, CROSS_SERVICE (dòng đổi), CROSS_FILE (cả file), FLAG_SLACK, CONFIG_UNREAD, VALUE_ORIGIN (chỉ Python).
 """
 import ast
+import os
 import re
 import subprocess
 import sys
 import warnings
 
-DELETE = re.compile(r'(?i)(delete|\bdrop|_drop|prune|purge|truncate|\bremove|_remove|cleanup|clean_up|discard|\$unset|\$pull|re-?key|expire\()')
-ROLLOUT_PATH = re.compile(r'^(alembic/|deploy/|.*/jobs/.*\.ya?ml$|charts?/|.*values[^/]*\.ya?ml$|.*\.sql$)')
-ROLLOUT_LINE = re.compile(r'(create_index|createIndex|ensure_index|CREATE (UNIQUE )?INDEX|\.command\(|@click\.command|add_column|op\.execute)')
-CROSS = re.compile(r'(go_chat|openim|OpenIM|SwagServerClient|outbox|pusher|Pusher)')
-# Whole-file scan: Mongo's Outbox model and Pusher sit in many files, so only names that mean our Go/OpenIM side.
-CROSS_FILE = re.compile(r'(go_chat|openim|OpenIM|SwagServerClient)')
-DESC_ROLLOUT = re.compile(r'(?i)(createIndex|create_index|manually|by hand|pre-deploy|post-deploy|before deploy|after deploy|run (it )?once|one-off)')
-# Go side (swag-openim): "openim" is in every import path there, so cross-service means a call to swag-server.
-GO_CROSS = re.compile(r'(SwagServerClient|swag_server|swagServer|send/validate|webhooks/(afterSend|sendFailed|shareFailed|shareDeliveryCompleted))')
-GO_CROSS_DIR = re.compile(r'^internal/infrastructure/client/')
-FLAG = re.compile(r'(?i)(migration_state|MigrationState|growthbook|kill_switch|ledger|wallet|payment|points\.|escrow)')
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+import triggers_config as tc  # noqa: E402
+
+V = None  # tc.load() in main(): a bad pipeline.json stops the run before any output
+FUNCTION = re.compile(
+    r'^\s*(?:export\s+|default\s+|public\s+|private\s+|protected\s+|static\s+|async\s+|final\s+|override\s+|suspend\s+)*'
+    r'(?:def|func|function|fn|fun|sub)\s+(?:\([^)]*\)\s*)?([A-Za-z_]\w*)'
+    r'|^\s*(?:export\s+)?(?:const|let|var)\s+([A-Za-z_]\w*)\s*=\s*(?:async\s*)?(?:\([^)]*\)|\w+)\s*=>')
+FLAG_ROWS_PER_FILE = 3
+SETTING = re.compile(r'^(?:[A-Z][A-Z0-9_]{3,}|[a-z][a-z0-9]*(?:_[a-z0-9]+)+|[a-z]+(?:[A-Z][a-z0-9]+)+)$')
+CONFIG_KEY = re.compile(r"""^\s*(?:export\s+)?["']?([A-Za-z_][\w.]*)["']?\s*[:=]""")
+CONFIG_SKIP = re.compile(r'(^|/)(\.github/|\.gitlab-ci|docker-compose|compose\.ya?ml|Chart\.ya?ml|node_modules/)|\.lock$')
 
 # Dòng đọc một giá trị rồi xử lý rỗng hoặc đặt mặc định: nơi một giả định về dữ liệu thật nằm.
 GUARD = re.compile(r"""(?x)
@@ -46,36 +50,38 @@ def git(wt, *args):
 
 def code_part(line):
     s = line.strip()
-    return '' if s.startswith(('#', '//', '"', "'", 'def ', 'async def ', 'func ')) else s.split('  #', 1)[0]
+    return '' if s.startswith(('#', '//', '/*', '* ', '--', '"', "'", 'def ', 'async def ', 'func ', 'function ', 'fn ', 'fun ')) else s.split('  #', 1)[0]
 
 
 def enclosing(lines, n):
     for i in range(min(n, len(lines)) - 1, -1, -1):
-        if m := re.match(r'\s*(?:async\s+)?def\s+(\w+)|func\s+(?:\([^)]*\)\s*)?(\w+)', lines[i]):
+        if m := FUNCTION.match(lines[i]):
             return m.group(1) or m.group(2)
     return '-'
 
 
 def scan_hunk(wt, head, path, hunk, cache, out):
-    if path.startswith('tests/') or path.endswith('_test.go'):
+    if tc.is_test(path):
         return
     src = cache.setdefault(path, git(wt, 'show', f'{head}:{path}').splitlines())
+    cross = V.crossByExt.get(tc.ext(path), V.cross)
     for i, (k, n, t) in enumerate(hunk):
         c = code_part(t)
         if not c:
             continue
         fn = enclosing(src, n) if k != '-' else '-'
         loc = f'{path}:{n}' if k != '-' else f'{path}:-{n}'
-        if k != ' ' and DELETE.search(c):
+        if k != ' ' and V.delete.search(c):
             out.append(('DATA_DELETE', loc, fn, c[:120]))
         # An unchanged delete under a changed condition still changes what gets deleted.
-        if k == ' ' and DELETE.search(c) and any(kk == '+' and code_part(tt) for kk, _, tt in hunk[max(0, i - 3):i]):
+        if k == ' ' and V.delete.search(c) and any(kk == '+' and code_part(tt) for kk, _, tt in hunk[max(0, i - 3):i]):
             out.append(('DATA_DELETE', loc, fn, '(guarded by a changed line) ' + c[:100]))
-        if k == '+' and ROLLOUT_LINE.search(c):
+        if k == '+' and V.rolloutLine.search(c):
             out.append(('ROLLOUT_MANUAL', loc, fn, c[:120]))
-        if k != ' ' and (GO_CROSS if path.endswith('.go') else CROSS).search(c):
+        if k != ' ' and cross and cross.search(c):
             out.append(('CROSS_SERVICE', loc, fn, c[:120]))
-        if k != ' ' and FLAG.search(c):
+        if k != ' ' and V.flag.search(c) and cache.setdefault(('flag', path), 0) < FLAG_ROWS_PER_FILE:
+            cache[('flag', path)] += 1
             out.append(('FLAG_SLACK', loc, fn, c[:120]))
 
 
@@ -162,23 +168,58 @@ def value_origins(wt, base, head):
     return out
 
 
+def used_elsewhere(wt, head, key, own):
+    """True when `key` appears as a word in a file that is not the config file itself; another config file counts only under templates/."""
+    r = subprocess.run(['git', '-C', wt, 'grep', '-l', '-F', '-w', '-I', key, head], capture_output=True, text=True)
+    if r.returncode > 1:
+        sys.exit(f'scan_triggers: git grep {key!r} failed: {r.stderr.strip()[:200]}')
+    for row in r.stdout.splitlines():
+        path = row.removeprefix(head + ':')
+        if path != own and (tc.ext(path) not in V.configExt or '/templates/' in path):
+            return True
+    return False
+
+
+def config_unread(wt, base, head, out):
+    """A setting the PR adds to a config file that no code reads: declared is not used (swag-openim #66)."""
+    for p in git(wt, 'diff', '--name-only', '--diff-filter=d', base, head).split():
+        if tc.ext(p) not in V.configExt or CONFIG_SKIP.search(p):
+            continue
+        n, seen = 0, {}
+        for line in git(wt, 'diff', '-U0', base, head, '--', p).splitlines():
+            if line.startswith('@@'):
+                n = int(re.match(r'@@ -\S+ \+(\d+)', line).group(1))
+            elif line.startswith('+') and not line.startswith('+++'):
+                m = CONFIG_KEY.match(line[1:])
+                if m and SETTING.match(m.group(1).split('.')[-1]):
+                    seen.setdefault(m.group(1).split('.')[-1], n)
+                n += 1
+        for key, line_no in list(seen.items())[:30]:
+            if not used_elsewhere(wt, head, key, p):
+                out.append(('CONFIG_UNREAD', f'{p}:{line_no}', '-', key))
+
+
 def main(wt, base, head, desc=None):
+    global V
+    V = tc.load()
     out = []
     for p in git(wt, 'diff', '--name-only', '--diff-filter=d', base, head).split():
-        if ROLLOUT_PATH.match(p):
+        if V.rolloutPath.match(p):
             out.append(('ROLLOUT_MANUAL', f'{p}:1', '-', '(deploy file)'))
-        if p.startswith('swag/migration/'):
-            out.append(('FLAG_SLACK', f'{p}:1', '-', '(under swag/migration/)'))
+        if V.flagPaths and V.flagPaths.match(p):
+            out.append(('FLAG_SLACK', f'{p}:1', '-', f'(path matches {V.flagPaths.pattern})'))
+        source = tc.ext(p) in V.sourceExt and not tc.is_test(p)
         # #19011 changed only lines inside a file that already calls Go; the changed lines named nothing cross-service.
-        if p.endswith('.py') and not p.startswith('tests/') and (m := CROSS_FILE.search(git(wt, 'show', f'{head}:{p}'))):
-            out.append(('CROSS_SERVICE', f'{p}:1', '-', f'(file uses {m.group(0)})'))
-        if GO_CROSS_DIR.match(p) and not p.endswith('_test.go'):
-            out.append(('CROSS_SERVICE', f'{p}:1', '-', '(swag-server client)'))
+        if source and V.crossFile and (m := V.crossFile.search(git(wt, 'show', f'{head}:{p}'))):
+            out.append(('CROSS_FILE', f'{p}:1', '-', f'(file uses {m.group(0)})'))
+        if source and V.crossDirs and V.crossDirs.match(p):
+            out.append(('CROSS_SERVICE', f'{p}:1', '-', '(a cross-service client)'))
     for n, line in enumerate(open(desc).read().splitlines() if desc else [], 1):
-        if DESC_ROLLOUT.search(line):
+        if V.descRollout.search(line):
             out.append(('ROLLOUT_MANUAL', f'description:{n}', '-', line.strip()[:120]))
+    config_unread(wt, base, head, out)
     path, hunk, cache, new_no, old_no = None, [], {}, 0, 0
-    for line in git(wt, 'diff', '-U3', base, head, '--', '*.py', '*.go').splitlines():
+    for line in git(wt, 'diff', '-U3', base, head, '--', *[f'*.{e}' for e in sorted(V.sourceExt)]).splitlines():
         if line.startswith('diff --git'):
             if path and hunk:
                 scan_hunk(wt, head, path, hunk, cache, out)

@@ -17,7 +17,7 @@ work.mkdir(exist_ok=True)
 log = work / "calls.txt"
 with open(log, "a") as f:
     f.write(" ".join(sys.argv[1:]) + "\\n")
-(work / "policy.txt").write_text(" ".join(os.environ.get(k, "-") for k in ("WT_PREFIX", "GATES", "IMPACT_SECTIONS", "DRAFT_CHECK", "AUTHOR_PATTERN", "BASE_BRANCH", "K3S_SSH")) + "\\n")
+(work / "policy.txt").write_text(" ".join(os.environ.get(k, "-") for k in ("WT_PREFIX", "GATES", "IMPACT_SECTIONS", "DRAFT_CHECK", "AUTHOR_PATTERN", "BASE_BRANCH", "K3S_SSH", "TRIGGERS", "WATCH_PATHS")) + "\\n")
 (work / "env.txt").write_text(" ".join(os.environ.get(k, "-") for k in ("REPO", "RV", "HANDBOOK", "REVIEWER", "RULES")) + "\\n")
 if cmd == "begin":
     if "STUB_REFUSE" in os.environ:
@@ -281,15 +281,27 @@ test("readPolicy merges pipeline.json with the project over global, and rejects 
   assert.throws(() => readPolicy(ruleRoots(f.root)), /không đọc được/);
 });
 
+test("readPolicy merges the triggers vocabulary key by key and takes only an object", () => {
+  const f = repo();
+  mkdirSync(join(f.globalRules, "steps"), { recursive: true });
+  writeFileSync(join(f.globalRules, "pipeline.json"), JSON.stringify({ triggers: { cross: "g", flag: "gf" } }));
+  writeFileSync(join(projectRulesDir(f.root), "pipeline.json"), JSON.stringify({ triggers: { cross: "p", crossByExt: { ".go": "x" } } }));
+  assert.deepEqual(readPolicy(ruleRoots(f.root)).triggers, { cross: "p", flag: "gf", crossByExt: { ".go": "x" } });
+  for (const bad of ["x", ["cross"], null, 3]) {
+    writeFileSync(join(projectRulesDir(f.root), "pipeline.json"), JSON.stringify({ triggers: bad }));
+    assert.throws(() => readPolicy(ruleRoots(f.root)), /lạ hoặc giá trị sai kiểu/);
+  }
+});
+
 test("/review-pr exports the policy to the pipeline, always keeps intake, and defaults the worktree prefix to the repo name", async () => {
   const f = repo("https://github.com/swaglive/swag-op-console-server.git");
   const { commands, ctx, handlers } = setup();
   await commands["review-pr"]("https://github.com/swaglive/swag-op-console-server/pull/1076", ctx(f.root));
-  assert.equal(readFileSync(join(f.work, "policy.txt"), "utf8"), "swag-op-console-server-pr- - - - - - -\n");
+  assert.equal(readFileSync(join(f.work, "policy.txt"), "utf8"), "swag-op-console-server-pr- - - - - - - - -\n");
   handlers.session_shutdown();
-  writeFileSync(join(projectRulesDir(f.root), "pipeline.json"), JSON.stringify({ worktreePrefix: "swag-op-pr-", gates: ["02", "06"], impactSections: 9, draftCheck: "check_draft_opc.py", authorPattern: "^acme-", baseBranch: "main", k3sHost: "root@k3s.example.ts.net" }));
+  writeFileSync(join(projectRulesDir(f.root), "pipeline.json"), JSON.stringify({ worktreePrefix: "swag-op-pr-", gates: ["02", "06"], impactSections: 9, draftCheck: "check_draft_opc.py", authorPattern: "^acme-", baseBranch: "main", k3sHost: "root@k3s.example.ts.net", triggers: { cross: "(a|b)", flag: "x" }, watchPaths: "^(db/|deploy/)" }));
   await commands["review-pr"]("https://github.com/swaglive/swag-op-console-server/pull/1076", ctx(f.root));
-  assert.equal(readFileSync(join(f.work, "policy.txt"), "utf8"), "swag-op-pr- 00 02 06 9 check_draft_opc.py ^acme- main root@k3s.example.ts.net\n");
+  assert.equal(readFileSync(join(f.work, "policy.txt"), "utf8"), "swag-op-pr- 00 02 06 9 check_draft_opc.py ^acme- main root@k3s.example.ts.net {\"cross\":\"(a|b)\",\"flag\":\"x\"} ^(db/|deploy/)\n");
   handlers.session_shutdown();
 });
 

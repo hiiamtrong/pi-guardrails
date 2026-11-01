@@ -35,21 +35,19 @@ LABELS=$(gh api "repos/$REPO/issues/$N" --jq '[.labels[].name]|join(",")') || ex
 gate 00 intake "$T/gate_intake.sh" "$N" "$WT"
 gate 01 comments env ${SEEN:+SEEN=$SEEN} "$T/gate_comments.sh" "$N" "$DRAFT" "$AS_OF"
 gh api "repos/$REPO/pulls/$N" --jq .body > "$WORK/description.txt" || exit 2
-if [ -z "${DRAFT_CHECK:-}" ] && { [ -z "${GATES:-}" ] || [[ " $GATES " == *" 05 "* ]]; }; then
+if [ -z "${DRAFT_CHECK:-}" ] && { [ -z "${GATES:-}" ] || [[ " $GATES " == *" 04 "* ]] || [[ " $GATES " == *" 05 "* ]]; }; then
   python3.12 "$T/scan_triggers.py" "$WT" "$BASE" "$HEAD" "$WORK/description.txt" > "$WORK/triggers.tsv" || { echo "ABORT: scan_triggers.py failed" >&2; exit 2; }
   python3.12 "$T/scan_expected.py" "$WT" "$BASE" "$HEAD" > "$WORK/expected.tsv" || { echo "ABORT: scan_expected.py failed" >&2; exit 2; }
 else
   : > "$WORK/triggers.tsv"; : > "$WORK/expected.tsv"
 fi
-impact_ok() {
-  local f=$EVID/impact-map.txt n
-  [ -f "$f" ] || { echo "MAP: FAIL không có $f (impact map chưa chạy, hoặc chạy mà không lưu)"; return 1; }
-  n=$(grep -c '^## ' "$f")
-  [ "$n" -ge "${IMPACT_SECTIONS:-8}" ] && echo "MAP: PASS $n mục" || { echo "MAP: FAIL chỉ $n/${IMPACT_SECTIONS:-8} mục: tool chạy hỏng?"; return 1; }
-}
-gate 02 impact-map impact_ok
+gate 02 impact-map python3.12 "$T/check_impact.py" "$EVID/impact-map.txt" --head "$HEAD" --base "$BASE" --sections "${IMPACT_SECTIONS:-8}"
 git -C "$WT" diff --name-only "$BASE" "$HEAD" > "$WORK/changed.txt" || exit 2
 gate 03 runs python3.12 "$T/check_runs.py" --head "$HEAD" --changed "$WORK/changed.txt" "$EVID"/runs*.txt
+outside_check() {
+  python3.12 "$T/check_draft.py" "$DRAFT" --step 04 --triggers "$WORK/triggers.tsv" --expected "$WORK/expected.tsv" --wt "$WT" --labels "$LABELS" --rv "$RV" --evid-root "$(dirname "$(dirname "$EVID")")"
+}
+[ -n "${DRAFT_CHECK:-}" ] || gate 04 outside outside_check
 draft_check() {
   if [ -n "${DRAFT_CHECK:-}" ]; then python3.12 "$T/$DRAFT_CHECK" "$DRAFT" --wt "$WT" --head "$HEAD"; return; fi
   python3.12 "$T/check_draft.py" "$DRAFT" --triggers "$WORK/triggers.tsv" --expected "$WORK/expected.tsv" --wt "$WT" --labels "$LABELS" --rv "$RV" --evid-root "$(dirname "$(dirname "$EVID")")"

@@ -16,7 +16,7 @@ STEPS = [
     ('06', 'post', 'pin khớp, người review đã OK, guard'),
     ('07', 'after', 'comment mới, review so với head'),
 ]
-LOGS = {'00': '00-intake', '01': '01-comments', '02': '02-impact-map', '03': '03-runs', '06': '06-pin', '07': '07-after'}
+LOGS = {'00': '00-intake', '01': '01-comments', '02': '02-impact-map', '03': '03-runs', '04': '04-outside', '06': '06-pin', '07': '07-after'}
 STEP04 = re.compile(r'^(data-|rollout|release-lbl|cross)')
 LINE = re.compile(r'^(?P<pre>[A-Z]+):\s+(?P<st>PASS|FAIL|MANUAL|WARN|INFO|ABORT)\b\s*(?P<rest>.*)$')
 ROW = re.compile(r'^(?P<num>\d\d)\s+\S+\s+(?P<st>PASS|FAIL|ABORT)\s+rc=(?P<rc>\d+)', re.M)

@@ -9,10 +9,10 @@ export GH_TOKEN="$(gh auth token -h github.com -u __REVIEWER__)"
 R=__REPO__; N=__PR__; D=__DRAFT__; VERIFIED_DEV=__DEV10__; EXPECTED_EVENT=__EVENT__
 RV=${RV:?set RV to the review checkout}
 V2=${V2:-$RV/reports/reviews/tools/v2}
-[ -n "${BASE_BRANCH:-}" ] || { f="$RV/reports/reviews/tools/.pipeline-env"; [ ! -f "$f" ] || . "$f"; }  # the project's base branch, written by /review-pr
+if [ -z "${BASE_BRANCH:-}" ] || [ -z "${WATCH_PATHS+x}" ]; then f="$RV/reports/reviews/tools/.pipeline-env"; [ ! -f "$f" ] || . "$f"; fi  # the project's base branch and watchlist, written by /review-pr
 BB=${BASE_BRANCH:-develop}
 PRFILES='__FILES__'
-WATCH='^(swag/migration/|deploy/chat-backfill/|swag/db/|alembic/|swag/settings/|swag/__init__\.py$|swag/utils/|tests/(integration/)?migration/|tests/(integration/)?(features/)?conftest\.py$|tests/conftest\.py$|\.pre-commit-config\.yaml$)'
+WATCH=${WATCH_PATHS:-}  # `watchPaths` of pipeline.json: an ERE over paths of the base branch's moves that make the draft stale
 fail() { echo "ABORT: $*"; exit 1; }
 lines() { printf '%s\n' "$1" | grep -c .; }
 HEAD=$(python3.12 -c "import json; print(json.load(open('$D.review.json'))['commit_id'])") || fail "could not read the payload"
@@ -32,6 +32,8 @@ if [ "${DEV:0:10}" != "$VERIFIED_DEV" ]; then
   MOVED=$(gh api "repos/$R/compare/$VERIFIED_DEV...$DEV" --jq '.files[].filename') || fail "could not compare $BB ${DEV:0:10} with $VERIFIED_DEV"
   count=$(lines "$MOVED")
   [ "$count" -gt 0 ] && [ "$count" -lt 300 ] || fail "$BB moved by $count files, outside what the compare API lists in full"
+  # A stale .pipeline-env (written before watchPaths existed) must not pass as "no watchlist".
+  [ -n "$WATCH" ] || fail "$BB moved to ${DEV:0:10} and no watchPaths is set: declare it in pipeline.json or run /review-pr again"
   hits=$(printf '%s\n' "$MOVED" | grep -E "$WATCH" | tr '\n' ' ')
   [ -z "$hits" ] || fail "$BB moved to ${DEV:0:10} and touched the watchlist: $hits"
   echo "$BB moved to ${DEV:0:10} ($count files), none on the watchlist"

@@ -9,6 +9,9 @@ import re
 import subprocess
 import sys
 
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+import triggers_config as tc  # noqa: E402
+
 POINTS = ['Breaks current production behaviour', 'Feature flag', 'Serious bug', 'Architecture',
           'Style and conventions', 'AI misuse', 'Hard to follow']
 # Keep in sync with "Voice of the review" and "House style" in
@@ -24,6 +27,17 @@ BANNED = [('—', 'em dash'), (r'(?i)\bmutants?\b', '"mutant"'), (r'\bApproving\
           (r'(?i)\b(?:which|as) we agreed\b', 'nhắc lại thoả thuận cũ'),
           (r'(?i)\bapprovals? (?:was|were) dismissed\b', 'nhắc việc approval của người khác: báo Han trên Slack, không để trong review')]
 results = []
+V = None
+POINTER = re.compile(r'https?://\S+|evidence/\S+|[\w./-]+\.\w+:\d+')
+# An agreement is read again from a URL, an evidence file, a file:line, a comment id, a commit, a PR/issue number or a dated note; "đã hỏi" alone is not.
+AGREE_POINTER = re.compile(r'https?://\S+|evidence/\S+|[\w./-]+\.\w+:\d+|(?<![\w.])\d{7,}(?![\w.])|\b(?=[0-9a-f]*\d)[0-9a-f]{7,40}\b|#\d{2,}|\b\d{4}-\d{2}-\d{2}\b')
+DELETER_WINDOW = 80
+
+
+def vocab():
+    global V
+    V = V or tc.load()
+    return V
 
 
 def norm(s):
@@ -146,11 +160,28 @@ def check_risk(text, event, override):
 
 
 def source_def(name):
-    """git grep -P pattern for the definition of `name`: a Python def, a Go func or a Go method."""
-    return rf'(?:def |func (?:\([^)]*\) )?){name}\('
+    """git grep -P pattern for the definition of `name`: def, func, function, fn, fun, sub, a JS assignment, or a Java-style method."""
+    n = re.escape(name)
+    return (rf'(?:\b(?:def|func|function|fn|fun|sub)\s+(?:\([^)]*\)\s*)?{n}\b'
+            rf'|\b{n}\s*[:=]\s*(?:async\s*)?(?:function\b|\([^)]*\)\s*=>)'
+            rf'|\b(?:public|private|protected|static|internal)[\w<>\[\], ?]*\s+{n}\s*\()')
 
 
-def check_deletes(text, body, deletes, wt, root, event, override):
+def definitions(wt, name):
+    r = subprocess.run(['git', '-C', wt, 'grep', '-n', '-P', source_def(name), 'HEAD'], capture_output=True, text=True)
+    return [(row.split(':')[1], int(row.split(':')[2])) for row in r.stdout.splitlines()]
+
+
+def deletes_something(wt, name):
+    """A function named as the deleter at the source must itself call something that removes data (the repo's `delete` vocabulary)."""
+    for path, line in definitions(wt, name):
+        src = subprocess.run(['git', '-C', wt, 'show', f'HEAD:{path}'], capture_output=True, text=True).stdout.splitlines()
+        if vocab().delete.search('\n'.join(src[line:line + DELETER_WINDOW])):
+            return True
+    return False
+
+
+def check_deletes(text, body, deletes, wt, root, event, override, final=True):
     if not deletes:
         say('PASS', 'data-delete', 'diff không có điểm xoá')
         return
@@ -168,26 +199,35 @@ def check_deletes(text, body, deletes, wt, root, event, override):
             say('FAIL', 'data-row', f'dòng {r[0]!r} thiếu cột (cần 8)')
             continue
         fn = re.search(r'`(\w+)`', r[4])
-        found = fn and subprocess.run(['git', '-C', wt, 'grep', '-q', '-P', source_def(fn.group(1)), 'HEAD'],
-                                      capture_output=True).returncode == 0
-        say('PASS' if found else 'FAIL', 'data-source', f'lệnh xoá ở nguồn {r[4]!r}: {"có def" if found else "không tìm thấy def hay func"}')
+        defined = bool(fn) and bool(definitions(wt, fn.group(1)))
+        # A row the draft marks `N/A:` claims there is no deleter (a false alarm of the scanner): the name still has to exist, it need not delete.
+        none = bool(re.match(r'(?i)n/?a\b', r[5]))
+        real = defined and (none or deletes_something(wt, fn.group(1)))
+        why = ('có def, dòng N/A nên không cần lệnh xoá' if none else 'có def và trong ' + str(DELETER_WINDOW) + ' dòng sau có lệnh xoá') if real else ('có def nhưng không có lệnh xoá nào trong ' + str(DELETER_WINDOW) + ' dòng sau (khớp triggers.delete)' if defined else 'không tìm thấy def hay func')
+        say('PASS' if real else 'FAIL', 'data-source', f'lệnh xoá ở nguồn {r[4]!r}: {why}')
         # Comparing with develop let #19233 pass: develop deleted even more. Only the source of truth can accept a loss.
+        agreed = bool(re.match(r'(?i)đồng ý', r[5]))
         unsure = not r[5] or re.match(r'(?i)(chưa kiểm|không\b|\?)', r[5])
         bad = unsure and event == 'APPROVE' and not override
         say('FAIL' if bad else 'PASS', 'data-truth', f'nguồn thật: {r[5]!r}, event {event}')
+        if agreed and not AGREE_POINTER.search(r[5]):
+            say('FAIL', 'data-agree', f'"đồng ý" phải trỏ tới nơi đọc được (URL, evidence/..., file:dòng, id comment, commit, #PR hay ngày duyệt): {r[5]!r}')
         shrink = any(int(y) < int(x) for x, y in re.findall(r'(\d+)\s*(?:→|->)\s*(\d+)', r[2]))
         # "The body then says what is deleted and why that is accepted": a loss the source agrees with is still stated.
-        if shrink:
+        if shrink and final:
             quote = r[6].strip('" `')
             ok = quote_in_body(quote, body)
             say('PASS' if ok else 'FAIL', 'data-body', f'PR head giảm {r[2]!r}; câu trong body: {quote[:50]!r} {"có" if ok else "không có"}')
-        probe = shrink and not re.match(r'(?i)đồng ý', r[5])
+        probe = shrink and not agreed
         ev = pathlib.Path(root, r[7].strip('` ')) if r[7].strip('` -') else None
-        ok = ev and ev.is_file() and (not probe or ('before' in ev.read_text() and 'after' in ev.read_text()))
-        say('PASS' if ok else 'FAIL', 'data-evid', f'{r[7]!r}: {"có" if ok else "không có file"}{", cần before/after vì mất mà nguồn chưa đồng ý" if probe else ""}')
+        evidence = ev.read_text() if ev and ev.is_file() else ''
+        numbers = {n for pair in re.findall(r'(\d+)\s*(?:→|->)\s*(\d+)', r[2]) for n in pair}
+        missing = sorted(n for n in numbers if not re.search(rf'(?<!\d){n}(?!\d)', evidence)) if shrink else []
+        ok = bool(ev and ev.is_file()) and not missing and (not probe or ('before' in evidence and 'after' in evidence))
+        say('PASS' if ok else 'FAIL', 'data-evid', f'{r[7]!r}: ' + ('có' if ok else ('không có file' if not (ev and ev.is_file()) else f'thiếu số {missing} của {r[2]!r}' if missing else 'cần before/after')) + (', cần before/after vì mất mà nguồn chưa đồng ý' if probe and ok else ''))
 
 
-def check_rollout(text, body, labels, event, override):
+def check_rollout(text, body, labels, event, override, final=True):
     sec = section(text, 'Bước chạy tay') or ''
     keys = ['Ai chạy', 'Con số an toàn', 'Lệnh chứng minh đã xong']
     miss = [k for k in keys if not re.search(rf'{k}:\**[ \t]*\S', sec)]
@@ -195,9 +235,51 @@ def check_rollout(text, body, labels, event, override):
     unknown = [k for k in keys if re.search(rf'{k}:\**[ \t]*chưa', sec)]
     bad = unknown and event == 'APPROVE' and not override
     say('FAIL' if bad else 'PASS', 'rollout-gap', f'{unknown or "không dòng nào"} còn "chưa", event {event} (#18729: approve chấp nhận bước viết tay không số, không lệnh kiểm)')
-    if not any(l.startswith('release/') for l in labels):
+    if final and not any(l.startswith('release/') for l in labels):
         ok = 'release/' in body or override
         say('PASS' if ok else 'FAIL', 'release-lbl', f'nhãn {labels}, không có release/*; body {"có" if ok else "không"} nêu (AGENTS.local.md:212)')
+
+
+def check_cross_file(text, rows, event, override):
+    """A file that already talks to another service changed, but not necessarily the call: the draft says why that call is untouched, or follows it."""
+    sec = section(text, 'Request thật qua service kia') or ''
+    for r in rows:
+        path = r[1].rsplit(':', 1)[0]
+        tail = '/'.join(path.split('/')[-2:])
+        line = next((l for l in sec.splitlines() if tail in l), '')
+        ok = 'evidence/' in line or bool(re.search(r'(?i)không (đụng|liên quan).{15,}', line)) or ('chưa kiểm' in line and event != 'APPROVE') or override
+        say('PASS' if ok else 'FAIL', 'cross-file', f'{path} {r[3]}: ' + ('đã nêu' if ok else f'chưa có dòng nêu "{tail}" với "không đụng đường gọi: <lý do>" hay evidence/'))
+
+
+def check_config(text, rows, event, override):
+    sec = section(text, 'Cấu hình khai báo mà code không đọc') or ''
+    for r in rows:
+        line = next((l for l in sec.splitlines() if re.search(rf'\b{re.escape(r[3])}\b', l)), '')
+        unread = bool(re.search(r'(?i)không ai đọc', line))
+        ok = unread or bool(POINTER.search(line))
+        say('PASS' if ok else 'FAIL', 'config-unread', f'{r[1]} {r[3]}: ' + ('có chỗ đọc, bằng chứng hay "không ai đọc"' if ok else 'khai báo mà không thấy code đọc; nêu tên khoá cùng file:dòng đọc nó, URL, evidence/ hay "không ai đọc"'))
+        if unread and event == 'APPROVE' and not override:
+            say('FAIL', 'config-gap', f'{r[3]}: "không ai đọc" mà vẫn APPROVE (swag-openim #66: khai báo không có nghĩa là được dùng)')
+
+
+def run_outside(a, text, body, event, override, root, final):
+    """The checks of step 04. `final` is False when the body is not written yet (gate 04): the checks that quote the body wait for gate 05."""
+    check_deletes(text, body, tsv(a.triggers, 'DATA_DELETE'), a.wt, root, event, override, final)
+    if tsv(a.triggers, 'ROLLOUT_MANUAL'):
+        check_rollout(text, body, [l for l in a.labels.split(',') if l], event, override, final)
+    if final and tsv(a.triggers, 'FLAG_SLACK'):
+        say('PASS' if 'Heads up' in body else 'FAIL', 'flag', 'câu cờ migration/tiền trong body (AGENTS.local.md:209, :360)')
+        say('MANUAL', 'flag-slack', 'đã báo trên Slack: chỉ người kiểm được')
+    if tsv(a.triggers, 'CROSS_SERVICE'):
+        sec = section(text, 'Request thật qua service kia') or ''
+        ok = 'evidence/' in sec or ('chưa kiểm' in sec and (event != 'APPROVE' or override))
+        say('PASS' if ok else 'FAIL', 'cross', f'theo request thật qua service kia (#19011, AGENTS.local.md:282): {"có bằng chứng" if "evidence/" in sec else "chưa kiểm" if sec else "thiếu mục"}, event {event}')
+    rows = tsv(a.triggers, 'CROSS_FILE')
+    if rows:
+        check_cross_file(text, rows, event, override)
+    rows = tsv(a.triggers, 'CONFIG_UNREAD')
+    if rows:
+        check_config(text, rows, event, override)
 
 
 def main():
@@ -206,6 +288,7 @@ def main():
         ap.add_argument(opt, required=True)
     ap.add_argument('draft')
     ap.add_argument('--labels', default='')
+    ap.add_argument('--step', choices=['04'], help='chỉ chạy các kiểm tra của bước 04 (chưa có body, nên bỏ các kiểm tra cần body)')
     ap.add_argument('--rv', default=os.environ.get('RV'), required='RV' not in os.environ)
     ap.add_argument('--evid-root', help='thư mục chứa evidence/, mặc định <rv>/reports/reviews')
     a = ap.parse_args()
@@ -214,6 +297,9 @@ def main():
     override = bool(re.search(r'(?m)^- \*\*Theo ghi đè:\*\*[ \t]*[^\s<].*\b\d{1,2}[:h]\d{2}\b', text))
     m = re.search(r'(?:Planned event|Event): `(\w+)`', text)
     event = m.group(1) if m else None
+    if a.step == '04':
+        run_outside(a, text, '', event, override, root, final=False)
+        sys.exit(1 if 'FAIL' in results else 0)
     say('PASS' if event in ('APPROVE', 'REQUEST_CHANGES', 'COMMENT') else 'FAIL', 'event', f'Planned event = {event}')
     drafted = re.search(r'Reviewed head: `([0-9a-f]{40})`', text)
     current = subprocess.run(['git', '-C', a.wt, 'rev-parse', 'HEAD'], capture_output=True, text=True).stdout.strip()
@@ -226,16 +312,7 @@ def main():
     check_points(body, event)
     check_inline(text, body, event)
     check_risk(text, event, override)
-    check_deletes(text, body, tsv(a.triggers, 'DATA_DELETE'), a.wt, root, event, override)
-    if tsv(a.triggers, 'ROLLOUT_MANUAL'):
-        check_rollout(text, body, [l for l in a.labels.split(',') if l], event, override)
-    if tsv(a.triggers, 'FLAG_SLACK'):
-        say('PASS' if 'Heads up' in body else 'FAIL', 'flag', 'câu cờ migration/tiền trong body (AGENTS.local.md:209, :360)')
-        say('MANUAL', 'flag-slack', 'đã báo trên Slack: chỉ người kiểm được')
-    if tsv(a.triggers, 'CROSS_SERVICE'):
-        sec = section(text, 'Request thật qua service kia') or ''
-        ok = 'evidence/' in sec or ('chưa kiểm' in sec and (event != 'APPROVE' or override))
-        say('PASS' if ok else 'FAIL', 'cross', f'theo request thật qua service kia (#19011, AGENTS.local.md:282): {"có bằng chứng" if "evidence/" in sec else "chưa kiểm" if sec else "thiếu mục"}, event {event}')
+    run_outside(a, text, body, event, override, root, final=True)
     origins = tsv(a.triggers, 'VALUE_ORIGIN')
     if origins:
         miss = origin_missing(section(text, 'Giá trị có thể rỗng do ai ghi') or '', origins, a.wt)

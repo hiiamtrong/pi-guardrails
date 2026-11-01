@@ -65,6 +65,7 @@ const READ_ONLY_GH_COMMANDS = new Set([
 const READ_ONLY_GH_SUBCOMMANDS = new Set([
   "check",
   "checks",
+  "checkout",
   "clone",
   "diff",
   "download",
@@ -202,6 +203,11 @@ function splitShellWords(command: string): string[] {
       quote = character;
       continue;
     }
+    // A `#` that starts a word comments out the rest of the line, so `echo ok # git push` runs no git.
+    if (character === "#" && current === "" && (index === 0 || /[\s;&|(]/.test(command[index - 1]))) {
+      while (index + 1 < command.length && command[index + 1] !== "\n") index += 1;
+      continue;
+    }
     if (";&|()<>{}\n".includes(character)) {
       flush();
       let punctuation = character;
@@ -230,8 +236,9 @@ function shellCommandSegments(tokens: string[]): string[][] {
   let segment: string[] = [];
   for (const token of tokens) {
     if (
-      token !== "{}" &&
-      [...token].every((character) => ";&|(){}\n".includes(character))
+      (token !== "{}" &&
+        [...token].every((character) => ";&|(){}\n".includes(character))) ||
+      /^[<>]\(+$/.test(token)
     ) {
       if (segment.length > 0) segments.push(segment);
       segment = [];
@@ -292,6 +299,9 @@ function executableIndex(tokens: string[]): number | undefined {
       ]),
     ],
     ["time", new Set(["-f", "-o", "--format", "--output"])],
+    ["timeout", new Set(["-s", "-k", "--signal", "--kill-after"])],
+    ["stdbuf", new Set(["-i", "-o", "-e"])],
+    ["setsid", new Set()],
   ]);
   let index = 0;
   while (index < tokens.length) {
@@ -343,6 +353,7 @@ function executableIndex(tokens: string[]): number | undefined {
         }
         if (valueOptions.has(option) && index < tokens.length) index += 1;
       }
+      if (executable === "timeout") index += 1;
       continue;
     }
     return index;
@@ -394,15 +405,159 @@ function shellScriptBodies(command: string): string[] {
   });
 }
 
-function nestedBodies(command: string): string[] {
-  return [...substitutionBodies(command), ...shellScriptBodies(command)].flatMap(
-    (body) => [body, ...nestedBodies(body)],
+const SHELL_NAMES = new Set(["sh", "bash", "zsh", "dash", "ksh"]);
+const RUNTIME_CODE_FLAGS = new Map<string, Set<string>>([
+  ["python", new Set(["-c"])],
+  ["node", new Set(["-e", "-p", "--eval", "--print"])],
+  ["bun", new Set(["-e", "--eval"])],
+  ["ruby", new Set(["-e"])],
+  ["perl", new Set(["-e", "-E"])],
+  ["php", new Set(["-r"])],
+]);
+
+// `python3.12` and `node18` run code like `python` and `node`.
+const runtimeName = (name: string) => name.replace(/[\d.]+$/, "");
+
+type Heredoc = { body: string; consumers: Set<string>; expands: boolean };
+
+function consumerNames(line: string): Set<string> {
+  return new Set(
+    shellCommandSegments(splitShellWords(line)).flatMap((tokens) => {
+      const index = executableIndex(tokens);
+      return index === undefined ? [] : [commandName(tokens[index]) ?? ""];
+    }),
   );
 }
 
-/** The command plus every nested `$(...)`, backtick or `sh -c` body, tokenized separately so an unclosed quote in one cannot swallow the next. */
+/** Heredoc bodies are data unless a shell or interpreter reads them, so they are cut out of the text that gets analysed. */
+function parseHeredocs(command: string): { text: string; heredocs: Heredoc[] } {
+  const lines = command.split("\n");
+  const kept: string[] = [];
+  const heredocs: Heredoc[] = [];
+  for (let i = 0; i < lines.length; i += 1) {
+    const line = lines[i];
+    kept.push(line);
+    let next = i + 1;
+    for (const match of line.matchAll(/(?<!<)<<(-?)\s*(?:(["'])(\w+)\2|(\\?)(\w+))/g)) {
+      const delimiter = match[3] ?? match[5];
+      let end = next;
+      while (end < lines.length && (match[1] ? lines[end].trim() : lines[end]) !== delimiter) end += 1;
+      // An arithmetic `1<<4` or a quoted `<<` has no closing line, and cutting it as a heredoc would hide every later command.
+      if (end >= lines.length) continue;
+      heredocs.push({
+        body: lines.slice(next, end).join("\n"),
+        consumers: consumerNames(line),
+        expands: match[2] === undefined && match[4] === "",
+      });
+      next = end + 1;
+    }
+    i = next - 1;
+  }
+  return { text: kept.join("\n"), heredocs };
+}
+
+/** Heredoc text a shell will run, plus the `$(...)` inside unquoted data heredocs, which expand even for `cat`. */
+function heredocShellBodies(heredocs: Heredoc[]): string[] {
+  return heredocs.flatMap(({ body, consumers, expands }) => {
+    if ([...consumers].some((name) => SHELL_NAMES.has(name) || ["ssh", "source", "."].includes(name))) return [body];
+    return expands ? body.split("\n").flatMap(substitutionBodies) : [];
+  });
+}
+
+/** Line continuations, `$(which git)` and simple `name=word` assignments are resolved so `g=gh; $g pr merge 1` reads as the gh command it is. */
+function normalizeShell(text: string): string {
+  const lookups = text.replace(/\\\r?\n/g, " ").replace(
+    /\$\(\s*(?:which|command\s+-v|type\s+-p|echo)\s+([\w./-]+)\s*\)|`\s*(?:which|command\s+-v|type\s+-p|echo)\s+([\w./-]+)\s*`/g,
+    (_match, parenthesised, backticked) => parenthesised ?? backticked,
+  );
+  const values = new Map<string, string>();
+  // One left-to-right pass, so `g=gh; $g pr merge 1; g=echo` still reads `$g` as gh.
+  return lookups.replace(
+    /(?:^|[;&|(\n]\s*)(?:(?:export|local|readonly|typeset|declare(?:\s+-\w+)*)\s+)?([A-Za-z_]\w*)=(?:"([^"$`]*)"|'([^']*)'|([^\s"'`$;&|()<>]+))(?=\s*(?:[;&|)\n]|$))|\$\{?([A-Za-z_]\w*)\}?/g,
+    (match, name, double, single, bare, used) => {
+      if (used !== undefined) return values.get(used) ?? match;
+      values.set(name, double ?? single ?? bare);
+      return match;
+    },
+  );
+}
+
+function shellText(command: string): string {
+  return normalizeShell(parseHeredocs(command).text);
+}
+
+/** Strings a shell runs that never appear as a command word: `eval` arguments, `echo '...' | sh` and `sh <<< '...'`. */
+function evalAndPipedBodies(command: string): string[] {
+  const segments: { tokens: string[]; afterPipe: boolean }[] = [];
+  let tokens: string[] = [];
+  let afterPipe = false;
+  for (const token of splitShellWords(command)) {
+    if (token !== "{}" && [...token].every((character) => ";&|(){}\n".includes(character))) {
+      if (tokens.length > 0) segments.push({ tokens, afterPipe });
+      tokens = [];
+      afterPipe = token === "|";
+    } else tokens.push(token);
+  }
+  if (tokens.length > 0) segments.push({ tokens, afterPipe });
+  const bodies: string[] = [];
+  segments.forEach(({ tokens: words, afterPipe: piped }, i) => {
+    const index = executableIndex(words);
+    if (index === undefined) return;
+    const name = commandName(words[index]) ?? "";
+    if (name === "eval") bodies.push(words.slice(index + 1).join(" "));
+    if (!SHELL_NAMES.has(name) || words.some((word) => /^-[A-Za-z]*c[A-Za-z]*$/.test(word))) return;
+    const here = words.indexOf("<<<");
+    if (here !== -1 && words[here + 1] !== undefined) bodies.push(words[here + 1]);
+    const feeder = piped ? segments[i - 1]?.tokens : undefined;
+    const feederIndex = feeder ? executableIndex(feeder) : undefined;
+    if (feeder && feederIndex !== undefined && ["echo", "printf"].includes(commandName(feeder[feederIndex]) ?? ""))
+      bodies.push(feeder.slice(feederIndex + 1).filter((word) => !word.startsWith("-")).join(" "));
+  });
+  return bodies;
+}
+
+function nestedBodies(command: string): string[] {
+  return [
+    ...substitutionBodies(command),
+    ...shellScriptBodies(command),
+    ...evalAndPipedBodies(command),
+  ].flatMap((body) => [body, ...nestedBodies(body)]);
+}
+
+/** The command plus every nested `$(...)`, backtick, `sh -c`, `eval` or piped-to-shell body, tokenized separately so an unclosed quote in one cannot swallow the next. */
 function shellTokenLists(command: string): string[][] {
-  return [command, ...nestedBodies(command)].map(splitShellWords);
+  const { text, heredocs } = parseHeredocs(command);
+  const sources = [text, ...heredocShellBodies(heredocs)].map(normalizeShell);
+  return sources.flatMap((source) => [source, ...nestedBodies(source)]).map(splitShellWords);
+}
+
+/** Code handed to python -c, node -e, perl -e, ruby -e or a heredoc fed to an interpreter. */
+function inlineRuntimeCodes(command: string): string[] {
+  const { text, heredocs } = parseHeredocs(command);
+  const fromHeredocs = heredocs
+    .filter(({ consumers }) => [...consumers].some((name) => RUNTIME_CODE_FLAGS.has(runtimeName(name))))
+    .map(({ body }) => body);
+  const source = normalizeShell(text);
+  const fromFlags = [source, ...nestedBodies(source)].flatMap((body) =>
+    shellCommandSegments(splitShellWords(body)).flatMap((tokens) => {
+      const index = executableIndex(tokens);
+      const flags = index === undefined ? undefined : RUNTIME_CODE_FLAGS.get(runtimeName(commandName(tokens[index]) ?? ""));
+      const flag = flags ? tokens.findIndex((token, i) => i > (index ?? 0) && flags.has(token)) : -1;
+      return flag === -1 || tokens[flag + 1] === undefined ? [] : [tokens[flag + 1]];
+    }),
+  );
+  return [...fromHeredocs, ...fromFlags].map(resolveRuntimeAliases);
+}
+
+/** `import subprocess as sp` and `from subprocess import run` hide the calls the runtime checks look for. */
+function resolveRuntimeAliases(code: string): string {
+  let resolved = code;
+  for (const [, module, alias] of code.matchAll(/\bimport\s+(subprocess|os)\s+as\s+(\w+)/g))
+    resolved = resolved.replace(new RegExp(`\\b${alias}\\.`, "g"), `${module}.`);
+  for (const [, names] of code.matchAll(/\bfrom\s+subprocess\s+import[ \t]+([\w \t,]+)/g))
+    for (const name of names.split(",").map((part) => part.trim()).filter(Boolean))
+      resolved = resolved.replace(new RegExp(`(?<![.\\w])${name}\\(`, "g"), `subprocess.${name}(`);
+  return resolved;
 }
 
 function shellInvocations(
@@ -455,16 +610,23 @@ function gitSubcommand(invocation: ShellInvocation): string | undefined {
   return undefined;
 }
 
-const GUARDED_SUBCOMMANDS = ["commit", "push"];
+// These create commits with the configured author, so they leak the wrong identity just like `git commit`.
+const HISTORY_SUBCOMMANDS = ["merge", "rebase", "cherry-pick", "revert", "am"];
+const NON_COMMITTING_FLAGS = new Set(["--abort", "--quit", "--no-commit", "--ff-only", "--dry-run"]);
+
+function isGuardedInvocation(invocation: ShellInvocation): boolean {
+  const subcommand = gitSubcommand(invocation);
+  const args = invocation.tokens.slice(invocation.executableIndex + 1);
+  if (subcommand === "push") return !args.some((arg) => arg === "--dry-run" || /^-[A-Za-z]*n[A-Za-z]*$/.test(arg));
+  if (subcommand === "commit") return !args.includes("--dry-run");
+  return subcommand !== undefined && HISTORY_SUBCOMMANDS.includes(subcommand) && !args.some((arg) => NON_COMMITTING_FLAGS.has(arg));
+}
 
 export function guardedGitAction(command: string): string | undefined {
   for (const invocation of shellInvocations(command, "git")) {
-    const subcommand = gitSubcommand(invocation);
-    if (subcommand && GUARDED_SUBCOMMANDS.includes(subcommand)) {
-      return `git ${subcommand}`;
-    }
+    if (isGuardedInvocation(invocation)) return `git ${gitSubcommand(invocation)}`;
   }
-  return undefined;
+  return inlineRuntimeCodes(command).map(guardedGitRuntimeAction).find((action) => action !== undefined);
 }
 
 export type GitTargets = { dirs: string[] } | { unresolved: string };
@@ -521,7 +683,7 @@ function gitTargetDirs(
 export function guardedGitTargets(command: string, cwd: string): GitTargets {
   const parts: { words: string[]; separator?: string }[] = [];
   let words: string[] = [];
-  for (const token of splitShellWords(command)) {
+  for (const token of splitShellWords(shellText(command))) {
     if ([...token].every((c) => ";&|()\n{}".includes(c))) {
       parts.push({ words, separator: token });
       words = [];
@@ -554,8 +716,7 @@ export function guardedGitTargets(command: string, cwd: string): GitTargets {
       if (resolved.includes(undefined)) return { unresolved: `cannot resolve cd ${raw}` };
       next = new Set(resolved as string[]);
     } else if (index !== undefined && name === "git") {
-      const subcommand = gitSubcommand({ tokens: segment, executableIndex: index });
-      if (subcommand && GUARDED_SUBCOMMANDS.includes(subcommand)) {
+      if (isGuardedInvocation({ tokens: segment, executableIndex: index })) {
         const dirs = gitTargetDirs(segment, index, state);
         if (typeof dirs === "string") return { unresolved: dirs };
         for (const dir of dirs) targets.add(dir);
@@ -570,11 +731,12 @@ export function guardedGitTargets(command: string, cwd: string): GitTargets {
       chainStart = state;
     }
   }
-  const guarded = shellInvocations(command, "git").filter((invocation) =>
-    GUARDED_SUBCOMMANDS.includes(gitSubcommand(invocation) ?? ""),
-  );
+  const guarded = shellInvocations(command, "git").filter(isGuardedInvocation);
   if (guarded.length !== direct) {
     return { unresolved: "git runs inside a nested shell, substitution, xargs or find" };
+  }
+  if (inlineRuntimeCodes(command).some((code) => guardedGitRuntimeAction(code) !== undefined)) {
+    return { unresolved: "git runs inside interpreter code" };
   }
   return { dirs: [...targets] };
 }
@@ -762,11 +924,18 @@ function isReadOnlyGhInvocation(invocation: ShellInvocation): boolean {
   );
 }
 
+// A `gh` argument to these only names or searches for the program, so it is not an unparsed call.
+const LOOKUP_COMMANDS = new Set(["which", "whereis", "type", "echo", "printf", "grep", "egrep", "fgrep", "rg", "ls", "brew", "man"]);
+
 function isReadOnlyGhCommand(command: string): boolean {
   const invocations = shellInvocations(command, "gh");
-  const ghTokens = shellTokenLists(command).flat().filter((token) =>
-    /(?:^|\/)gh(?:\.exe)?$/i.test(token),
-  );
+  const ghTokens = shellTokenLists(command)
+    .flatMap(shellCommandSegments)
+    .flatMap((segment) => {
+      const index = executableIndex(segment);
+      if (index !== undefined && LOOKUP_COMMANDS.has(commandName(segment[index]) ?? "")) return [];
+      return segment.filter((token) => /(?:^|\/)gh(?:\.exe)?$/i.test(token));
+    });
   return (
     invocations.length > 0 &&
     invocations.length === ghTokens.length &&
@@ -784,6 +953,13 @@ function githubHttpInvocations(command: string): ShellInvocation[] {
         ),
       ),
     );
+}
+
+/** Every gh call and every GitHub HTTP call in the command must be a read, not just one of the two kinds. */
+function isReadOnlyGithubCommand(command: string): boolean {
+  const ghReadOnly = shellInvocations(command, "gh").length === 0 || isReadOnlyGhCommand(command);
+  const httpReadOnly = githubHttpInvocations(command).length === 0 || isReadOnlyGithubHttpCommand(command);
+  return ghReadOnly && httpReadOnly;
 }
 
 function isGithubCommand(command: string): boolean {
@@ -880,26 +1056,49 @@ function runtimeGhInvocations(code: string): ShellInvocation[] {
   return invocations;
 }
 
+const GITHUB_URL = /https?:\/\/(?:(?:api|uploads)\.)?github\.com(?:[/:]|["'`]|$)|["'](?:api|uploads)\.github\.com["']/i;
+const GITHUB_SDK = /\bfrom\s+github\s+import\b|\bimport\s+github\b|@octokit\/|\bnew\s+Octokit\b|\bPyGithub\b/;
+const HTTP_CALL = /\brequests\.(?:get|post|put|patch|delete|request|Session)\b|\b(?:httpx|aiohttp)\.[a-z]|\burllib\.request\b|\burlopen\(|\baxios(?:\.[a-z]|\()|XMLHttpRequest|Net::HTTP|\bcurl_exec\(|\bfetch\(|\bhttps?\.(?:get|post|request|newrequest)\(/i;
+
+// Clients whose GET we cannot tell from a POST: one next to a GitHub URL is a call, never a proven read.
+const HTTP_IMPORT =
+  /\b(?:import|from)\s+(?:urllib3|http\.client|pycurl|httplib2)\b|require\(\s*["'](?:got|superagent|undici|ky|request|needle)["']\s*\)|\bfrom\s+["'](?:got|superagent|undici|ky|needle)["']|\bHTTParty\b|\bFaraday\b|\bRestClient\b|\breqwest::/;
+
+// Clients whose methods are only recognisable once imported: `import requests as r; r.delete(url)`, `from requests import post`.
+const HTTP_CLIENT_IMPORT =
+  /\b(?:import|from)\s+(?:requests|httpx|aiohttp|urllib\.request)\b|require\(\s*["'](?:axios|node-fetch)["']\s*\)|\bfrom\s+["'](?:axios|node-fetch)["']/;
+
+// Only call syntax counts as a write here: a quoted "POST" or a `data=` in a doc edit or test fixture is text, not a request.
+// `.delete(` and a bare `post(` count only next to an imported client, so `Map.delete(x)` in a doc edit stays quiet.
+const httpWriteCall = (code: string) =>
+  /\.(?:post|put|patch)\s*\(/i.test(code) ||
+  (HTTP_CLIENT_IMPORT.test(code) && /\b(?:post|put|patch|delete|request)\s*\(/.test(code));
+
+// A github.com string in a script that never makes an HTTP call (a doc edit, a test fixture) is not a request.
+const callsGithubOverHttp = (code: string) =>
+  GITHUB_URL.test(code) && (HTTP_CALL.test(code) || HTTP_IMPORT.test(code) || httpWriteCall(code));
+
+// urlopen(url, data) and Request(url, data) send a POST when the second argument is positional.
+function isReadOnlyRuntimeHttp(code: string): boolean {
+  return !(
+    httpWriteCall(code) ||
+    /\.(?:post|put|patch|delete)\s*\(|\bmethod\s*[:=]|["'](?:POST|PUT|PATCH|DELETE)["']|(?<=[(,{]\s*)(?:data|json|body|payload|files)\s*[:=](?!=)|\b(?:urlopen|Request)\(\s*[^,)]+,(?!\s*\w+\s*=)/i.test(code)
+  );
+}
+
 function hasOnlyReadOnlyGithubRuntimeCommands(code: string): boolean {
+  if (GITHUB_SDK.test(code)) return false;
   const shellCommands = runtimeShellCommands(code).filter(isGithubCommand);
-  if (
-    shellCommands.some(
-      (command) =>
-        !isReadOnlyGhCommand(command) && !isReadOnlyGithubHttpCommand(command),
-    )
-  )
-    return false;
+  if (shellCommands.some((command) => !isReadOnlyGithubCommand(command))) return false;
 
   const ghExecutables = runtimeExecutables(code).filter((executable) =>
     /(?:^|\/)gh(?:\.exe)?$/i.test(executable),
   );
   const ghInvocations = runtimeGhInvocations(code);
-  return (
-    shellCommands.length + ghExecutables.length > 0 &&
-    ghInvocations.length === ghExecutables.length &&
-    ghInvocations.every(isReadOnlyGhInvocation) &&
-    !/https?:\/\/(?:(?:api|uploads)\.)?github\.com(?:[/:]|["'`]|$)/i.test(code)
-  );
+  if (ghInvocations.length !== ghExecutables.length || !ghInvocations.every(isReadOnlyGhInvocation)) return false;
+  const hasUrl = callsGithubOverHttp(code);
+  if (hasUrl && (!isReadOnlyRuntimeHttp(code) || HTTP_IMPORT.test(code))) return false;
+  return shellCommands.length + ghExecutables.length > 0 || hasUrl;
 }
 
 function isGithubRuntimeCode(code: string): boolean {
@@ -908,17 +1107,19 @@ function isGithubRuntimeCode(code: string): boolean {
     runtimeExecutables(code).some((executable) =>
       /(?:^|\/)gh(?:\.exe)?$/i.test(executable),
     ) ||
-    /https?:\/\/(?:(?:api|uploads)\.)?github\.com(?:[/:]|["'`]|$)/i.test(code)
+    callsGithubOverHttp(code) ||
+    GITHUB_SDK.test(code)
   );
 }
 
-export function guardedGitRuntimeAction(code: string): string | undefined {
+export function guardedGitRuntimeAction(source: string): string | undefined {
+  const code = resolveRuntimeAliases(source);
   const shellAction = runtimeShellCommands(code)
     .map(guardedGitAction)
     .find((action) => action !== undefined);
   if (shellAction) return shellAction;
   const match = code.match(
-    /\b(?:execFile|execFileSync|spawn|spawnSync|subprocess\.(?:Popen|call|check_call|check_output|run))\s*\(\s*(?:\[\s*)?["'](?:[^"']*\/)?git["'][\s\S]{0,240}["'](commit|push)["']/i,
+    /\b(?:execFile|execFileSync|spawn|spawnSync|subprocess\.(?:Popen|call|check_call|check_output|run))\s*\(\s*(?:\[\s*)?["'](?:[^"']*\/)?git["'][\s\S]{0,240}["'](commit|push|merge|rebase|cherry-pick|revert|am)["']/i,
   );
   return match ? `git ${match[1].toLowerCase()}` : undefined;
 }
@@ -927,7 +1128,8 @@ export function isGuardedGitRuntimeCode(code: string): boolean {
   return guardedGitRuntimeAction(code) !== undefined;
 }
 
-function isGitPushRuntimeCode(code: string): boolean {
+function isGitPushRuntimeCode(source: string): boolean {
+  const code = resolveRuntimeAliases(source);
   return (
     runtimeShellCommands(code).some(isGitPush) ||
     /\b(?:execFile|execFileSync|spawn|spawnSync)\s*\(\s*["'](?:[^"']*\/)?git["'][\s\S]{0,240}["']push["']/i.test(
@@ -940,14 +1142,31 @@ function isGitPushRuntimeCode(code: string): boolean {
 }
 
 function isGitPush(command: string): boolean {
-  return (
-    shellInvocations(command, "git").some(
-      (invocation) => gitSubcommand(invocation) === "push",
-    ) ||
-    /(?:^|[;&|()]|\s)git(?:\s+-[^\s]+(?:\s+[^\s]+)?)*\s+push(?:\s|$)/i.test(
-      command,
-    )
+  return shellInvocations(command, "git").some(
+    (invocation) => gitSubcommand(invocation) === "push" && isGuardedInvocation(invocation),
   );
+}
+
+function shellPushes(command: string): boolean {
+  return isGitPush(command) || inlineRuntimeCodes(command).some(isGitPushRuntimeCode);
+}
+
+function shellWritesGithub(command: string): boolean {
+  const inlineWrite = inlineRuntimeCodes(command).some(
+    (code) => isGithubRuntimeCode(code) && !hasOnlyReadOnlyGithubRuntimeCommands(code),
+  );
+  return inlineWrite || (isGithubCommand(command) && !isReadOnlyGithubCommand(command));
+}
+
+function isReadOnlyGraphqlRequest(tokens: string[]): boolean {
+  if (!tokens.some((token) => /github\.com\/graphql\/?$/i.test(token))) return false;
+  const body = tokens.find((token) => token.startsWith("{") && token.includes("query"));
+  try {
+    const { query } = JSON.parse(body ?? "");
+    return typeof query === "string" && isReadOnlyGraphqlDocument(query);
+  } catch {
+    return false;
+  }
 }
 
 function isReadOnlyGithubHttpInvocation(invocation: ShellInvocation): boolean {
@@ -998,6 +1217,7 @@ function isReadOnlyGithubHttpInvocation(invocation: ShellInvocation): boolean {
       hasPayload = true;
     }
   }
+  if (isReadOnlyGraphqlRequest(tokens) && (!method || method.toUpperCase() === "POST")) return true;
   if (method) return ["GET", "HEAD", "OPTIONS"].includes(method.toUpperCase());
   return !hasPayload;
 }
@@ -1065,7 +1285,7 @@ function repoFromInput(input: ToolInput | undefined): string | undefined {
 }
 
 function githubActionFromCommand(command: string): string | undefined {
-  if (isGitPush(command)) return "git push";
+  if (shellPushes(command)) return "git push";
   const ghInvocation = shellInvocations(command, "gh").find(
     (invocation) => !isReadOnlyGhInvocation(invocation),
   );
@@ -1083,12 +1303,25 @@ function githubActionFromCommand(command: string): string | undefined {
       .at(-1);
     return `${executable ?? "HTTP client"} GitHub request`;
   }
-  return undefined;
+  return inlineRuntimeCodes(command).some(isGithubRuntimeCode) ? "GitHub request in interpreter code" : undefined;
+}
+
+const GITHUB_TOOL_NAME = /github|(?:^|[^a-z0-9])gh(?:[^a-z0-9]|$)/i;
+
+/** Name of a GitHub MCP call, including adapter proxies (`mcp` with server github, `...__mcp__github`) whose real operation is in `input.tool`. */
+export function githubMcpToolName(event: ToolCallEvent): string | undefined {
+  const toolName = typeof event.toolName === "string" ? event.toolName : "";
+  const { server, tool } = event.input ?? {};
+  if (toolName === "mcp" && typeof server === "string" && /github/i.test(server))
+    return `github_${typeof tool === "string" ? tool : "list"}`;
+  if (!GITHUB_TOOL_NAME.test(toolName)) return undefined;
+  return typeof tool === "string" ? `${toolName}_${tool}` : toolName;
 }
 
 export function githubWriteAction(event: ToolCallEvent): string | undefined {
   const toolName = typeof event.toolName === "string" ? event.toolName : "";
-  if (toolName.toLowerCase().includes("github")) return toolName;
+  const mcpName = githubMcpToolName(event);
+  if (mcpName) return mcpName;
   if (isCtxExecuteTool(toolName)) {
     const code = event.input?.code;
     if (typeof code !== "string") return undefined;
@@ -1123,38 +1356,32 @@ export function githubWriteAction(event: ToolCallEvent): string | undefined {
 
 export function githubWriteReason(event: ToolCallEvent): string | undefined {
   const toolName = typeof event.toolName === "string" ? event.toolName : "";
-  if (toolName.toLowerCase().includes("github"))
-    return isReadOnlyGithubMcpTool(toolName)
-      ? undefined
-      : `GitHub tool: ${toolName}`;
+  const mcpName = githubMcpToolName(event);
+  if (mcpName)
+    return isReadOnlyGithubMcpTool(mcpName) ? undefined : `GitHub tool: ${mcpName}`;
 
   if (isCtxExecuteTool(toolName)) {
     const code = event.input?.code;
     if (typeof code !== "string") return undefined;
     if (event.input?.language === "shell") {
-      if (isGitPush(code)) return "git push may mutate a GitHub remote";
-      if (!isGithubCommand(code)) return undefined;
-      return isReadOnlyGhCommand(code) || isReadOnlyGithubHttpCommand(code)
-        ? undefined
-        : "ctx_execute shell code contains a GitHub write or cannot be proven read-only";
+      if (shellPushes(code)) return "git push may mutate a GitHub remote";
+      return shellWritesGithub(code)
+        ? "ctx_execute shell code contains a GitHub write or cannot be proven read-only"
+        : undefined;
     }
-    if (isGitPushRuntimeCode(code))
+    const runtime = resolveRuntimeAliases(code);
+    if (isGitPushRuntimeCode(runtime))
       return "git push may mutate a GitHub remote";
-    if (hasOnlyReadOnlyGithubRuntimeCommands(code)) return undefined;
-    return isGithubRuntimeCode(code)
+    if (hasOnlyReadOnlyGithubRuntimeCommands(runtime)) return undefined;
+    return isGithubRuntimeCode(runtime)
       ? "ctx_execute can issue GitHub writes and cannot be proven read-only"
       : undefined;
   }
 
   if (isCtxBatchExecuteTool(toolName)) {
     const commands = batchCommands(event.input);
-    if (commands.some(isGitPush)) return "git push may mutate a GitHub remote";
-    return commands.some(
-      (command) =>
-        isGithubCommand(command) &&
-        !isReadOnlyGhCommand(command) &&
-        !isReadOnlyGithubHttpCommand(command),
-    )
+    if (commands.some(shellPushes)) return "git push may mutate a GitHub remote";
+    return commands.some(shellWritesGithub)
       ? "ctx_batch_execute contains a GitHub write or cannot be proven read-only"
       : undefined;
   }
@@ -1162,11 +1389,10 @@ export function githubWriteReason(event: ToolCallEvent): string | undefined {
   if (toolName !== "bash" || typeof event.input?.command !== "string")
     return undefined;
   const command = event.input.command;
-  if (isGitPush(command)) return "git push may mutate a GitHub remote";
-  if (!isGithubCommand(command)) return undefined;
-  return isReadOnlyGhCommand(command) || isReadOnlyGithubHttpCommand(command)
-    ? undefined
-    : "GitHub command is a write or cannot be proven read-only";
+  if (shellPushes(command)) return "git push may mutate a GitHub remote";
+  return shellWritesGithub(command)
+    ? "GitHub command is a write or cannot be proven read-only"
+    : undefined;
 }
 
 export function targetGithubRepo(event: ToolCallEvent): string | undefined {
@@ -1177,6 +1403,67 @@ export function targetGithubRepo(event: ToolCallEvent): string | undefined {
       .map(explicitRepoFromCommand)
       .find((repo) => repo !== undefined) ?? repoFromInput(event.input)
   );
+}
+
+// The value of these flags is text the user wrote, so a GitHub URL there does not say which repository is written.
+const TEXT_VALUE_FLAGS = new Set([
+  "-b", "--body", "-t", "--title", "-m", "--message", "-n", "--notes", "-c", "--comment", "--description",
+  "-d", "--data", "--data-raw", "--data-binary", "--data-urlencode", "--json", "-H", "--header", "-f", "--raw-field", "-F", "--field",
+]);
+
+function invocationRepo(tokens: string[]): string | undefined {
+  for (let index = 0; index < tokens.length; index += 1) {
+    if (tokens[index] === "-R" || tokens[index] === "--repo") return normalizeRepo(tokens[index + 1]);
+    if (tokens[index].startsWith("--repo=")) return normalizeRepo(tokens[index].slice("--repo=".length));
+  }
+  for (const [index, token] of tokens.entries()) {
+    if (TEXT_VALUE_FLAGS.has(tokens[index - 1])) continue;
+    const url = token.match(
+      /^(?:https?:\/\/(?:api\.|uploads\.)?github\.com\/(?:repos\/)?|git@github\.com:)([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+?)(?:\.git)?(?:[/?#]|$)/i,
+    );
+    if (url) return normalizeRepo(url[1]);
+    const api = token.match(/^\/?repos\/([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)/i);
+    if (api) return normalizeRepo(api[1]);
+  }
+  const repoIndex = tokens.findIndex((token) => token.toLowerCase() === "repo");
+  return repoIndex === -1 ? undefined : normalizeRepo(tokens[repoIndex + 2]);
+}
+
+function githubWriteInvocations(command: string): ShellInvocation[] {
+  return [
+    ...shellInvocations(command, "gh").filter((invocation) => !isReadOnlyGhInvocation(invocation)),
+    ...githubHttpInvocations(command).filter((invocation) => !isReadOnlyGithubHttpInvocation(invocation)),
+  ];
+}
+
+function shellCommandsOf(event: ToolCallEvent): string[] | undefined {
+  const toolName = typeof event.toolName === "string" ? event.toolName : "";
+  const { command, code, language } = event.input ?? {};
+  if (toolName === "bash" && typeof command === "string") return [command];
+  if (isCtxExecuteTool(toolName) && language === "shell" && typeof code === "string") return [code];
+  if (isCtxBatchExecuteTool(toolName)) return batchCommands(event.input);
+  return undefined;
+}
+
+/** Skips the prompt only when every write in the call names an allowlisted repo, so a chained `&& gh pr merge -R other/repo` or `&& git push` still asks. */
+function allowlistCovers(event: ToolCallEvent): boolean {
+  const allowed = loadWriteAllowlist();
+  if (allowed.size === 0) return false;
+  const commands = shellCommandsOf(event);
+  if (!commands) {
+    const repo = repoFromInput(event.input);
+    return repo !== undefined && allowed.has(repo);
+  }
+  let writes = 0;
+  for (const command of commands) {
+    if (shellPushes(command) || inlineRuntimeCodes(command).some(isGithubRuntimeCode)) return false;
+    for (const invocation of githubWriteInvocations(command)) {
+      const repo = invocationRepo(invocation.tokens);
+      if (!repo || !allowed.has(repo)) return false;
+      writes += 1;
+    }
+  }
+  return writes > 0;
 }
 
 function notifyPendingConfirmation(action: string, repo?: string): void {
@@ -1226,8 +1513,8 @@ export default function (pi: ExtensionApi): void {
     if (!reason) return undefined;
     const action = githubWriteAction(event) ?? "unknown GitHub write";
 
+    if (allowlistCovers(event)) return undefined;
     const targetRepo = targetGithubRepo(event);
-    if (targetRepo && loadWriteAllowlist().has(targetRepo)) return undefined;
 
     if (!ctx.hasUI || !ctx.ui?.confirm) {
       return {

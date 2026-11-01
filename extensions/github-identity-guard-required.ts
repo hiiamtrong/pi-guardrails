@@ -2,6 +2,7 @@ import { execFileSync } from "node:child_process";
 import { existsSync } from "node:fs";
 import { join } from "node:path";
 import {
+  githubMcpToolName,
   githubWriteAction,
   githubWriteReason,
   guardedGitAction,
@@ -120,7 +121,7 @@ export default function (pi: ExtensionApi): void {
       toolName.endsWith(".ctx_batch_execute");
     const githubReason = githubWriteReason(event);
     const isGithubMcpMutation =
-      toolName.toLowerCase().includes("github") && githubReason !== undefined;
+      githubMcpToolName(event) !== undefined && githubReason !== undefined;
     const gitAction =
       toolName === "bash" && typeof value === "string"
         ? guardedGitAction(value)

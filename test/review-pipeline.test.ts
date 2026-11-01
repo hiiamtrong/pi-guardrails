@@ -1262,6 +1262,7 @@ for a; do cmd="$a"; done
 echo "$cmd" >> "$NODE_DIR/calls.txt"
 case "$cmd" in
   *range*) echo "mongo" ;;
+  *"-keep -o jsonpath"*creationTimestamp*) cat "$NODE_DIR/keep" 2>/dev/null ;;
   *"get pod"*)
     n=$(( $(cat "$NODE_DIR/n" 2>/dev/null || echo 0) + 1 )); echo $n > "$NODE_DIR/n"
     line=$(sed -n "\${n}p" "$NODE_DIR/states"); [ -n "$line" ] || line=$(tail -1 "$NODE_DIR/states"); echo "$line" ;;
@@ -1298,20 +1299,26 @@ function k3sNode(states: string[]) {
       child.on("close", (code) => resolve({ code, stdout, stderr }));
     });
   const calls = () => (existsSync(join(dir, "calls.txt")) ? readFileSync(join(dir, "calls.txt"), "utf8") : "");
-  return { dir, run, calls, engine, wt };
+  // what the node answers about the PR's kept pod: phase, creation time, schema label (empty file: no such pod)
+  const keep = (phase: string, ageMs: number, schema: string) =>
+    writeFileSync(join(dir, "keep"), `${phase} ${phase === "Running" ? "True" : "False"} ${new Date(Date.now() - ageMs).toISOString().replace(/\.\d+Z$/, "Z")} ${schema}\n`);
+  return { dir, run, calls, engine, wt, keep };
 }
+// sha256 of nothing: the test worktree has no alembic/versions, so that is the schema hash of every tree here
+const NO_SCHEMA = "e3b0c44298fc";
 
 const READY = "Running True W: T:";
 const PENDING = "Pending False W:ContainerCreating T:";
 
-test("rv_k3s.sh creates one pod for the run, ships the worktree, sets up, runs, and deletes the pod", async () => {
+test("rv_k3s.sh builds the PR's kept pod on the first run, wipes the image's tree before the worktree lands, sets up, runs, and leaves the pod for the next run", async () => {
   const node = k3sNode([PENDING, READY]);
   const result = await node.run({}, "19372", "python -m pytest tests/x.py");
   assert.equal(result.code, 0, result.stderr);
   assert.match(result.stdout, /5 passed/);
   const yaml = readFileSync(join(node.dir, "pod.yaml"), "utf8");
-  assert.match(yaml, /name: rv-swag-server-19372-[a-z0-9]{6}\n/);
+  assert.match(yaml, /name: rv-swag-server-19372-keep\n/);
   assert.match(yaml, /rv\/pr: "19372"/);
+  assert.match(yaml, new RegExp(`rv/schema: "${NO_SCHEMA}"`));
   assert.match(yaml, /activeDeadlineSeconds: 5400/);
   assert.doesNotMatch(yaml, /__[A-Z_]+__/);
   assert.match(yaml, /automountServiceAccountToken: false/);
@@ -1320,10 +1327,72 @@ test("rv_k3s.sh creates one pod for the run, ships the worktree, sets up, runs, 
   assert.match(calls, /ctr images ls -q \| grep -qx docker\.io\/library\/rv-swag-server:dev \|\| \{ docker image inspect rv-swag-server:dev/);
   assert.ok(calls.indexOf("ctr images ls") < calls.indexOf("create -f -"), "the image is back in k3s before the pod needs it");
   assert.match(calls, /kubectl -n review-env create -f -/);
-  assert.match(calls, /exec -i rv-swag-server-19372-\S+ -c runner -- tar -x -o -C \/usr\/src\/app/);
-  assert.match(calls, /kubectl -n review-env delete pod rv-swag-server-19372-\S+ --wait=false/);
+  // the image holds the tree it was built from: a module the PR deleted must not survive into the run
+  assert.match(calls, /exec -i rv-swag-server-19372-keep -c runner -- sh -c 'cd \/usr\/src\/app && find \. -mindepth 1 -maxdepth 1 ! -name \.venv -exec rm -rf \{\} \+ && tar -x -o -C \/usr\/src\/app'/);
+  assert.doesNotMatch(calls, /delete pod/);
   assert.ok(calls.indexOf("tar -x") < calls.indexOf("-- sh -s"), "the code goes up before anything runs");
   assert.match(execFileSync("tar", ["-tf", join(node.dir, "shipped.tar")], { encoding: "utf8" }), /marker\.txt/);
+  assert.equal(existsSync(join(node.dir, "rv-k3s-keep-swag-server-19372")), false, "the per-PR lock is released");
+});
+
+test("rv_k3s.sh reuses the kept pod of the PR: no new pod, no setup, the tree shipped again and compiled before the command", async () => {
+  const node = k3sNode([READY]);
+  node.keep("Running", 60_000, NO_SCHEMA);
+  const result = await node.run({ FAKE_SETUP_FAIL: "1" }, "19372", "python -m pytest tests/x.py");
+  assert.equal(result.code, 0, result.stderr);
+  assert.match(result.stderr, /rv-swag-server-19372-keep \(dùng lại\)/);
+  assert.match(result.stdout, /5 passed/);
+  const calls = node.calls();
+  assert.doesNotMatch(calls, /create -f -|delete pod|bash -s|ctr images/);
+  assert.equal((calls.match(/get pod/g) ?? []).length, 1, "one probe, no queue polling");
+  assert.match(calls, /find \. -mindepth 1 -maxdepth 1 ! -name \.venv -exec rm -rf \{\} \+ && tar -x -o -C \/usr\/src\/app/);
+  assert.match(readFileSync(join(node.dir, "run.sh"), "utf8"), /cd \/usr\/src\/app\nexec 2>&1\npython -m compileall -q -j 0 -o 0 swag libs tests >\/dev\/null 2>&1 \|\| true\npython -m pytest tests\/x\.py\n$/);
+});
+
+test("rv_k3s.sh replaces a kept pod that has other migration files, or too little time left before the node's deadline", async () => {
+  for (const [why, phase, age, schema] of [["schema", "Running", 60_000, "deadbeef0000"], ["age", "Running", 4000_000, NO_SCHEMA], ["phase", "Failed", 60_000, NO_SCHEMA]] as const) {
+    const node = k3sNode([READY]);
+    node.keep(phase, age, schema);
+    const result = await node.run();
+    assert.equal(result.code, 0, result.stderr);
+    assert.match(result.stderr, /pod rv-swag-server-19372-keep cũ .* xoá để dựng lại/, why);
+    const calls = node.calls();
+    assert.ok(calls.indexOf("delete pod rv-swag-server-19372-keep --wait=true") < calls.indexOf("create -f -"), `${why}: the old pod goes before the new one is created`);
+  }
+});
+
+test("rv_k3s.sh gives a throwaway pod on RV_FRESH_POD=1 and to a second run of the same PR at the same time, and takes over a lock whose owner died", async () => {
+  const fresh = k3sNode([READY]);
+  fresh.keep("Running", 60_000, NO_SCHEMA);
+  await fresh.run({ RV_FRESH_POD: "1" });
+  assert.match(readFileSync(join(fresh.dir, "pod.yaml"), "utf8"), /name: rv-swag-server-19372-[a-z0-9]{6}\n/);
+  assert.match(fresh.calls(), /delete pod rv-swag-server-19372-[a-z0-9]{6} --wait=false/);
+  assert.doesNotMatch(fresh.calls(), /-keep/);
+
+  const busy = k3sNode([READY]);
+  mkdirSync(join(busy.dir, "rv-k3s-keep-swag-server-19372"));
+  writeFileSync(join(busy.dir, "rv-k3s-keep-swag-server-19372", "pid"), `${process.pid}\n`);
+  await busy.run();
+  assert.match(readFileSync(join(busy.dir, "pod.yaml"), "utf8"), /name: rv-swag-server-19372-[a-z0-9]{6}\n/);
+  assert.equal(existsSync(join(busy.dir, "rv-k3s-keep-swag-server-19372")), true, "another run's lock is left alone");
+
+  const stale = k3sNode([READY]);
+  mkdirSync(join(stale.dir, "rv-k3s-keep-swag-server-19372"));
+  writeFileSync(join(stale.dir, "rv-k3s-keep-swag-server-19372", "pid"), "999999\n");
+  await stale.run();
+  assert.match(readFileSync(join(stale.dir, "pod.yaml"), "utf8"), /name: rv-swag-server-19372-keep\n/);
+});
+
+test("rv_k3s.sh deletes a kept pod whose setup or run broke, so the next run builds a sound one", async () => {
+  const node = k3sNode([READY]);
+  const failed = await node.run({ FAKE_SETUP_FAIL: "1" });
+  assert.equal(failed.code, 125);
+  assert.match(node.calls(), /delete pod rv-swag-server-19372-keep --wait=false/);
+  const hung = k3sNode([READY]);
+  hung.keep("Running", 60_000, NO_SCHEMA);
+  const result = await hung.run({ RV_RUN_TIMEOUT: "2", FAKE_HANG: "1" });
+  assert.equal(result.code, 124);
+  assert.match(hung.calls(), /delete pod rv-swag-server-19372-keep --wait=false/);
 });
 
 test("rv_k3s.sh does not count the time in the queue against the run", async () => {

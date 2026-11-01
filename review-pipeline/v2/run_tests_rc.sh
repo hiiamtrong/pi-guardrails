@@ -4,6 +4,7 @@
 # The trailing "; echo R0::..." rides inside the container's sh -c "... $*", and R[0-9]+:: survives its output filter.
 # Usage: run_tests_rc.sh <PR|worktree> <pytest args...>   (append to an evidence log with: | tee -a <log>)
 # Exit: pytest's rc; 3 if no rc line came back (the run is void, do not read it).
+# On k3s the PR's pod is kept between runs (databases included): RV_FRESH_POD=1 gives this run a throwaway pod with empty databases.
 [ -n "${RV:-}" ] || { f="$(dirname "$0")/../.pipeline-env"; [ ! -f "$f" ] || . "$f"; }  # run by hand: the /review-pr extension wrote the environment next to the tools
 RV=${RV:?set RV}
 [ -f "${HANDBOOK:-}" ] || { echo "ABORT: set RV, HANDBOOK and REVIEWER (the /review-pr extension does)" >&2; exit 2; }

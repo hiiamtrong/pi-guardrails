@@ -9,6 +9,7 @@ metadata:
     app: review-env
     rv/repo: __REPO__
     rv/pr: "__PR__"
+    rv/schema: "__SCHEMA__"
     rv/net: internet
 spec:
   priorityClassName: review-env

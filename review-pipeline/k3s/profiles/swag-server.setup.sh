@@ -2,6 +2,9 @@
 # shortcut: the settings below mirror tests/services.py `_service_environ` (all services on localhost); change them together.
 set -eu
 cd /usr/src/app
+# The PR's code arrives as sources only (tar drops __pycache__); compile it while the databases come up instead of letting the first pytest do it serially.
+python -m compileall -q -j 0 -o 0 swag libs tests >/dev/null 2>&1 &
+COMPILE=$!
 python - <<'PY'
 import time
 
@@ -59,3 +62,4 @@ export RATELIMIT_STORAGE_URI='$R/3?max_connections=1&socket_connect_timeout=5&pr
 ENV
 . /tmp/rv.env
 python -m alembic upgrade head > /tmp/alembic.log 2>&1 || { tail -20 /tmp/alembic.log; exit 1; }
+wait $COMPILE || true

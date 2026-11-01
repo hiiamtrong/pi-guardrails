@@ -58,7 +58,7 @@ function setup(trivial: number | Error) {
 test("sends ponytail-review exactly once on settle after a non-trivial code edit, and stays silent when nothing was touched", async () => {
   const { sent, options, states, handlers } = setup(0.1);
 
-  await handlers.agent_settled();
+  await handlers.agent_settled({ aborted: false });
   assert.deepEqual(sent, []);
 
   handlers.tool_call({
@@ -72,7 +72,7 @@ test("sends ponytail-review exactly once on settle after a non-trivial code edit
     toolName: "write",
     input: { path: "src/bar.ts", content: "export {}" },
   });
-  await handlers.agent_settled();
+  await handlers.agent_settled({ aborted: false });
   assert.deepEqual(sent, ["/skill:ponytail-review"]);
   assert.deepEqual(options, [
     { deliverAs: "followUp", expandPromptTemplates: true },
@@ -86,7 +86,7 @@ test("sends ponytail-review exactly once on settle after a non-trivial code edit
     },
   ]);
 
-  await handlers.agent_settled();
+  await handlers.agent_settled({ aborted: false });
   assert.deepEqual(sent, ["/skill:ponytail-review"]);
 });
 
@@ -96,14 +96,14 @@ test("skips ponytail-review when Jev is confident the change is trivial", async 
     toolName: "write",
     input: { path: "src/foo.ts", content: "const x = 1;" },
   });
-  await handlers.agent_settled();
+  await handlers.agent_settled({ aborted: false });
   assert.deepEqual(sent, []);
 });
 
 test("still reviews when Jev fails or the change is too large to send", async () => {
   const failing = setup(new Error("network down"));
   failing.handlers.tool_call({ toolName: "write", input: { path: "a.ts", content: "x" } });
-  await failing.handlers.agent_settled();
+  await failing.handlers.agent_settled({ aborted: false });
   assert.deepEqual(failing.sent, ["/skill:ponytail-review"]);
 
   const large = setup(0.99);
@@ -111,7 +111,16 @@ test("still reviews when Jev fails or the change is too large to send", async ()
     toolName: "write",
     input: { path: "a.ts", content: "x".repeat(70_000) },
   });
-  await large.handlers.agent_settled();
+  await large.handlers.agent_settled({ aborted: false });
   assert.deepEqual(large.sent, ["/skill:ponytail-review"]);
   assert.deepEqual(large.states, []);
+});
+
+test("does not review after an aborted run, then reviews the queued edits on the next settle", async () => {
+  const { sent, handlers } = setup(0.1);
+  handlers.tool_call({ toolName: "write", input: { path: "a.ts", content: "x" } });
+  await handlers.agent_settled({ aborted: true });
+  assert.deepEqual(sent, []);
+  await handlers.agent_settled({ aborted: false });
+  assert.deepEqual(sent, ["/skill:ponytail-review"]);
 });

@@ -1,4 +1,7 @@
 import { spawn } from "node:child_process";
+import { readFileSync, statSync } from "node:fs";
+import { resolve } from "node:path";
+import { editsOf } from "./edits.ts";
 import { askNoul } from "./jev.ts";
 
 type ToolCallResult = { block: true; reason: string } | undefined;
@@ -12,7 +15,6 @@ type ExtensionAPI = {
   ) => void;
 };
 
-type Edit = { newText?: unknown };
 type ToolInput = { path?: unknown; content?: unknown; edits?: unknown };
 type ToolCallEvent = { toolName?: unknown; input?: ToolInput };
 type ExtensionContext = {
@@ -259,7 +261,37 @@ function hasReviewableComment(
   );
 }
 
-function reviewableContext(path: string, text: string): string[] {
+// A suppression must match as a whole line: `# type: ignore` on a new line is a new suppression even when an old line has the same text.
+function commentKey(path: string, line: string): string {
+  const code = withoutQuotedStrings(path, line);
+  if (SUPPRESSION_COMMENT.test(code)) return line.trim();
+  const at = code.search(/#|\/\/|\/\*|--/);
+  return (at === -1 ? line : line.slice(at)).trim();
+}
+
+function existingComments(path: string, before: string | undefined): Set<string> {
+  const known = new Set<string>();
+  const lexicalState: LexicalState = {};
+  for (const line of (before ?? "").split("\n")) {
+    const startedInBlockComment = Boolean(lexicalState.blockCommentDepth);
+    const code = withoutQuotedStrings(path, line, lexicalState);
+    if (startedInBlockComment || hasReviewableComment(path, line, code)) known.add(commentKey(path, line));
+  }
+  return known;
+}
+
+// A rewrite that keeps a comment as it is must not send that comment back for review.
+function currentContent(path: string, cwd: string | undefined): string | undefined {
+  if (!cwd) return undefined;
+  try {
+    const file = resolve(cwd, path);
+    return statSync(file).size > 1_000_000 ? undefined : readFileSync(file, "utf8");
+  } catch {
+    return undefined;
+  }
+}
+
+function reviewableContext(path: string, text: string, known: Set<string> = new Set()): string[] {
   const lines = text.split("\n");
   const selected = new Set<number>();
   const reviewableLines = new Set<number>();
@@ -269,7 +301,8 @@ function reviewableContext(path: string, text: string): string[] {
     const startedInBlockComment = Boolean(lexicalState.blockCommentDepth);
     const code = withoutQuotedStrings(path, line, lexicalState);
     const reviewable =
-      startedInBlockComment || hasReviewableComment(path, line, code);
+      (startedInBlockComment || hasReviewableComment(path, line, code)) &&
+      !known.has(commentKey(path, line));
     if (reviewable) {
       reviewableLines.add(index);
       for (const candidate of [index - 1, index, index + 1]) {
@@ -288,20 +321,23 @@ function reviewableContext(path: string, text: string): string[] {
 
 export function extractReviewCandidate(
   event: ToolCallEvent,
+  cwd?: string,
 ): string | undefined {
   const path = event.input?.path;
   if (typeof path !== "string" || !CODE_FILE.test(path)) return undefined;
 
-  const additions =
+  const additions: { text: string; before?: string }[] =
     event.toolName === "write" && typeof event.input?.content === "string"
-      ? [event.input.content]
-      : event.toolName === "edit" && Array.isArray(event.input?.edits)
-        ? event.input.edits.flatMap((edit: Edit) =>
-            typeof edit.newText === "string" ? [edit.newText] : [],
+      ? [{ text: event.input.content, before: currentContent(path, cwd) }]
+      : event.toolName === "edit"
+        ? editsOf(event.input).flatMap((edit) =>
+            typeof edit.newText === "string"
+              ? [{ text: edit.newText, before: typeof edit.oldText === "string" ? edit.oldText : undefined }]
+              : [],
           )
         : [];
   const candidate = additions
-    .flatMap((text) => reviewableContext(path, text))
+    .flatMap(({ text, before }) => reviewableContext(path, text, existingComments(path, before)))
     .join("\n");
   return candidate || undefined;
 }
@@ -409,15 +445,27 @@ async function review(
   return stdout.trim();
 }
 
+/** The prompt asks for the verdict on line one. A reviewer that explains first still counts, but only through a line that is just the verdict, so a rule it quotes (`- APPROVE only when ...`) is not mistaken for one. */
+export function reviewerVerdict(output: string): "APPROVE" | "REJECT" | undefined {
+  const lead = output.trim().match(/^(APPROVE|REJECT)[ \t]*(?:$|\n|[:.\-–—*,!])/i);
+  if (lead) return lead[1].toUpperCase() as "APPROVE" | "REJECT";
+  for (const line of output.split("\n")) {
+    const match = line.match(/^[\s>*_`#|-]*(?:[Vv]erdict\s*[:\u2013\u2014-]?[\s*_`]*)?(APPROVE|REJECT)[\s*_`.:!]*$/);
+    if (match) return match[1] as "APPROVE" | "REJECT";
+  }
+  return undefined;
+}
+
 export default function (pi: ExtensionAPI): void {
   pi.on("tool_call", async (event: ToolCallEvent, ctx: ExtensionContext) => {
-    const proposedText = extractReviewCandidate(event);
     const path = event.input?.path;
-    if (!proposedText || typeof path !== "string") return;
+    if (typeof path !== "string") return;
 
     try {
+      const proposedText = extractReviewCandidate(event, ctx.cwd);
+      if (!proposedText) return;
       const verdict = await review(path, proposedText, ctx);
-      if (/^APPROVE\b/i.test(verdict)) return;
+      if (reviewerVerdict(verdict) === "APPROVE") return;
       return {
         block: true,
         reason: `Comment reviewer rejected this change: ${verdict || "no verdict returned"}`,

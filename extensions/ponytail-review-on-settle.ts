@@ -1,3 +1,4 @@
+import { editsOf } from "./edits.ts";
 import { askNoul, MAX_STATE_CHARS } from "./jev.ts";
 
 type ExtensionAPI = {
@@ -20,7 +21,7 @@ type Edit = { path: string; before?: string; after: string };
 const CODE_FILE =
   /\.(?:c|cc|cpp|cs|cxx|go|h|hpp|hxx|java|js|jsx|mjs|php|py|rb|rs|sh|sql|swift|ts|tsx)$/i;
 const TRIVIAL =
-  "Each edit in `edits` only changes wording, names, formatting, or literal values between `before` and `after`, without adding or changing any logic, condition, operator, or control flow";
+  "Each edit in `edits` only changes wording, names, formatting, or literal values between `before` and `after`, without adding or changing any logic, condition, operator, or control flow, and without flipping a boolean or default flag or lowering a security setting such as a hash cost, key size, token expiry, or permission";
 
 export function isReviewableEdit(event: ToolCallEvent): string | undefined {
   if (event.toolName !== "write" && event.toolName !== "edit") return undefined;
@@ -30,10 +31,9 @@ export function isReviewableEdit(event: ToolCallEvent): string | undefined {
 }
 
 function toEdits(path: string, event: ToolCallEvent): Edit[] {
-  const { content, edits } = event.input ?? {};
+  const { content } = event.input ?? {};
   if (typeof content === "string") return [{ path, after: content }];
-  if (!Array.isArray(edits)) return [];
-  return edits.map((edit: { oldText?: unknown; newText?: unknown }) => ({
+  return editsOf(event.input).map((edit) => ({
     path,
     before: String(edit.oldText ?? ""),
     after: String(edit.newText ?? ""),

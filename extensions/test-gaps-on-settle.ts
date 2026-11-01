@@ -21,7 +21,7 @@ const JS_EXTENSIONS = ["", ".ts", ".tsx", ".js", ".jsx", ".mjs", "/index.ts", "/
 const CHECKLIST = [
   "a typical valid input returns the expected result (happy path)",
   "empty input (empty string, list, map, or object)",
-  "null, undefined, or None input",
+  "null, undefined, or None input, only where the function's signature or types allow it",
   "a value exactly at a limit or threshold",
   "a value just past a limit or threshold",
   "zero or negative numbers",

@@ -21,6 +21,10 @@ The GitHub write and identity gates fail closed when the required condition cann
 - Confirms `gh` mutations, dynamic subprocess argv, GitHub API POST/PUT/PATCH/DELETE calls, `git push`, and GitHub MCP mutation tools such as review-thread resolution.
 - Defaults to confirmation when an action cannot be proven read-only.
 - Redacts GitHub tokens from the confirmation preview.
+- Reads a command the way a shell runs it. Text is not a command: heredoc bodies (unless a shell or interpreter reads them), quoted strings, `# comments`, `echo '... git push ...'` and `which gh` never trigger it, and neither does `git push --dry-run`. Indirect forms do: `eval`, `echo '...' | sh`, `sh <<< '...'`, `python -c`/`node -e`/`perl -e`/`ruby -e` and heredocs fed to an interpreter, `$(which git) push`, simple `name=word` variables, line continuations, `timeout`/`stdbuf`/`setsid` wrappers, and `<(...)`.
+- Every GitHub call in a command must be a read, so `gh pr view 1; curl -X POST https://api.github.com/...` is confirmed. `gh pr checkout` and `gh repo clone` only change the local checkout and are allowed. A GraphQL `query` (not `mutation`) sent with `curl` is a read.
+- Script code (`ctx_execute`, `python -c`) counts as a GitHub call only when it runs `gh`, uses an SDK (Octokit, PyGithub), or makes an HTTP request to github.com. A GET with no body, method override or positional data argument is a read; `import subprocess as sp` and `from subprocess import run` are resolved. An HTTP client the check cannot read (`urllib3`, `http.client`, `pycurl`, `got`, `superagent`, `HTTParty`...) next to a GitHub URL or host always asks. With `requests`, `httpx`, `aiohttp`, `urllib.request`, `axios` or `node-fetch` imported (also under an alias, or as `from requests import post`), any `post`, `put`, `patch`, `delete` or `request` call next to a GitHub URL asks too.
+- GitHub MCP calls are matched by the adapter's `server`/`tool` too (`mcp` with `server: github`, `...__mcp__github`, `gh_*` tool names).
 
 ### Write allowlist
 
@@ -34,11 +38,13 @@ By default every GitHub write requires confirmation. To bypass confirmation for 
 }
 ```
 
-The allowlist is case-insensitive. The write must identify its repository explicitly, for example `gh repo edit hiiamtrong/example-repo ...`, `gh --repo hiiamtrong/example-repo ...`, a GitHub URL, or MCP `owner`/`repo` input. Unknown targets, including `git push origin`, remain confirmation-gated.
+The allowlist is case-insensitive. The write must identify its repository explicitly, for example `gh repo edit hiiamtrong/example-repo ...`, `gh --repo hiiamtrong/example-repo ...`, a GitHub URL given as an argument (`gh pr edit https://github.com/owner/repo/pull/3`), or MCP `owner`/`repo` input. A URL inside text you wrote (`--body`, `--title`, `-m`, `-d`, `-f body=...`) does not count. Unknown targets, including `git push origin`, remain confirmation-gated.
+
+The prompt is skipped only when **every** write in the call names an allowlisted repository. A chained write to another repository, a `git push`, or script code that calls GitHub still asks, even if one part of the command targets an allowlisted repo.
 
 ## Git Identity Guard requirement
 
-`github-identity-guard-required` checks Bash, `ctx_execute`, and batched commands for Git commits/pushes and GitHub writes. If the working repository lacks a configured Git Identity Guard runner, it blocks the command; it never installs a guard implicitly.
+`github-identity-guard-required` checks Bash, `ctx_execute`, and batched commands for Git commits/pushes and GitHub writes. It also covers the other commands that create commits with your configured author: `git merge`, `rebase`, `cherry-pick`, `revert` and `am`. Dry runs and non-committing forms (`--dry-run`, `--abort`, `--quit`, `--no-commit`, `--ff-only`) are not guarded. `git pull`, `git tag -a` and `git commit-tree`, and git run on another host (`ssh host 'git push'`), are not guarded. If the working repository lacks a configured Git Identity Guard runner, it blocks the command; it never installs a guard implicitly.
 
 Install [Git Identity Guard](https://github.com/hiiamtrong/git-identity-guard) in each repository before committing or pushing:
 
@@ -101,11 +107,13 @@ Reload Pi with `/reload` or restart it after installation.
 
 `comment-guard` reviews comments in code files before accepting them. It also reviews type/linter suppression comments and `from __future__ import annotations`, and blocks the write if no reviewer can run.
 
+Only new or changed comments are reviewed. For an `edit` the comments already in `oldText` are skipped, and for a `write` the comments already in the file on disk are skipped, so changing code next to an old comment does not send that comment back. A suppression is skipped only when the whole line is unchanged. `edits` sent as a JSON string are read like an array. The Pi reviewer's verdict is the start of its output, or else the first line that is only the verdict (`APPROVE`, `**REJECT**`, `Verdict: APPROVE`), so a reviewer that explains first still counts and a rule it quotes (`- APPROVE only when ...`) does not.
+
 When a TypeSafe key is configured (see [Jev decisions](#jev-decisions)), Jev scores each change on three questions: does every comment document a non-obvious reason (`documentsWhy`), does one restate the code (`restatesCode`), and does it add an unexplained suppression (`unverifiedSuppression`). It rejects when `restatesCode` or `unverifiedSuppression` is ≥ 0.8 or `documentsWhy` is ≤ 0.2, and approves when `documentsWhy` ≥ 0.6, `restatesCode` ≤ 0.4, and `unverifiedSuppression` ≤ 0.2. Everything in between, and any Jev failure, falls back to the read-only Pi reviewer.
 
 ## Ponytail review on settle
 
-`ponytail-review-on-settle` sends `/skill:ponytail-review` once a turn settles after editing code files. With Jev configured, it first sends each edit's `before`/`after` text and skips the review when Jev is at least 0.8 confident the edits only change wording, names, formatting, or literal values without adding or changing any logic, condition, operator, or control flow. Jev failures and changes over 60,000 characters always get reviewed.
+`ponytail-review-on-settle` sends `/skill:ponytail-review` once a turn settles after editing code files. With Jev configured, it first sends each edit's `before`/`after` text and skips the review when Jev is at least 0.8 confident the edits only change wording, names, formatting, or literal values without adding or changing any logic, condition, operator, or control flow, and without flipping a boolean or default flag or lowering a security setting (hash cost, key size, token expiry, permission). Jev failures and changes over 60,000 characters always get reviewed.
 
 ## Test gaps on settle
 
@@ -243,5 +251,14 @@ node --experimental-strip-types bench/jev-bench.ts "" holdout    # all three on 
 ```
 
 `bench/holdout/` (16 + 16 + 15 cases) was written before the thresholds and questions were tuned on the main set; use it to check that a change generalizes instead of fitting the main set.
+
+Two more runners are not tied to the tuned set above:
+
+```bash
+node --experimental-strip-types bench/guards-bench.ts     # offline: the two GitHub guards, ~250 labelled commands and 31 state checks
+node --experimental-strip-types bench/fresh-bench.ts      # real Jev: comment-guard, ponytail, test-gaps on newly written cases
+```
+
+`guards-bench.ts` reports missed writes (a write got through) and blocked reads separately, and lists `edge` cases that are not scored, such as `ssh host 'git push'`. `fresh-bench.ts` takes one optional argument (`comment-guard`, `ponytail` or `test-gaps`).
 
 It reads the same TypeSafe settings as the extensions and costs well under $0.01 per full run. `comment-guard` runs with a stub Pi reviewer that always answers `DEFER`, so cases Jev leaves undecided show up as deferred instead of spawning Pi. The `test-gaps` report includes recall and precision for several gap thresholds, computed from the recorded scores.

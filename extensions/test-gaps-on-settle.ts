@@ -173,7 +173,9 @@ export default function (pi: ExtensionAPI): void {
     touched.set(resolve(ctx.cwd, input.path), ctx.cwd);
   });
 
-  pi.on("agent_settled", async () => {
+  pi.on("agent_settled", async (event) => {
+    // An aborted run (Escape) means the user took over; the touched tests stay queued for the next settle.
+    if ((event as { aborted: boolean }).aborted) return;
     const files = [...touched];
     touched.clear();
     const report: string[] = [];

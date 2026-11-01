@@ -315,7 +315,7 @@ test("ignores error paths of functions the test does not use", async () => {
   });
 
   touch("test/age.test.ts");
-  await handlers.agent_settled();
+  await handlers.agent_settled({ aborted: false });
 
   assert.ok(sent[0][0].includes('"age is required"'));
   assert.ok(!sent[0][0].includes("unrelated failure"));
@@ -325,7 +325,7 @@ test("reports untested relevant cases once after a test file is written", async 
   const { sent, handlers, touch, root } = setup(files);
 
   touch("test/age.test.ts");
-  await handlers.agent_settled();
+  await handlers.agent_settled({ aborted: false });
 
   assert.equal(sent.length, 1);
   const [text, options] = sent[0];
@@ -339,19 +339,19 @@ test("reports untested relevant cases once after a test file is written", async 
   assert.ok(!text.includes("negative numbers"), "irrelevant case must not be reported");
 
   touch("test/age.test.ts", "edit");
-  await handlers.agent_settled();
+  await handlers.agent_settled({ aborted: false });
   assert.equal(sent.length, 1, "the same gaps are never reported twice");
 });
 
 test("remembers reported gaps across a reload", async () => {
   const first = setup(files);
   first.touch("test/age.test.ts");
-  await first.handlers.agent_settled();
+  await first.handlers.agent_settled({ aborted: false });
   assert.equal(first.sent.length, 1);
 
   const reloaded = first.reload();
   reloaded.touch("test/age.test.ts");
-  await reloaded.handlers.agent_settled();
+  await reloaded.handlers.agent_settled({ aborted: false });
   assert.deepEqual(reloaded.sent, []);
 });
 
@@ -361,7 +361,7 @@ test("treats an empty, null, or non-object state file as nothing reported", asyn
     mkdirSync(join(state.reportedFile, ".."), { recursive: true });
     writeFileSync(state.reportedFile, content);
     state.touch("test/age.test.ts");
-    await state.handlers.agent_settled();
+    await state.handlers.agent_settled({ aborted: false });
     assert.equal(state.sent.length, 1, `state file ${JSON.stringify(content)}`);
     assert.equal(Object.keys(JSON.parse(readFileSync(state.reportedFile, "utf8"))).length, 2);
   }
@@ -371,7 +371,7 @@ test("still delivers the report when the state file cannot be written", async ()
   const state = setup(files);
   writeFileSync(join(process.env.HOME as string, ".pi"), "not a directory");
   state.touch("test/age.test.ts");
-  await assert.rejects(Promise.resolve(state.handlers.agent_settled()), /ENOTDIR|EEXIST/);
+  await assert.rejects(Promise.resolve(state.handlers.agent_settled({ aborted: false })), /ENOTDIR|EEXIST/);
   assert.equal(state.sent.length, 1);
 });
 
@@ -380,7 +380,7 @@ test("reports again after 30 days and survives a corrupt state file", async () =
   mkdirSync(join(state.reportedFile, ".."), { recursive: true });
   writeFileSync(state.reportedFile, "{not json");
   state.touch("test/age.test.ts");
-  await state.handlers.agent_settled();
+  await state.handlers.agent_settled({ aborted: false });
   assert.equal(state.sent.length, 1);
 
   const stamps = JSON.parse(readFileSync(state.reportedFile, "utf8"));
@@ -388,7 +388,7 @@ test("reports again after 30 days and survives a corrupt state file", async () =
   writeFileSync(state.reportedFile, JSON.stringify(Object.fromEntries(Object.keys(stamps).map((key) => [key, old]))));
   const reloaded = state.reload();
   reloaded.touch("test/age.test.ts");
-  await reloaded.handlers.agent_settled();
+  await reloaded.handlers.agent_settled({ aborted: false });
   assert.equal(reloaded.sent.length, 1, "gaps reported over 30 days ago are reported again");
   assert.ok(Object.values(JSON.parse(readFileSync(state.reportedFile, "utf8"))).every((at) => (at as number) > old));
 });
@@ -399,7 +399,7 @@ test("ignores non-test edits and stays silent when Jev fails", async () => {
   quiet.handlers.tool_call({ toolName: "read", input: { path: "test/age.test.ts" } }, { cwd: quiet.root });
   for (const input of [undefined, {}, { path: null }, { path: 42 }])
     quiet.handlers.tool_call({ toolName: "write", input }, { cwd: quiet.root });
-  await quiet.handlers.agent_settled();
+  await quiet.handlers.agent_settled({ aborted: false });
   assert.deepEqual(quiet.sent, []);
   assert.equal(quiet.calls(), 0);
 
@@ -407,6 +407,16 @@ test("ignores non-test edits and stays silent when Jev fails", async () => {
     throw new Error("network down");
   }) as typeof fetch);
   failing.touch("test/age.test.ts");
-  await failing.handlers.agent_settled();
+  await failing.handlers.agent_settled({ aborted: false });
   assert.deepEqual(failing.sent, []);
+});
+
+test("reports nothing after an aborted run, then reports the queued test on the next settle", async () => {
+  const state = setup(files);
+  state.touch("test/age.test.ts");
+  await state.handlers.agent_settled({ aborted: true });
+  assert.deepEqual(state.sent, []);
+  assert.equal(state.calls(), 0);
+  await state.handlers.agent_settled({ aborted: false });
+  assert.equal(state.sent.length, 1);
 });

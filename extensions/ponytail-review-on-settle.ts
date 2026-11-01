@@ -60,8 +60,9 @@ export default function (pi: ExtensionAPI): void {
 
   // ponytail: agent_end can fire mid-retry/before compaction-resume; agent_settled
   // is pi's documented once-per-run "no further automatic continuation" signal.
-  pi.on("agent_settled", async () => {
-    if (edits.length === 0) return;
+  pi.on("agent_settled", async (event) => {
+    // An aborted run (Escape) means the user took over; the edits stay queued for the next settle.
+    if ((event as { aborted: boolean }).aborted || edits.length === 0) return;
     // The Jev call can outlast idle time, so a new user turn may already be streaming.
     if (!(await isTrivial(edits.splice(0))))
       pi.sendUserMessage("/skill:ponytail-review", {

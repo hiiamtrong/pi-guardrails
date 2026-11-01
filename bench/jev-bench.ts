@@ -144,7 +144,7 @@ async function benchPonytail() {
           : { toolName: "edit", input: { path: edit.path, edits: [{ oldText: text(edit.before), newText: text(edit.after) }] } },
       );
     const before = sent;
-    const { made } = await tracked(() => handlers.agent_settled({}));
+    const { made } = await tracked(() => handlers.agent_settled({ aborted: false }));
     const got = made.some((call) => !call.ok) ? "ERROR" : sent > before ? "review" : "skip";
     rows.push({ ...c, got, detail: scores(made) });
   }

@@ -1,6 +1,6 @@
 # Pi GitHub Guards
 
-A Pi package with ten workflow and security extensions:
+A Pi package with eleven workflow and security extensions:
 
 - **`comment-guard`** reviews new code comments, suppressions, and Python future annotations before they are written.
 - **`ponytail-review-on-settle`** runs `/skill:ponytail-review` after a turn that edited code, unless the edits were trivial.
@@ -12,6 +12,7 @@ A Pi package with ten workflow and security extensions:
 - **`compact-continue`** resumes the run once after Pi compacts the context at the end of a run, so the task is not left waiting for you.
 - **`session-auto-name`** names each session after its work, keeps the name current as the work changes, and renames the Orca tab to match.
 - **`worktree-bootstrap`** configures a personal, per-repository `post-checkout` bootstrap hook that copies selected ignored files into new Git worktrees.
+- **`whoami`** gives the agent a `whoami` tool that returns who you are in the current project (role, client, context) from Markdown files you write under `~/.pi/agent/whoami/`, and `/whoami-init` to create them.
 
 The GitHub write and identity gates fail closed when the required condition cannot be verified.
 
@@ -98,6 +99,7 @@ ln -sf "$PWD/extensions/worktree-bootstrap.ts" ~/.pi/agent/extensions/worktree-b
 ln -sf "$PWD/extensions/ponytail-review-on-settle.ts" ~/.pi/agent/extensions/ponytail-review-on-settle.ts
 ln -sf "$PWD/extensions/test-gaps-on-settle.ts" ~/.pi/agent/extensions/test-gaps-on-settle.ts
 ln -sf "$PWD/extensions/review-pipeline.ts" ~/.pi/agent/extensions/review-pipeline.ts   # dev only: delete this link once the package that ships the extension is installed, or it loads twice
+ln -sf "$PWD/extensions/whoami.ts" ~/.pi/agent/extensions/whoami.ts
 cp config/github-write-confirm.example.json ~/.pi/agent/github-write-confirm.json
 ```
 
@@ -204,6 +206,12 @@ Jev receives the proposed code text, and `test-gaps-on-settle` sends whole test 
 Only human-authored discussion, review, and inline comments are archived. Terminal control sequences are removed before archived content is displayed.
 
 After each `sync`, newly archived comments of at least 80 characters are handed to the agent as a follow-up message asking it to store the durable ones with `memory_add`, so the guidance stays searchable in later sessions. Comment text is delimited and marked as untrusted data. A per-repository watermark keeps a later `sync` from proposing the same comments again.
+
+## Who am I
+
+The `whoami` tool (no parameters) returns `~/.pi/agent/whoami/default.md` (who you are in general) followed by the current project's file, `~/.pi/agent/whoami/<key>.md`, where `<key>` is the canonical repository path encoded the same way as the folders in `~/.pi/agent/memory/projects/` (for example `-Users-you-Works-client-repo.md`; a linked worktree maps to its main repository). Both files are free-form Markdown that you write by hand: role, client, team, contacts, conventions. The tool reads them verbatim; a missing file is reported as a `Missing: <path>` line, and a file it cannot read (for example a permission error) makes the tool fail. Nothing is written to the repository.
+
+Set up a project with `/whoami-init` run inside it: it creates private (`0600`) templates for `default.md` and the project file, and never overwrites a file that exists. Once at least one of the two files exists, the system prompt gets a short hint saying that the `whoami` tool exists and when to call it (before writing on your behalf, or when the client or your role changes the answer). The hint does not contain your text, so the files can be long. A project with no whoami file gets no hint.
 
 ## Personal worktree bootstrap
 

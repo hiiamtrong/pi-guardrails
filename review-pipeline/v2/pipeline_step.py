@@ -56,6 +56,10 @@ def widget_lines(pr, events, now):
 
 def emit(work, pr, step, state, msg='', **extra):
     work.mkdir(parents=True, exist_ok=True)
+    # The pane the pi that works on this review runs in, rewritten at every event: the owner pid goes stale when pi is restarted in the
+    # same pane (pi --continue), the pane does not. Orca's own tools (Plugboard) use it to open the session that holds the review.
+    if os.environ.get('ORCA_PANE_KEY'):
+        (work / 'orca_pane').write_text(os.environ['ORCA_PANE_KEY'])
     event = {'ts': time.time(), 'step': step, 'state': state, 'msg': msg, **extra}
     with open(work / 'events.jsonl', 'a') as f:
         f.write(json.dumps(event, ensure_ascii=False) + '\n')

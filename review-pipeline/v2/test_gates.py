@@ -94,9 +94,9 @@ sys.path.insert(0, str(HERE))
 import pipeline_ui
 
 
-def step(rv, *args, check=True):
+def step(rv, *args, check=True, env=None):
     done = subprocess.run([sys.executable, '-I', str(HERE / 'pipeline_step.py'), *args],
-                          env={'RV': rv, 'PATH': '/usr/bin:/bin', 'PYTHONDONTWRITEBYTECODE': '1'}, capture_output=True, text=True)
+                          env={'RV': rv, 'PATH': '/usr/bin:/bin', 'PYTHONDONTWRITEBYTECODE': '1', **(env or {})}, capture_output=True, text=True)
     if check:
         assert done.returncode == 0, done.stderr
     return done
@@ -180,6 +180,21 @@ class Owner(Session):
         done, data = begin(self.rv, '1', '--owner', str(self.sleeper()))
         self.assertEqual(done.returncode, 0)
         self.assertTrue(data['resumed'])
+
+
+class OrcaPane(Session):
+    def test_every_event_records_the_orca_pane_it_ran_in_and_without_orca_leaves_it_alone(self):
+        pane = gates(self.rv, '1') / 'orca_pane'
+        step(self.rv, 'begin', '1', '--no-open', env={'ORCA_PANE_KEY': 'tabA:leafA'})
+        self.assertEqual(pane.read_text(), 'tabA:leafA')
+        step(self.rv, 'note', '1', '00', '--msg', 'x', env={'ORCA_PANE_KEY': 'tabB:leafB'})
+        self.assertEqual(pane.read_text(), 'tabB:leafB', 'a pi restarted in another pane takes the review over')
+        step(self.rv, 'note', '1', '00', '--msg', 'y')
+        self.assertEqual(pane.read_text(), 'tabB:leafB')
+
+    def test_no_pane_file_outside_orca(self):
+        step(self.rv, 'begin', '1', '--no-open')
+        self.assertFalse((gates(self.rv, '1') / 'orca_pane').exists())
 
 
 class Server(Session):

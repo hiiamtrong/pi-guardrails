@@ -238,3 +238,17 @@ test("a title starting with -- reaches the Orca rename as a single --title= argu
 	assert.equal(t.name(), "--flag-like title");
 	assert.deepEqual(t.exec[0], ["terminal", "rename", "--terminal", "term_x", "--title=--flag-like title"]);
 });
+
+test("the assistant's last reply is sent so a subject-less request can be named", async () => {
+	const t = setup({ branch: [msg("user", "fix theo screenshot"), msg("assistant", "Đã fix: pytest collect được 11969 test"), msg("assistant", "x".repeat(700))] });
+	await t.turn();
+	const prompt = t.prompts[0];
+	assert.ok(prompt.includes(`Assistant's last reply:\n${"x".repeat(600)}`));
+	assert.ok(!prompt.includes("x".repeat(601)));
+});
+
+test("no reply section is sent before the assistant has answered", async () => {
+	const t = setup();
+	await t.turn();
+	assert.ok(!t.prompts[0].includes("Assistant's last reply"));
+});

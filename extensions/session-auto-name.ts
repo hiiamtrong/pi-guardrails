@@ -34,11 +34,18 @@ const ENTRY = "session-auto-name";
 const CONFIG = process.env.SESSION_AUTO_NAME_CONFIG ?? join(homedir(), ".pi", "agent", "session-auto-name.json");
 const FAST_MODEL = ["claude-bridge", "claude-haiku-5-5"] as const;
 const MAX_NAME_LENGTH = 48;
-const SYSTEM_PROMPT = `You keep the title of a coding-agent session accurate.
-You get the current title (or "none"), earlier titles, the user's first request and the latest requests.
-If the current title still describes the session's work, output exactly KEEP.
-Otherwise output a new title (max ${MAX_NAME_LENGTH} characters) naming the overall task. If the work widened (for example another PR), cover both. Do not reuse an earlier title unless it truly fits.
-Use the language of the user's requests. Output only KEEP or the title: no quotes, no explanation.`;
+const SYSTEM_PROMPT = `You keep the title of a coding-agent session accurate and specific.
+You get the current title (or "none"), earlier titles, the user's first request, the latest requests and the assistant's last reply.
+If the current title still describes the session's work, output exactly KEEP. A vague title (only a verb and a generic noun) does not count: replace it.
+Otherwise output a new title (max ${MAX_NAME_LENGTH} characters) shaped "<action> <specific subject>". Rules:
+- Name the concrete subject: PR or ticket number, feature, file, service, error. Take identifiers from the requests and the reply, never invent one. Use PR, ticket and issue numbers, but skip opaque ids (hashes, Slack timestamps, UUIDs).
+- A generic word alone is not a subject: task, issue, bug, question, screenshot, tool, flow, answer, research. Bad: "Fix from screenshot", "Khảo sát & trả lời câu hỏi", "Review code". Good: "Fix pytest collect 11969 tests", "Review PR #19408".
+- If the requests carry no subject (for example "fix this" with an image), take it from the assistant's last reply.
+- Name the overall task, not the latest step. If the work widened (for example another PR), cover both. If it moved to unrelated work, rename it. Do not reuse an earlier title unless it truly fits.
+- Leave the repo and branch name out: the sidebar shows them already.
+- Use the language of the user's requests; keep technical terms, identifiers and ids as written.
+- A label, not a sentence: no question, no trailing period, no quotes.
+Output only KEEP or the title: no explanation.`;
 
 function textOf(message: { content?: unknown } | undefined): string {
 	const content = message?.content;
@@ -115,12 +122,17 @@ export default function (pi: ExtensionAPI) {
 			.flatMap((e) => (e.type === "message" && e.message?.role === "user" ? [textOf(e.message).trim()] : []))
 			.filter((t) => t && !t.startsWith("<skill") && !t.startsWith("["));
 		if (requests.length === 0) return;
+		const reply = entries
+			.flatMap((e) => (e.type === "message" && e.message?.role === "assistant" ? [textOf(e.message).trim()] : []))
+			.filter(Boolean)
+			.at(-1);
 		const latest = [...new Set(requests.slice(-2))].filter((t) => t !== requests[0]);
 		const prompt = [
 			`Current title: ${current ?? "none"}`,
 			`Earlier titles: ${names.length ? names.join(" | ") : "none"}`,
 			`First request:\n${requests[0].slice(0, 600)}`,
 			`Latest requests:\n${latest.map((t) => t.slice(0, 600)).join("\n---\n") || "(same as first)"}`,
+			...(reply ? [`Assistant's last reply:\n${reply.slice(0, 600)}`] : []),
 		].join("\n\n");
 		inFlight = true;
 		void review(ctx, prompt, current).finally(() => (inFlight = false));

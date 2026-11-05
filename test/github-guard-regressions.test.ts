@@ -378,3 +378,17 @@ test("the identity guard blocks, not crashes, when the directory or the runner i
         execFileSync("git", ["-C", repo, "config", `identity.guard.${key}`, value], { stdio: "ignore" });
     assert.match(handler(bash("git commit -m x"), { cwd: repo })?.reason ?? "", /Install Git Identity Guard/);
 });
+
+test("ctx_batch of context-mode 2.x, with plain string commands, is guarded like ctx_batch_execute", () => {
+    for (const toolName of ["ctx_batch", "context-mode.ctx_batch"]) {
+        assert.notEqual(confirm.githubWriteReason({ toolName, input: { commands: ["echo hi", "gh pr merge 1"] } }), undefined, toolName);
+        assert.notEqual(confirm.githubWriteReason({ toolName, input: { commands: ["git push origin main"] } }), undefined, toolName);
+        assert.equal(confirm.githubWriteReason({ toolName, input: { commands: ["gh pr view 1", "echo hi"] } }), undefined, toolName);
+    }
+    const repo = mkdtempSync(join(dir, "batch2-"));
+    execFileSync("git", ["init", repo], { stdio: "ignore" });
+    const event = { toolName: "ctx_batch", input: { commands: ["echo ok", "git commit -m x"] } };
+    assert.equal(identityHandler()(event, { cwd: repo })?.block, true);
+    const combined = { toolName: "ctx_batch", input: { commands: ["gh auth switch -u x", "gh pr merge 1"] } };
+    assert.match(identityHandler()(combined, { cwd: repo })?.reason ?? "", /as its own command/);
+});

@@ -973,19 +973,20 @@ function isCtxExecuteTool(toolName: string): boolean {
   return toolName === "ctx_execute" || toolName.endsWith(".ctx_execute");
 }
 
-function batchCommands(input: ToolInput | undefined): string[] {
+export function batchCommands(input: ToolInput | undefined): string[] {
   if (!Array.isArray(input?.commands)) return [];
+  // ctx_batch_execute takes {label, command} objects, ctx_batch (context-mode 2.x) plain strings.
   return input.commands.flatMap((entry) =>
-    entry && typeof entry === "object" && typeof entry.command === "string"
-      ? [entry.command]
-      : [],
+    typeof entry === "string"
+      ? [entry]
+      : entry && typeof entry === "object" && typeof entry.command === "string"
+        ? [entry.command]
+        : [],
   );
 }
 
-function isCtxBatchExecuteTool(toolName: string): boolean {
-  return (
-    toolName === "ctx_batch_execute" || toolName.endsWith(".ctx_batch_execute")
-  );
+export function isCtxBatchExecuteTool(toolName: string): boolean {
+  return /(^|\.)ctx_batch(_execute)?$/.test(toolName);
 }
 
 function runtimeShellCommands(code: string): string[] {
@@ -1382,7 +1383,7 @@ export function githubWriteReason(event: ToolCallEvent): string | undefined {
     const commands = batchCommands(event.input);
     if (commands.some(shellPushes)) return "git push may mutate a GitHub remote";
     return commands.some(shellWritesGithub)
-      ? "ctx_batch_execute contains a GitHub write or cannot be proven read-only"
+      ? `${toolName.replace(/^.*\./, "")} contains a GitHub write or cannot be proven read-only`
       : undefined;
   }
 

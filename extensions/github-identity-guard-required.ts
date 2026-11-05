@@ -2,6 +2,7 @@ import { execFileSync } from "node:child_process";
 import { existsSync } from "node:fs";
 import { join } from "node:path";
 import {
+  batchCommands,
   githubMcpToolName,
   githubWriteAction,
   githubWriteReason,
@@ -9,6 +10,7 @@ import {
   guardedGitRuntimeAction,
   guardedGitTargets,
   hasGhAuthSwitchCommand,
+  isCtxBatchExecuteTool,
 } from "./github-write-confirm.ts";
 
 type ToolInput = {
@@ -27,15 +29,6 @@ type ExtensionApi = {
     handler: (event: ToolCallEvent, ctx: ExtensionContext) => ToolCallResult,
   ) => void;
 };
-
-function batchCommands(input: ToolInput | undefined): string[] {
-  if (!Array.isArray(input?.commands)) return [];
-  return input.commands.flatMap((entry) =>
-    entry && typeof entry === "object" && typeof entry.command === "string"
-      ? [entry.command]
-      : [],
-  );
-}
 
 function repositoryPath(cwd: string): string | undefined {
   try {
@@ -116,9 +109,7 @@ export default function (pi: ExtensionApi): void {
     const commands = batchCommands(event.input);
     const isCtxExecute =
       toolName === "ctx_execute" || toolName.endsWith(".ctx_execute");
-    const isCtxBatch =
-      toolName === "ctx_batch_execute" ||
-      toolName.endsWith(".ctx_batch_execute");
+    const isCtxBatch = isCtxBatchExecuteTool(toolName);
     const githubReason = githubWriteReason(event);
     const isGithubMcpMutation =
       githubMcpToolName(event) !== undefined && githubReason !== undefined;

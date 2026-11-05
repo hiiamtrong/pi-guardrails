@@ -747,10 +747,6 @@ class ImpactMapGate(unittest.TestCase):
         self.assertEqual(rc, 1)
 
 
-if __name__ == '__main__':
-    unittest.main()
-
-
 class DraftVoice(unittest.TestCase):
     """check_draft: a body that reads like a colleague, and a gate that does not force odd sentences into it."""
 
@@ -803,3 +799,112 @@ class DraftVoice(unittest.TestCase):
         call = 'some_long_call(first_argument, second_argument, third_argument, fourth_argument, fifth_argument, sixth_argument, seventh_argument, eighth_argument, ninth_argument)'
         code = f'```\\n{call}\\n{call}\\n```'
         self.assertIsNone(self.cd.repeated_phrase('Please add this test.\n' + code))
+
+
+class SummaryGate(unittest.TestCase):
+    """check_draft summary: the approver reads verdict, the author's to-do and the after-deploy list first (a DEV check cannot block a merge)."""
+
+    @classmethod
+    def setUpClass(cls):
+        sys.path.insert(0, str(HERE))
+        import check_draft
+        cls.cd = check_draft
+
+    BODY = '\n'.join(f'{i}. {label}: No' for i, label in enumerate(
+        ['Breaks current production behaviour', 'Feature flag', 'Serious bug', 'Architecture', 'Style and conventions', 'AI misuse', 'Hard to follow'], 1))
+
+    def summary(self, todo='- [ ] Fix `app/mod.py:12`, done when `pytest tests/test_mod.py` passes.', after='- [ ] AC-5: open the page on dev. Seen: 200.',
+                theo='Không có.', answers=None):
+        rows = '\n'.join(f'| {i} | x | {(answers or {}).get(i, "No")} | y |' for i in range(1, 8))
+        return (f'## {self.cd.SUMMARY}\n\n**Kết luận:** `REQUEST_CHANGES`: một lỗi.\n\n| # | Điểm | Trả lời | Một dòng |\n|---|---|---|---|\n{rows}\n\n'
+                f'**{self.cd.AUTHOR_TODO}**\n\n{todo}\n\n**{self.cd.AFTER_DEPLOY} (không chặn merge, tác giả ghi kết quả vào ticket):**\n\n{after}\n\n'
+                f'**{self.cd.FOR_THEO}**\n\n{theo}\n\n## PR này làm gì\n\nx\n')
+
+    def gate(self, text, event='REQUEST_CHANGES'):
+        import contextlib
+        import io
+        self.cd.results.clear()
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.cd.check_summary(text, self.BODY, event)
+        return out.getvalue()
+
+    def test_a_complete_summary_passes(self):
+        out = self.gate(self.summary())
+        self.assertNotIn('FAIL', out)
+        self.assertIn('PASS   summary-todo', out)
+
+    def test_a_draft_without_the_section_fails(self):
+        self.assertIn('FAIL   summary ', self.gate('## PR này làm gì\n\nx\n'))
+
+    def test_request_changes_needs_something_for_the_author_to_do(self):
+        self.assertIn('FAIL   summary-todo', self.gate(self.summary(todo='Không có.')))
+
+    def test_an_approve_may_have_nothing_left(self):
+        self.assertIn('PASS   summary-todo', self.gate(self.summary(todo='Không còn việc nào chặn merge.'), 'APPROVE'))
+
+    def test_a_todo_with_no_place_to_look_fails(self):
+        self.assertIn('FAIL   summary-todo', self.gate(self.summary(todo='- [ ] Please fix the bug.')))
+
+    def test_an_empty_after_deploy_block_fails(self):
+        self.assertIn('FAIL   summary ', self.gate(self.summary(after='')))
+
+    def test_more_yes_points_than_todos_is_left_to_the_human(self):
+        body = self.BODY.replace('3. Serious bug: No', '3. Serious bug: Yes').replace('4. Architecture: No', '4. Architecture: Yes')
+        import contextlib
+        import io
+        self.cd.results.clear()
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.cd.check_summary(self.summary(answers={3: 'Yes', 4: 'Yes'}), body, 'REQUEST_CHANGES')
+        self.assertIn('MANUAL summary-yes', out.getvalue())
+        self.assertIn('2 điểm Yes nhưng chỉ 1 việc', out.getvalue())
+
+    def test_only_a_project_whose_template_has_the_section_is_held_to_it(self):
+        import os
+        with tempfile.TemporaryDirectory() as tmp:
+            old = os.environ.pop('RULES', None)
+            try:
+                self.assertFalse(self.cd.summary_required())
+                os.environ['RULES'] = tmp
+                self.assertFalse(self.cd.summary_required())
+                pathlib.Path(tmp, 'draft_template.md').write_text('## PR này làm gì\n')
+                self.assertFalse(self.cd.summary_required())
+                pathlib.Path(tmp, 'draft_template.md').write_text(f'## {self.cd.SUMMARY}\n')
+                self.assertTrue(self.cd.summary_required())
+            finally:
+                os.environ.pop('RULES', None)
+                if old is not None:
+                    os.environ['RULES'] = old
+
+    def run_cli(self, rules, draft_text):
+        import os
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = pathlib.Path(tmp)
+            (tmp / 'draft.md').write_text(draft_text)
+            (tmp / 't.tsv').write_text('NONE\n')
+            (tmp / 'e.tsv').write_text('')
+            subprocess.run(['git', 'init', '-q', str(tmp / 'wt')], check=True)
+            env = {**os.environ, 'RV': str(tmp), 'RULES': rules}
+            return subprocess.run([sys.executable, '-I', str(HERE / 'check_draft.py'), '--triggers', str(tmp / 't.tsv'), '--expected', str(tmp / 'e.tsv'),
+                                   '--wt', str(tmp / 'wt'), str(tmp / 'draft.md')], capture_output=True, text=True, env=env).stdout
+
+    def test_main_runs_the_summary_gate_for_a_project_that_asks_for_it(self):
+        with tempfile.TemporaryDirectory() as rules:
+            pathlib.Path(rules, 'draft_template.md').write_text(f'## {self.cd.SUMMARY}\n')
+            out = self.run_cli(rules, 'Planned event: `APPROVE`\n\n' + self.BODY + '\n')
+            self.assertIn('FAIL   summary ', out)
+
+    def test_main_skips_the_summary_gate_for_a_project_that_does_not(self):
+        with tempfile.TemporaryDirectory() as rules:
+            pathlib.Path(rules, 'draft_template.md').write_text('## PR này làm gì\n')
+            out = self.run_cli(rules, 'Planned event: `APPROVE`\n\n' + self.BODY + '\n')
+            self.assertIn('PASS   summary ', out)
+            self.assertNotIn('FAIL   summary', out)
+
+    def test_a_points_table_that_disagrees_with_the_body_fails(self):
+        self.assertIn('FAIL   summary-points', self.gate(self.summary(answers={3: 'Yes'})))
+
+
+if __name__ == '__main__':
+    unittest.main()

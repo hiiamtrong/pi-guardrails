@@ -114,6 +114,58 @@ def check_points(body, event):
     say('FAIL' if bad else 'PASS', 'yes=>RC', f'Yes ở {yes or "không điểm nào"}, event {event}')
 
 
+SUMMARY = 'Tóm tắt cho người duyệt'
+AUTHOR_TODO = 'Để được approve, tác giả cần làm:'
+AFTER_DEPLOY = 'Sau khi merge và deploy lên dev'
+FOR_THEO = 'Cần Theo quyết hoặc biết:'
+
+
+def labelled(sec, label):
+    """Text of the `**label**` block up to the next bold label line, or None when the label is missing."""
+    m = re.search(rf'(?ms)^\*\*{re.escape(label)}[^\n]*\n(.*?)(?=^\*\*[^\n]*:\*\*[ \t]*$|\Z)', sec)
+    return m.group(1) if m else None
+
+
+def summary_required():
+    """Only a project whose draft_template.md has the Tóm tắt section is held to it: the other projects share this checker."""
+    rules = os.environ.get('RULES')
+    tpl = pathlib.Path(rules) / 'draft_template.md' if rules else None
+    return bool(tpl and tpl.is_file() and f'## {SUMMARY}' in tpl.read_text())
+
+
+def check_summary(text, body, event):
+    """The last approver reads the draft top-down: verdict, what the author must do, what waits for dev. Evidence tables come after it."""
+    sec = section(text, SUMMARY)
+    if sec is None:
+        say('FAIL', 'summary', f'thiếu mục "## {SUMMARY}" (đầu bản nháp, ngay sau header): kết luận, việc của tác giả, việc sau deploy')
+        return
+    blocks = {l: labelled(sec, l) for l in (AUTHOR_TODO, AFTER_DEPLOY, FOR_THEO)}
+    absent = [l for l, b in blocks.items() if b is None]
+    if absent:
+        say('FAIL', 'summary', f'mục tóm tắt thiếu nhãn in đậm: {absent}')
+        return
+    todo = re.findall(r'(?m)^- \[[ x]\] (.+)$', blocks[AUTHOR_TODO])
+    if event != 'APPROVE' and not todo:
+        say('FAIL', 'summary-todo', f'event {event} mà "{AUTHOR_TODO}" không có dòng "- [ ] ..." nào: tác giả phải biết làm gì thì mới được approve')
+    elif (loose := [t for t in todo if not POINTER.search(t)]):
+        say('FAIL', 'summary-todo', f'việc của tác giả phải trỏ file:dòng, URL hay evidence/: "{loose[0][:60]}..."')
+    else:
+        say('PASS', 'summary-todo', f'{len(todo)} việc của tác giả' if todo else 'không còn việc nào chặn merge')
+    for b in (AFTER_DEPLOY, FOR_THEO):
+        if not blocks[b].strip():
+            say('FAIL', 'summary', f'"{b}" để trống: ghi các dòng "- [ ] ..." hoặc "Không có."')
+    rows = dict(re.findall(r'(?m)^\|\s*(\d)\s*\|[^|\n]*\|\s*(Yes|No issue|No|N/A)\s*\|', sec))
+    mismatch = []
+    for i, label in enumerate(POINTS, 1):
+        pm = re.search(rf'(?m)^{i}\. {re.escape(label)}: (Yes|No issue|No|N/A)\b', body)
+        if pm and rows.get(str(i)) != pm.group(1):
+            mismatch.append(f'{i}: tóm tắt {rows.get(str(i))}, body {pm.group(1)}')
+    say('FAIL' if mismatch else 'PASS', 'summary-points', f'bảng 7 điểm trong tóm tắt lệch body ({mismatch[0]})' if mismatch else 'bảng 7 điểm trong tóm tắt khớp body')
+    yes = [i for i, v in enumerate(POINTS, 1) if re.search(rf'(?m)^{i}\. {re.escape(v)}: Yes\b', body)]
+    if len(todo) < len(yes):
+        say('MANUAL', 'summary-yes', f'{len(yes)} điểm Yes nhưng chỉ {len(todo)} việc cho tác giả: mỗi điểm Yes cần được một việc phủ (một việc phủ hai điểm thì bỏ qua)')
+
+
 # Same shape as the block build_payload.py turns into an inline comment; a heading that does not match is dropped without a word.
 INLINE_BLOCK = re.compile(
     r'^### \d+\. `([^`]+)` L(\d+)(?:-L(\d+))? \((?:RIGHT|LEFT)\)\s*\n\n'
@@ -310,6 +362,10 @@ def main():
     posted = body + '\n'.join(re.findall(r'\*\*(?:Comment|Reply) \(EN, sẽ post\):\*\*\n\n(.*?)\n\n\*\*Vì sao', text, re.S))
 
     check_points(body, event)
+    if summary_required():
+        check_summary(text, body, event)
+    else:
+        say('PASS', 'summary', 'template của project này không có mục Tóm tắt: không kiểm')
     check_inline(text, body, event)
     check_risk(text, event, override)
     run_outside(a, text, body, event, override, root, final=True)

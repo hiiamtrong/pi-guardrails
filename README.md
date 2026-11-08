@@ -192,6 +192,18 @@ The thresholds were calibrated against Jev 1.13, and the `jev-latest` alias move
 
 Jev receives the proposed code text, and `test-gaps-on-settle` sends whole test files and the source files they import, so only enable it for code you may send to TypeSafe (and OpenRouter, if used).
 
+## Auto router
+
+`extensions/auto-router.ts` registers a virtual model, `auto/router`. Select it with `/model` or `pi --model auto/router`. For each user turn, a Jev classifier rates the request `light`, `standard` or `heavy`, and the router sends it to the first usable model of that tier. A tier can span several subscriptions, so cheap or high-quota plans take easy work and a scarce plan, such as Claude Pro, keeps the hard work.
+
+- Tool follow-ups stay on the model of the turn, and a retry after a transient error stays on the failed model, to keep the prompt cache.
+- A short follow-up does not lower the tier unless Jev gives the lower tier at least 0.8.
+- A model that reports a rate limit or quota error is skipped for 30 minutes, an overload for 2 minutes, and a plan or region refusal (for example `not supported when using Codex with a ChatGPT account`) for 6 hours. The skip list lives in the process, so a subagent learns it again.
+- A turn whose last user message has an image goes to the first model of `vision` (then of the tiers) that accepts images. The next text turn is classified again.
+- Compaction summaries use the first usable `light` model.
+
+Copy `config/auto-router.example.json` to `~/.pi/agent/auto-router.json` to choose models (`provider/model-id` as listed by `pi --list-models`). Without the file the router uses Claude and opencode-go defaults. `PI_AUTO_ROUTER_CONFIG` points to another file. The classifier is the first of `classifiers` whose provider has credentials: `typesafe/jev-latest`, then `openrouter/~typesafe/jev-latest`, then `opencode/jev-1.13-free`. With no classifier, every turn is `standard`.
+
 ## PR review archive
 
 `pr-review-archive` requires authenticated `gh` and the `sqlite3` CLI. Data is stored with user-only permissions at `~/.pi/agent/pi-guardrails/pr-review-archive.sqlite`.

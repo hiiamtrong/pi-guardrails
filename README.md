@@ -1,6 +1,6 @@
 # Pi GitHub Guards
 
-A Pi package with eleven workflow and security extensions:
+A Pi package with twelve workflow and security extensions:
 
 - **`comment-guard`** reviews new code comments, suppressions, and Python future annotations before they are written.
 - **`ponytail-review-on-settle`** runs `/skill:ponytail-review` after a turn that edited code, unless the edits were trivial.
@@ -13,6 +13,7 @@ A Pi package with eleven workflow and security extensions:
 - **`session-auto-name`** names each session after its work, keeps the name current as the work changes, and renames the Orca tab to match.
 - **`worktree-bootstrap`** configures a personal, per-repository `post-checkout` bootstrap hook that copies selected ignored files into new Git worktrees.
 - **`whoami`** gives the agent a `whoami` tool that returns who you are in the current project (role, client, context) from Markdown files you write under `~/.pi/agent/whoami/`, and `/whoami-init` to create them.
+- **`secret-guard`** replaces credentials with `<redacted:...>` in what you paste, in tool results, and in the payload sent to the provider.
 
 The GitHub write and identity gates fail closed when the required condition cannot be verified.
 
@@ -184,9 +185,49 @@ The command builds `reports/reviews/tools` (rules and scripts address the tools 
 
 With no `pipeline.json` the draft gate still runs swag-server's draft policy (release labels, the "Heads up" flag, trial blocks; `draftCheck` replaces it), but nothing is cross-service, only generic flag words fire, and the post guard has no watchlist: a new repo declares `triggers` and `watchPaths` before its first review. The base branch is `develop` unless `baseBranch` says otherwise.
 
+## Secret guard
+
+`secret-guard` keeps credentials out of what a provider receives, so a cheaper or less trusted model can be used safely. It acts in three places:
+
+| Layer | Hook | What it redacts |
+|---|---|---|
+| Paste | `input` | Known values, patterns, and high-entropy strings that Jev rates as secrets. Shows a notice with the count. |
+| Tool output | `tool_result` | Known values and patterns in `content` and `structuredContent`. |
+| Request | `before_provider_request` | The whole payload, as a last line of defence. |
+
+Three sources decide what is a secret:
+
+- **Known values.** Environment variables whose name holds `KEY`, `TOKEN`, `SECRET`, `PASSWORD`, `PASSWD` or `CREDENTIAL` (and `API_HASH`, `PASSWORD_HASH`, `SECRET_HASH`, not `COMMIT_HASH`), the same kind of entries in `~/.pi/agent/mcp-env.json`, and every string of 16 characters or more in `~/.pi/agent/auth.json`. Names ending in `_FILE`, `_PATH`, `_DIR`, `_URL` or `_ID`, `GIT_CONFIG_KEY_<n>` and `PWD` are skipped, because they hold paths and names. The replacement reads `<redacted:env NAME>`, `<redacted:mcp-env NAME>` or `<redacted:auth.json>`.
+- **Patterns.** Private-key blocks, prefixed tokens (`sk-`, `ghp_`, `github_pat_`, `xox*-`, `AKIA`, `AIza`, `ya29.`, `ntn_`, `ATATT3`, JWT), `Bearer` values, passwords in connection URLs, and `NAME=value` or `"name": "value"` pairs whose name holds one of the keywords above and whose value has none of `( ) { } [ ] $`, so `const apiKey = process.env.X_API_KEY` and `hash(password)` are left alone. The value also needs a digit, unless the name is `UPPER_CASE` and the value is unquoted with a lowercase letter (`DB_PASSWORD=correcthorse`). Every scan is linear in the input size.
+- **Jev, for pasted text only.** A string of 24 to 256 characters with letters and digits and an entropy of at least 3.5 bits per character, which is not a SHA, a UUID, or part of a URL, goes to Jev as a candidate (at most 40 per paste, and any beyond that are redacted as `<redacted:unverified>` instead of passing through). A score of at least 0.4 redacts it as `<redacted:jev>`. Jev gets the shape (length, character classes, entropy), the key name, and about 60 characters on each side, **never the value**. In that context, every word that is not a plain word of up to 11 letters, an identifier made of such words, or a short number is replaced by `<OTHER>`. Plain short words, such as a password that is one dictionary word, still reach Jev. If Jev fails or times out, every candidate is redacted as `<redacted:unverified>` and a notice says so; the notice and the log keep only the HTTP status, never the response body. `TYPESAFE_API_KEY=` (empty) turns the Jev step off.
+
+Subagents: a background child loads the package like the parent does. A foreground child never loads ambient extensions, so its requests would go out unredacted. `~/.pi/agent/settings.json` therefore needs the extension in `subagents.defaultSubagentOnlyExtensions`:
+
+```json
+{
+  "subagents": {
+    "defaultSubagentOnlyExtensions": ["/Users/<you>/.pi/agent/git/github.com/hiiamtrong/pi-guardrails/extensions/secret-guard.ts"]
+  }
+}
+```
+
+A background child then loads it twice. That is harmless, because redaction is idempotent.
+
+Set `SECRET_GUARD_LOG=<file>` to append one JSON line per decision (`layer`, `count`, `labels`, `ms`, and for pastes `jevMs`, `jevCandidates`, `jevError`). The log never holds a value or any text.
+
+Limits:
+
+- `pi-claude-bridge` does not call `before_provider_request`, so the Request layer does nothing there. The Paste and Tool output layers still do.
+- Images are not inspected, sessions written before the extension was enabled are not cleaned, and tool calls are not blocked: an agent can still read `auth.json`, but what it reads is redacted.
+- A secret that has no known prefix, is not in `auth.json`, the environment or `mcp-env.json`, and is not next to a keyword name reaches the model unless you paste it and Jev flags it. Data that must never leave the machine needs a local model.
+- A name with more than 64 characters before its keyword is not matched by the `NAME=value` pattern, and neither is a letters-only value behind a lowercase name or a quote, such as `password: correcthorse`: the same shape is ordinary code and prose, and keeping `const apiKey = loadKey(path)` intact matters more. The known-value and Jev layers still cover a password you also keep in `auth.json`, the environment, or paste.
+- Environment and `mcp-env.json` values shorter than 8 characters are not tracked, because replacing a short string everywhere would corrupt ordinary text.
+- The guard matches literal text. A known credential that is base64-encoded, written as `\uXXXX` escapes, or split across two tool-result parts is not recognised; this protects against accidental disclosure, not a model that deliberately re-encodes a secret.
+- A failing `SECRET_GUARD_LOG` path (a directory, a full disk) is ignored, so telemetry can never stop a redaction.
+
 ## Jev decisions
 
-All three Jev-backed extensions call the [TypeSafe System One API](https://docs.typesafe.ai/api) with model `TYPESAFE_MODEL` (default `jev-latest`). They read `TYPESAFE_API_KEY`, `TYPESAFE_BASE_URL` (default `https://api.typesafe.ai`), and `TYPESAFE_MODEL` from the environment, or from `~/.pi/agent/mcp-env.json` when `TYPESAFE_API_KEY` is unset. To route through OpenRouter, set `TYPESAFE_BASE_URL` to `https://openrouter.ai/api` and use an OpenRouter key. Set `TYPESAFE_API_KEY=` (empty) to disable Jev.
+`comment-guard`, `ponytail-review-on-settle`, `test-gaps-on-settle` and `secret-guard` call the [TypeSafe System One API](https://docs.typesafe.ai/api) with model `TYPESAFE_MODEL` (default `jev-latest`). They read `TYPESAFE_API_KEY`, `TYPESAFE_BASE_URL` (default `https://api.typesafe.ai`), and `TYPESAFE_MODEL` from the environment, or from `~/.pi/agent/mcp-env.json` when `TYPESAFE_API_KEY` is unset. To route through OpenRouter, set `TYPESAFE_BASE_URL` to `https://openrouter.ai/api` and use an OpenRouter key. Set `TYPESAFE_API_KEY=` (empty) to disable Jev.
 
 The thresholds were calibrated against Jev 1.13, and the `jev-latest` alias moves when TypeSafe ships a new version. Pin the version with `TYPESAFE_MODEL`, then rerun `bench/` before moving to a newer one. Version IDs differ by provider: `jev-1.13.0` on `api.typesafe.ai`, `typesafe/jev-1.13-20260917` on OpenRouter.
 
@@ -263,7 +304,7 @@ npx tsc --noEmit
 
 ### Jev benchmark
 
-`bench/` holds 150 hand-labeled cases (50 per Jev-backed extension) and a runner that calls the real Jev API through each extension's own handler or `findGaps`:
+`bench/` holds 150 hand-labeled cases (50 per Jev-backed extension, not counting `secret-guard`, see below) and a runner that calls the real Jev API through each extension's own handler or `findGaps`:
 
 ```bash
 node --experimental-strip-types bench/jev-bench.ts              # all three
@@ -283,3 +324,31 @@ node --experimental-strip-types bench/fresh-bench.ts      # real Jev: comment-gu
 `guards-bench.ts` reports missed writes (a write got through) and blocked reads separately, and lists `edge` cases that are not scored, such as `ssh host 'git push'`. `fresh-bench.ts` takes one optional argument (`comment-guard`, `ponytail` or `test-gaps`).
 
 It reads the same TypeSafe settings as the extensions and costs well under $0.01 per full run. `comment-guard` runs with a stub Pi reviewer that always answers `DEFER`, so cases Jev leaves undecided show up as deferred instead of spawning Pi. The `test-gaps` report includes recall and precision for several gap thresholds, computed from the recorded scores.
+
+### Secret guard benchmark
+
+Three runners, all with synthetic credentials generated for the run:
+
+```bash
+node --experimental-strip-types bench/jev-bench.ts secret-guard           # real Jev, 50 labelled pastes
+node --experimental-strip-types bench/jev-bench.ts secret-guard holdout   # 15 pastes written before the question was tuned
+node --experimental-strip-types bench/secret-guard-bench.ts               # offline: patterns, known values, timing
+node --experimental-strip-types bench/secret-guard-e2e.ts [paste|env-output|auth-file|payload|jev-down]
+node --experimental-strip-types bench/secret-guard-e2e.ts --session=<file> --token=<t> --opaque=<o> --uuid=<u>   # grade a subagent session
+```
+
+`secret-guard-e2e.ts` starts a fresh `pi` process per scenario with a temporary agent directory, a DeepSeek model through OpenRouter (`--model=` changes it), the real Jev, and `bench/payload-tap.ts`, which records the payload each request sends. It fails if any synthetic value appears in the session file or in a payload. It needs `TYPESAFE_API_KEY` (the OpenRouter key from `mcp-env.json` is reused for the model).
+
+Results on 2026-11-08, Jev `typesafe/jev-1.13` through OpenRouter, threshold 0.4:
+
+| Runner | Result |
+|---|---|
+| Jev, main set (50) | recall 96.0%, precision 92.3%, AUC 0.968, p95 0.8 s |
+| Jev, holdout (15) | recall 100%, precision 100% |
+| Offline (263 cases) | 0 secrets missed, 0 of 152 benign strings redacted, including code such as `const apiKey = process.env.X` |
+| Offline timing | request layer p95 13 ms at 1 MB and 60 ms at 5 MB, paste p95 0.1 ms, 200 KB hostile input under 6 ms |
+| End to end (5 scenarios) | 5 of 5 pass: paste, tool output, `auth.json`, request payload, Jev down (fail closed) |
+| Subagents | foreground and background children pass with the setting above; a foreground child without it leaks the token and password |
+
+The threshold moved from 0.6 to 0.4 after the first real run (recall 76% at 0.6). At 0.4 the main set still misclassifies a Twilio auth token as benign and two content hashes as secrets (`integrity sha512-...`, a release tag).
+

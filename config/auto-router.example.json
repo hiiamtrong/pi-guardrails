@@ -1,0 +1,8 @@
+{
+  "tiers": {
+    "light": ["opencode-go/glm-5.3-flash", "claude-bridge/claude-haiku-5-5"],
+    "standard": ["opencode-go/kimi-k3.1-pro", "claude-bridge/claude-sonnet-5-5"],
+    "heavy": ["claude-bridge/claude-opus-5-5", "opencode-go/kimi-k3.1-pro"]
+  },
+  "vision": ["opencode-go/kimi-k3.1-pro", "opencode-go/glm-5.3-flash", "claude-bridge/claude-sonnet-5-5"]
+}

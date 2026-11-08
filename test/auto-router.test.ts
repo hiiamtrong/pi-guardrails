@@ -358,3 +358,50 @@ test("loadConfig: a __proto__ key in tiers does not leak into other objects", ()
   assert.equal(loadConfig(file).tiers.light[0], "claude-bridge/claude-haiku-5-5");
   assert.equal(({} as Record<string, unknown>).light, undefined);
 });
+
+test("null and undefined: a text block without text, a missing errorMessage and a turn_end without provider are harmless", async () => {
+  const made = makeCtx({ configured: ["typesafe"], probabilities: { light: 1 } });
+  const blank = req({ reason: "user", messages: [{ role: "user", content: [{ type: "text" }] }] });
+  assert.equal(await classifyTier(blank as never, made.ctx, ["typesafe/jev-latest"]), "light");
+  assert.equal(made.calls[0][1].state.prompt, "");
+
+  const state = { tier: "standard", model: "opencode-go/kimi-k3.1-pro" };
+  const retry = await def.route(req({ reason: "retry", state, failed: { model: kimi, message: {} } }), makeCtx().ctx);
+  assert.equal(retry.model.id, "kimi-k3.1-pro");
+
+  handlers.turn_end({ message: { role: "assistant", stopReason: "error", errorMessage: "429 rate limit" } });
+  assert.equal((await def.route(req({ reason: "user" }), makeCtx().ctx)).model.id, "claude-sonnet-5-5");
+});
+
+test("classifier: a configured provider that lacks the model, or an answer with no probabilities, falls back", async () => {
+  const missing = makeCtx({ configured: ["typesafe"] });
+  missing.ctx.modelRegistry.findOfType = () => undefined;
+  assert.equal(await classifyTier(req({ reason: "user" }) as never, missing.ctx, ["typesafe/jev-latest"]), "standard");
+  assert.equal(missing.calls.length, 0);
+
+  const none = makeCtx({ configured: ["typesafe"], probabilities: {} });
+  assert.equal(await classifyTier(req({ reason: "user" }) as never, none.ctx, ["typesafe/jev-latest"]), "standard");
+  const keep = req({ reason: "user", state: { tier: "heavy", model: "x/y" } });
+  assert.equal(await classifyTier(keep as never, none.ctx, ["typesafe/jev-latest"]), "heavy");
+});
+
+test("loadConfig: null values mean absent and give the defaults", () => {
+  const file = join(dir, "nulls.json");
+  writeFileSync(file, '{"tiers":null,"classifiers":null,"vision":null}');
+  assert.deepEqual(loadConfig(file), loadConfig(join(dir, "none.json")));
+});
+
+test("no classifier: warns once per process, and only when there is a UI", async () => {
+  const notes: string[] = [];
+  const withUi = (hasUI: boolean) => {
+    const made = makeCtx();
+    return { ...made.ctx, hasUI, ui: { notify: (message: string) => notes.push(message) } };
+  };
+  const ask = (ctx: unknown) => classifyTier(req({ reason: "user" }) as never, ctx as never, ["typesafe/jev-latest"]);
+  assert.equal(await ask(withUi(false)), "standard");
+  assert.equal(notes.length, 0);
+  assert.equal(await ask(withUi(true)), "standard");
+  assert.equal(await ask(withUi(true)), "standard");
+  assert.equal(notes.length, 1);
+  assert.match(notes[0], /no classifier/);
+});

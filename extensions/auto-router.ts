@@ -24,6 +24,8 @@ type ClassifierResult = {
   answers: Record<string, { type: string; probabilities: Record<string, number> }>;
 };
 type Ctx = {
+  hasUI?: boolean;
+  ui?: { notify: (message: string, type?: "info" | "warning" | "error") => void };
   modelRegistry: {
     find: (provider: string, id: string) => Model | undefined;
     hasConfiguredAuth: (model: Model) => boolean;
@@ -69,6 +71,7 @@ const OVERLOAD_BENCH_MS = 2 * 60_000;
 const DOWNGRADE_MIN_PROBABILITY = 0.8;
 const CONTEXT_USER_MESSAGES = 3;
 const benched = new Map<string, number>();
+let warnedNoClassifier = false;
 
 export function benchFor(error: string): number {
   if (REFUSED_ERROR.test(error)) return REFUSED_BENCH_MS;
@@ -134,7 +137,16 @@ export async function classifyTier(request: Request, ctx: Ctx, classifiers: stri
         : undefined;
     })
     .find((model) => model);
-  if (!jev) return fallback;
+  if (!jev) {
+    if (!warnedNoClassifier && ctx.hasUI && ctx.ui) {
+      warnedNoClassifier = true;
+      ctx.ui.notify(
+        "auto-router: no classifier has credentials in Pi (mcp-env.json is not read), so every turn keeps the current tier",
+        "warning",
+      );
+    }
+    return fallback;
+  }
   const users = request.messages.filter((message) => message.role === "user").slice(-CONTEXT_USER_MESSAGES);
   if (!users.length) return fallback;
   const result = await ctx.modelRegistry.classify(
@@ -164,6 +176,7 @@ export async function classifyTier(request: Request, ctx: Ctx, classifiers: stri
   const answer = result.stopReason === "stop" ? result.answers.tier : undefined;
   if (answer?.type !== "choice") return fallback;
   const p = (tier: Tier) => answer.probabilities[tier] ?? 0;
+  if (!TIERS.some((tier) => p(tier) > 0)) return fallback;
   const best = TIERS.reduce((a, b) => (p(b) > p(a) ? b : a));
   // A short follow-up in a heavy session must not pull it down to a cheap model and lose the cache.
   if (current && TIERS.indexOf(best) < TIERS.indexOf(current) && p(best) < DOWNGRADE_MIN_PROBABILITY) return current;

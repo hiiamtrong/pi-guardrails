@@ -202,7 +202,7 @@ Jev receives the proposed code text, and `test-gaps-on-settle` sends whole test 
 - A turn whose last user message has an image goes to the first model of `vision` (then of the tiers) that accepts images. The next text turn is classified again.
 - Compaction summaries use the first usable `light` model.
 
-Copy `config/auto-router.example.json` to `~/.pi/agent/auto-router.json` to choose models (`provider/model-id` as listed by `pi --list-models`). Without the file the router uses Claude and opencode-go defaults. `PI_AUTO_ROUTER_CONFIG` points to another file. The classifier is the first of `classifiers` whose provider has credentials: `typesafe/jev-latest`, then `openrouter/~typesafe/jev-latest`, then `opencode/jev-1.13-free`. With no classifier, every turn is `standard`.
+Copy `config/auto-router.example.json` to `~/.pi/agent/auto-router.json` to choose models (`provider/model-id` as listed by `pi --list-models`). Without the file the router uses Claude and opencode-go defaults. `PI_AUTO_ROUTER_CONFIG` points to another file. The classifier is the first of `classifiers` whose provider has credentials: `typesafe/jev-latest`, then `openrouter/~typesafe/jev-latest`, then `opencode/jev-1.13-free`. The classifier needs a credential that Pi itself can resolve (`TYPESAFE_API_KEY` in the environment, `/login`, or `models.json`); `~/.pi/agent/mcp-env.json` is not read here, unlike the other Jev extensions. With no classifier the router keeps the current tier (`standard` at first) and warns once per process.
 
 ## PR review archive
 

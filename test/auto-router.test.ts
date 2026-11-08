@@ -405,3 +405,43 @@ test("no classifier: warns once per process, and only when there is a UI", async
   assert.equal(notes.length, 1);
   assert.match(notes[0], /no classifier/);
 });
+
+const turnError = (provider: string, model: string, errorMessage: string) =>
+  handlers.turn_end({ message: { role: "assistant", stopReason: "error", errorMessage, provider, model } });
+
+test("a spent plan benches every model of its provider, a plain rate limit only the model", async () => {
+  const { ctx } = makeCtx();
+  turnError("claude-bridge", "claude-haiku-5-5", "429 rate limit");
+  assert.equal((await def.route(req({ reason: "user" }), ctx)).model.id, "claude-sonnet-5-5");
+  now += 60 * 60_000;
+  turnError("claude-bridge", "claude-haiku-5-5", '429: {"type":"GoUsageLimitError","message":"Go usage limit exceeded"}');
+  assert.equal((await def.route(req({ reason: "user" }), ctx)).model.id, "kimi-k3.1-pro");
+});
+
+test("a retry after a spent plan skips the whole provider", async () => {
+  const r = await def.route(
+    req({
+      reason: "retry",
+      state: { tier: "standard", model: "opencode-go/kimi-k3.1-pro" },
+      failed: { model: kimi, message: { errorMessage: "Go usage limit exceeded" } },
+    }),
+    makeCtx().ctx,
+  );
+  assert.equal(r.model.id, "claude-sonnet-5-5");
+  const next = await def.route(req({ reason: "user" }), makeCtx().ctx);
+  assert.notEqual(next.model.provider, "opencode-go");
+});
+
+test("a run that ends on a plan-exhaustion error resumes once on another model", () => {
+  const settle = handlers.agent_before_settle as (event: unknown) => { continue: boolean } | undefined;
+  turnError("opencode-go", "kimi-k3.1-pro", "429: Go usage limit exceeded");
+  assert.equal(settle({ outcome: "error" })?.continue, true);
+  assert.equal(settle({ outcome: "error" }), undefined);
+  turnError("opencode-go", "kimi-k3.1-pro", "429: Go usage limit exceeded");
+  assert.equal(settle({ outcome: "completed" }), undefined);
+  turnError("opencode-go", "kimi-k3.1-pro", "400 bad request");
+  assert.equal(settle({ outcome: "error" }), undefined);
+  turnError("opencode-go", "kimi-k3.1-pro", "Go usage limit exceeded");
+  (handlers.turn_start as () => void)();
+  assert.equal(settle({ outcome: "error" }), undefined);
+});

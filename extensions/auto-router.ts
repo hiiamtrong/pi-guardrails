@@ -37,8 +37,13 @@ type Ctx = {
 type TurnEnd = {
   message: { role: string; stopReason?: string; errorMessage?: string; provider?: string; model?: string };
 };
+type BeforeSettle = { outcome: string };
 type ExtensionAPI = {
-  on: (event: "turn_end", handler: (event: TurnEnd) => void) => void;
+  on: {
+    (event: "turn_end", handler: (event: TurnEnd) => void): void;
+    (event: "turn_start", handler: () => void): void;
+    (event: "agent_before_settle", handler: (event: BeforeSettle) => unknown): void;
+  };
   registerVirtualModel: (definition: {
     provider: string;
     id: string;
@@ -63,6 +68,9 @@ type Config = { tiers: Record<Tier, string[]>; classifiers: string[]; vision: st
 const QUOTA_ERROR =
   /(?<![a-z0-9])429(?![a-z0-9])|rate.?limit|quota|usage.?limit|insufficient_quota|out of budget|billing|"code"\s*:\s*"?1308(?![0-9])/i;
 const OVERLOAD_ERROR = /overload|capacity|server_busy|high demand/i;
+// The plan behind the provider is spent, so its other models fail the same way; Pi never retries these (Go, Free, billing).
+const PLAN_EXHAUSTED =
+  /usage.?limit|insufficient_quota|out of budget|billing|available balance|quota exceeded|"code"\s*:\s*"?1308(?![0-9])/i;
 // Plan or region refusals do not clear on their own, so the model stays out for hours.
 const REFUSED_ERROR = /not supported when using|hosted outside|model_not_found/i;
 const REFUSED_BENCH_MS = 6 * 60 * 60_000;
@@ -76,6 +84,15 @@ let warnedNoClassifier = false;
 export function benchFor(error: string): number {
   if (REFUSED_ERROR.test(error)) return REFUSED_BENCH_MS;
   return QUOTA_ERROR.test(error) ? QUOTA_BENCH_MS : OVERLOAD_ERROR.test(error) ? OVERLOAD_BENCH_MS : 0;
+}
+
+// A provider-wide bench is keyed by the bare provider name, which never contains "/" like a model ref does.
+function bench(provider: string | undefined, model: string | undefined, error: string): boolean {
+  const ms = benchFor(error);
+  if (!ms) return false;
+  benched.set(`${provider}/${model}`, Date.now() + ms);
+  if (provider && PLAN_EXHAUSTED.test(error)) benched.set(provider, Date.now() + ms);
+  return true;
 }
 
 const refOf = (model: Model) => `${model.provider}/${model.id}`;
@@ -184,10 +201,30 @@ export async function classifyTier(request: Request, ctx: Ctx, classifiers: stri
 }
 
 export default function (pi: ExtensionAPI) {
+  let benchedThisRun = false;
+  pi.on("turn_start", () => {
+    benchedThisRun = false;
+  });
   pi.on("turn_end", ({ message }) => {
     if (message.role !== "assistant" || message.stopReason !== "error") return;
-    const ms = benchFor(message.errorMessage ?? "");
-    if (ms) benched.set(`${message.provider}/${message.model}`, Date.now() + ms);
+    benchedThisRun = bench(message.provider, message.model, message.errorMessage ?? "");
+  });
+  // Pi does not retry plan-exhaustion errors, so the run would end here; resume it once the model is benched and route() picks another.
+  // Each resume needs a fresh bench, so the number of resumes is bounded by the models in the config.
+  pi.on("agent_before_settle", ({ outcome }) => {
+    if (outcome !== "error" || !benchedThisRun) return;
+    benchedThisRun = false;
+    return {
+      continue: true,
+      entries: [
+        {
+          type: "custom_message",
+          customType: "auto-router-switch",
+          display: true,
+          content: "The previous model hit its usage limit and is now skipped. Answer the user's last request.",
+        },
+      ],
+    };
   });
 
   pi.registerVirtualModel({
@@ -199,7 +236,10 @@ export default function (pi: ExtensionAPI) {
       const { tiers, classifiers, vision } = loadConfig();
       const usable = (ref: string) => {
         const model = ctx.modelRegistry.find(...splitRef(ref));
-        return model && ctx.modelRegistry.hasConfiguredAuth(model) && (benched.get(ref) ?? 0) < Date.now()
+        return model &&
+          ctx.modelRegistry.hasConfiguredAuth(model) &&
+          (benched.get(ref) ?? 0) < Date.now() &&
+          (benched.get(model.provider) ?? 0) < Date.now()
           ? model
           : undefined;
       };
@@ -235,10 +275,9 @@ export default function (pi: ExtensionAPI) {
       if (request.reason === "retry" && request.failed) {
         const failed = refOf(request.failed.model);
         const tier = state?.tier ?? tierOf(failed) ?? "standard";
-        const ms = benchFor(request.failed.message.errorMessage ?? "");
         // Transient errors retry on the same model so the prompt cache and thinking signatures stay valid.
-        if (!ms) return route(request.failed.model, tier);
-        benched.set(failed, Date.now() + ms);
+        if (!bench(request.failed.model.provider, request.failed.model.id, request.failed.message.errorMessage ?? ""))
+          return route(request.failed.model, tier);
         return route(pick(tier, failed), tier);
       }
 

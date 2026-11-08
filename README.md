@@ -240,6 +240,7 @@ Jev receives the proposed code text, and `test-gaps-on-settle` sends whole test 
 - Tool follow-ups stay on the model of the turn, and a retry after a transient error stays on the failed model, to keep the prompt cache.
 - A short follow-up does not lower the tier unless Jev gives the lower tier at least 0.8.
 - A model that reports a rate limit or quota error is skipped for 30 minutes, an overload for 2 minutes, and a plan or region refusal (for example `not supported when using Codex with a ChatGPT account`) for 6 hours. The skip list lives in the process, so a subagent learns it again.
+- A spent plan (`GoUsageLimitError`, `insufficient_quota`, billing and similar) skips every model of that provider, because the other models of the plan fail the same way. Pi does not retry these errors, so when a run ends on one the router resumes it once with a short message and the next pick goes to another provider.
 - A turn whose last user message has an image goes to the first model of `vision` (then of the tiers) that accepts images. The next text turn is classified again.
 - Compaction summaries use the first usable `light` model.
 

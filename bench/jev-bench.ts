@@ -5,6 +5,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import commentGuard from "../extensions/comment-guard.ts";
 import ponytailReview from "../extensions/ponytail-review-on-settle.ts";
+import secretGuard, { JEV_SECRET } from "../extensions/secret-guard.ts";
 import { errorPaths, findGaps, relevantSource } from "../extensions/test-gaps-on-settle.ts";
 
 type Lines = string | string[];
@@ -324,10 +325,59 @@ async function benchTestGaps() {
   };
 }
 
+async function benchSecretGuard() {
+  const cases = load("secret-guard.json");
+  const handlers: Record<string, Handler> = {};
+  secretGuard({ on: (event: string, h: Handler) => (handlers[event] = h) } as never);
+  const from = calls.length;
+  const rows = [];
+  for (const c of cases) {
+    const { result, made } = await tracked(() =>
+      handlers.input({ text: c.text, source: "interactive" }, { ui: { notify: () => undefined } }),
+    );
+    const values = made.flatMap((call) => Object.values(call.answers ?? {}).map((answer) => answer.noul));
+    const score = values.length ? Math.max(...values) : undefined;
+    const labels = [...String(result?.text ?? "").matchAll(/<redacted:([^>]+)>/g)].map((match) => match[1]);
+    const got = made.some((call) => !call.ok) || labels.includes("unverified") ? "ERROR"
+      : labels.includes("jev") ? "secret"
+      : labels.length ? "REGEX"
+      : "benign";
+    rows.push({ ...c, got, score, detail: scores(made), jevCalls: made.length });
+  }
+  const valid = rows.filter((row) => row.got !== "ERROR" && row.got !== "REGEX");
+  const secret = rows.filter((row) => row.expect === "secret").length;
+  const at = (threshold: number) => {
+    const hit = (row: (typeof rows)[number]) => row.score !== undefined && row.score >= threshold;
+    const tp = valid.filter((row) => row.expect === "secret" && hit(row)).length;
+    const fp = valid.filter((row) => row.expect === "benign" && hit(row)).length;
+    const fn = valid.filter((row) => row.expect === "secret" && !hit(row)).length;
+    return { tp, fp, fn, recall: tp / (tp + fn), precision: tp / (tp + fp), f1: (2 * tp) / (2 * tp + fp + fn) };
+  };
+  const current = at(JEV_SECRET);
+  const scoreOf = (expect: string) => valid.filter((row) => row.expect === expect && row.score !== undefined).map((row) => row.score as number);
+  const aucScore = auc(scoreOf("secret"), scoreOf("benign"));
+  console.log(`\n=== secret-guard (${rows.length} cases) ===`);
+  for (const threshold of [...new Set([0.3, 0.35, 0.4, 0.5, JEV_SECRET, 0.7, 0.8])].sort((a, b) => a - b)) {
+    const m = at(threshold);
+    console.log(`  t=${threshold.toFixed(2)} recall ${pct(m.tp, m.tp + m.fn)} precision ${Number.isNaN(m.precision) ? "n/a" : pct(m.tp, m.tp + m.fp)} F1 ${m.f1.toFixed(3)} (tp ${m.tp}, fp ${m.fp}, fn ${m.fn})`);
+  }
+  console.log(`AUC ${aucScore.toFixed(3)}, errors ${rows.filter((row) => row.got === "ERROR").length}, regex before Jev ${rows.filter((row) => row.got === "REGEX").length}, no Jev call ${rows.filter((row) => row.jevCalls === 0).length}`);
+  console.log("not classified correctly at the current threshold:");
+  for (const row of rows.filter((row) => row.got === "ERROR" || row.got === "REGEX" || (row.expect === "secret") !== (row.score !== undefined && row.score >= JEV_SECRET)))
+    console.log(`  ${row.got.padEnd(6)} exp=${row.expect.padEnd(6)} ${row.id.padEnd(24)} score=${row.score?.toFixed(2) ?? "-"} ${row.detail}`);
+  console.log(`latency: ${stats(calls.slice(from))}`);
+  summary.secretGuard = {
+    n: rows.length, threshold: JEV_SECRET, secret, recall: current.recall, precision: current.precision,
+    f1: current.f1, auc: aucScore, errors: rows.filter((row) => row.got === "ERROR").length,
+    regex: rows.filter((row) => row.got === "REGEX").length, noJev: rows.filter((row) => row.jevCalls === 0).length,
+  };
+}
+
 const benches: Record<string, () => Promise<void>> = {
   "comment-guard": benchCommentGuard,
   ponytail: benchPonytail,
   "test-gaps": benchTestGaps,
+  "secret-guard": benchSecretGuard,
 };
 for (const [name, run] of Object.entries(benches)) if (!only || only === name) await run();
 console.log(`\ntotal: ${stats(calls)}`);

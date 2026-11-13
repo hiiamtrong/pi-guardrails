@@ -1,0 +1,23 @@
+{
+  "router": {
+    "tiers": {
+      "light": [
+        "opencode-go/glm-5.3-flash",
+        "opencode-go/deepseek-v4.1-flash"
+      ],
+      "standard": [
+        "opencode-go/deepseek-v4.1-flash",
+        "opencode-go/glm-5.3"
+      ],
+      "heavy": [
+        "opencode-go/deepseek-v4-pro",
+        "opencode-go/kimi-k3.1-pro"
+      ]
+    },
+    "vision": [
+      "opencode-go/kimi-k3.1-pro",
+      "opencode-go/glm-5.3-flash"
+    ]
+  },
+  "classifiers": []
+}

@@ -273,10 +273,13 @@ test("readPolicy merges pipeline.json with the project over global, and rejects 
   writeFileSync(join(f.globalRules, "pipeline.json"), JSON.stringify({ worktreePrefix: "g-", impactSections: 8, gates: ["00", "06"] }));
   writeFileSync(join(projectRulesDir(f.root), "pipeline.json"), JSON.stringify({ worktreePrefix: "p-", draftCheck: "check.py", authorPattern: "^(a|b)-", baseBranch: "release/1.x" }));
   assert.deepEqual(readPolicy(ruleRoots(f.root)), { worktreePrefix: "p-", impactSections: 8, gates: ["00", "06"], draftCheck: "check.py", authorPattern: "^(a|b)-", baseBranch: "release/1.x" });
-  for (const bad of [{ gate: ["00"] }, { gates: ["99"] }, { impactSections: 0 }, { draftCheck: "../x.py" }, { worktreePrefix: 3 }, { authorPattern: "" }, { authorPattern: "(" }, { authorPattern: 5 }, { k3sHost: "k3s" }, { k3sHost: "root@k3s; rm -rf /" }, { k3sHost: 3 }, { baseBranch: "" }, { baseBranch: "a b" }, { baseBranch: "-x" }, { baseBranch: 3 }]) {
+  for (const bad of [{ gate: ["00"] }, { gates: ["99"] }, { impactSections: 0 }, { draftCheck: "../x.py" }, { worktreePrefix: 3 }, { authorPattern: "" }, { authorPattern: "(" }, { authorPattern: 5 }, { k3sHost: "k3s" }, { k3sHost: "root@k3s; rm -rf /" }, { k3sHost: 3 }, { k3sHost: "locals" }, { k3sHost: "Local" }, { baseBranch: "" }, { baseBranch: "a b" }, { baseBranch: "-x" }, { baseBranch: 3 }]) {
     writeFileSync(join(projectRulesDir(f.root), "pipeline.json"), JSON.stringify(bad));
     assert.throws(() => readPolicy(ruleRoots(f.root)), /lạ hoặc giá trị sai kiểu/);
   }
+  // "local" is not a node address: rv_k3s.sh takes it to mean "this caller already runs in the cluster" (the review agent's pod).
+  writeFileSync(join(projectRulesDir(f.root), "pipeline.json"), JSON.stringify({ k3sHost: "local" }));
+  assert.deepEqual(readPolicy(ruleRoots(f.root)), { worktreePrefix: "g-", impactSections: 8, gates: ["00", "06"], k3sHost: "local" });
   writeFileSync(join(projectRulesDir(f.root), "pipeline.json"), "{nope");
   assert.throws(() => readPolicy(ruleRoots(f.root)), /không đọc được/);
 });
@@ -1474,6 +1477,53 @@ test("rv_k3s.sh sweeps old pods by age on the node, and leaves the finished pods
   writeFileSync(join(fake, "date"), `#!/bin/sh\nif [ "$1" = "-d" ]; then exec python3 -c 'import sys,datetime;print(int(datetime.datetime.fromisoformat(sys.argv[1].replace("Z","+00:00")).timestamp()))' "$2"; fi\nexec /bin/date "$@"\n`, { mode: 0o755 });
   spawnSync("bash", ["-s"], { input: sweep, env: { PATH: `${fake}:${process.env.PATH}` } });
   assert.deepEqual(readFileSync(join(fake, "deleted.txt"), "utf8").trim().split("\n").map((l) => l.match(/pod (\S+)/)![1]), ["old-failed", "old-running"]);
+});
+
+// Inside the cluster (the review agent's pod) there is no node to ssh into: kubectl answers with the pod's service account.
+const FAKE_KUBECTL = `#!/bin/sh
+echo "$*" >> "$NODE_DIR/kubectl-calls.txt"
+case "$*" in
+  *"create -f -"*) cat > "$NODE_DIR/pod.yaml" ;;
+  *"tar -x"*) cat > "$NODE_DIR/shipped.tar" ;;
+  *"-keep -o jsonpath"*creationTimestamp*) cat "$NODE_DIR/keep" 2>/dev/null ;;
+  *"get pods"*) : ;;
+  *"get pod"*)
+    n=$(( $(cat "$NODE_DIR/n" 2>/dev/null || echo 0) + 1 )); echo $n > "$NODE_DIR/n"
+    line=$(sed -n "\${n}p" "$NODE_DIR/states"); [ -n "$line" ] || line=$(tail -1 "$NODE_DIR/states"); echo "$line" ;;
+  *"sh -s"*)
+    script=$(cat)
+    case "$script" in
+      "# Runs in the runner container"*) ;;
+      *) printf '%s\\n' "$script" > "$NODE_DIR/run.sh"; echo "5 passed" ;;
+    esac ;;
+esac
+exit 0
+`;
+
+test("rv_k3s.sh puts the pod in RV_NS when the caller names one, and in review-env otherwise", async () => {
+  for (const [env, ns] of [[{}, "review-env"], [{ RV_NS: "review-agent-tests" }, "review-agent-tests"]] as const) {
+    const node = k3sNode([PENDING, READY]);
+    writeFileSync(join(node.dir, "kubectl"), FAKE_KUBECTL, { mode: 0o755 });
+    const result = await node.run({ K3S_SSH: "local", RV_HOST: "agent", ...env }, "19372", "true");
+    assert.equal(result.code, 0, result.stderr);
+    assert.match(readFileSync(join(node.dir, "kubectl-calls.txt"), "utf8"), new RegExp(`^-n ${ns} create -f -$`, "m"));
+  }
+});
+
+test("rv_k3s.sh with K3S_SSH=local talks to kubectl directly, never ssh or the node's own image store, and names the kept pod after RV_HOST", async () => {
+  const node = k3sNode([PENDING, READY]);
+  const stub = (name: string, body: string) => writeFileSync(join(node.dir, name), `#!/bin/sh\n${body}\n`, { mode: 0o755 });
+  writeFileSync(join(node.dir, "kubectl"), FAKE_KUBECTL, { mode: 0o755 });
+  for (const name of ["ssh", "k3s", "docker"]) stub(name, `echo ${name} >> "$NODE_DIR/node-only.txt"; exit 1`);
+  const result = await node.run({ K3S_SSH: "local", RV_HOST: "Agent" }, "19372", "python -m pytest tests/x.py");
+  assert.equal(result.code, 0, result.stderr);
+  assert.match(result.stdout, /5 passed/);
+  assert.equal(existsSync(join(node.dir, "node-only.txt")), false, "ssh, k3s and docker exist only on the node");
+  const calls = readFileSync(join(node.dir, "kubectl-calls.txt"), "utf8");
+  assert.match(calls, /^-n review-env create -f -$/m);
+  assert.match(calls, /^-n review-env exec -i rv-swag-server-19372-agent-keep -c runner -- sh -c .*tar -x/m);
+  assert.match(readFileSync(join(node.dir, "pod.yaml"), "utf8"), /name: rv-swag-server-19372-agent-keep\n/);
+  assert.match(readFileSync(join(node.dir, "run.sh"), "utf8"), /python -m pytest tests\/x\.py\n$/);
 });
 
 test("rv_k3s.sh refuses a PR that is not a number before it uses it anywhere", async () => {

@@ -1,0 +1,10 @@
+{
+  "k3s-images": ["rv-swag-server:dev"],
+  "example-service": {
+    "repo": "owner/example-service",
+    "reviewer": "reviewer-login",
+    "tokenVar": "GH_TOKEN_EXAMPLE",
+    "dir": "/Users/hiiamtrong/Works/example/example-service-review",
+    "needs": []
+  }
+}

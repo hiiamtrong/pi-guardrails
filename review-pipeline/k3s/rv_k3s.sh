@@ -15,10 +15,13 @@
 #   gone:   a throwaway pod is deleted on exit and on a signal; a kept pod when its setup or run broke (exit 124/125), and every pod by the
 #           node itself after RV_POD_DEADLINE (default 5400 s) from its creation.
 # Needs K3S_SSH (user@host of the node, set by "k3sHost" in pipeline.json). Output of <command> goes to stdout, our own messages to stderr.
+# K3S_SSH=local is for a caller that already runs in the cluster (the review agent's pod): kubectl is run directly with the pod's service account, there is no node to
+# ssh into and no image store to refill (the image is on the node already). RV_HOST then names the kept pod, since a Job's pod gets a new host name every run.
 # Exit: the command's own status, or 123 the PR head moved while we waited, 124 a timeout, 125 the node or the pod could not be used.
 set -u
 HERE=$(cd "$(dirname "$0")" && pwd)
-NS=review-env
+# The pod's namespace, so a caller that runs in the cluster can keep its test pods out of review-env (the review agent does: see networkpolicy.yaml there).
+NS=${RV_NS:-review-env}
 [ "${1:-}" = run ] && [ $# -ge 5 ] || { echo "usage: rv_k3s.sh run <profile> <PR> <worktree> <command>" >&2; exit 125; }
 PROFILE=$2; PR=$3; WT=$4; CMD=$5
 case "$PR" in ''|*[!0-9]*) echo "ABORT: PR phải là số, nhận được '$PR'" >&2; exit 125 ;; esac
@@ -30,7 +33,11 @@ case "$PROFILE" in ''|*[!a-z0-9-]*) echo "ABORT: tên profile lạ '$PROFILE'" >
 . "$HERE/profiles/$PROFILE.conf"
 CTL=$(mktemp -d "${TMPDIR:-/tmp}/rv-k3s.XXXXXX")
 RC=125
-SSH=(ssh -o BatchMode=yes -o ConnectTimeout=15 -o ServerAliveInterval=15 -o ControlMaster=auto -o "ControlPath=$CTL/ssh" -o ControlPersist=120 "$K3S_SSH")
+if [ "$K3S_SSH" = local ]; then
+  SSH=(sh -c 'eval "$1"' _)
+else
+  SSH=(ssh -o BatchMode=yes -o ConnectTimeout=15 -o ServerAliveInterval=15 -o ControlMaster=auto -o "ControlPath=$CTL/ssh" -o ControlPersist=120 "$K3S_SSH")
+fi
 # ssh joins its arguments into one string for the node's shell, so each one is quoted for it.
 kc() { local line="kubectl -n $NS" a; for a in "$@"; do line+=" $(printf '%q' "$a")"; done; "${SSH[@]}" "$line"; }
 POD="rv-$PROFILE-$PR-$(LC_ALL=C tr -dc 'a-z0-9' < /dev/urandom | head -c 6)"
@@ -40,7 +47,7 @@ LOCK=
 REUSE=
 READY=
 # Kept pod and lock carry this machine's name: two machines reviewing the same PR must not share a pod, and the lock is local.
-HOST=$(hostname -s 2>/dev/null | tr 'A-Z' 'a-z' | tr -c 'a-z0-9\n' - | cut -c1-8)
+HOST=$(printf %s "${RV_HOST:-$(hostname -s 2>/dev/null)}" | tr 'A-Z' 'a-z' | tr -c 'a-z0-9' - | cut -c1-8)
 cleanup() {
   local rc=$?
   [ -z "${WATCH_PIDS:-}" ] || kill $WATCH_PIDS 2>/dev/null
@@ -128,7 +135,7 @@ done
 SWEEP
 
 # The runner image is local to the node (imagePullPolicy Never), and kubelet's image GC drops unused images when the disk passes 85%: put it back from docker's copy.
-"${SSH[@]}" "k3s ctr images ls -q | grep -qx docker.io/library/$RV_IMAGE || { docker image inspect $RV_IMAGE >/dev/null 2>&1 && docker save $RV_IMAGE | k3s ctr images import - >/dev/null; }" >/dev/null 2>&1
+[ "$K3S_SSH" = local ] || "${SSH[@]}" "k3s ctr images ls -q | grep -qx docker.io/library/$RV_IMAGE || { docker image inspect $RV_IMAGE >/dev/null 2>&1 && docker save $RV_IMAGE | k3s ctr images import - >/dev/null; }" >/dev/null 2>&1
 
 [ -n "$REUSE" ] || sed -e "s|__POD__|$POD|g" -e "s|__PR__|$PR|g" -e "s|__SCHEMA__|$SCHEMA|g" -e "s|__REPO__|$PROFILE|g" -e "s|__IMAGE__|$RV_IMAGE|g" -e "s|__MONGO_IMAGE__|${RV_MONGO_IMAGE:-mongo:7.0.11}|g" -e "s|__DEADLINE__|${RV_POD_DEADLINE:-5400}|g" \
   "$HERE/profiles/$PROFILE.pod.yaml" | kc create -f - >/dev/null || { echo "ABORT: không tạo được pod trên k3s (kubectl create lỗi)" >&2; exit 125; }

@@ -1,0 +1,62 @@
+# One unattended review. poll.sh and rvctl.sh fill the __NAME__ placeholders with sed and create it in the review-agent namespace.
+# Only this project's GitHub token is mapped in, so the agent never holds another account's token.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: __JOB__
+  namespace: review-agent
+  labels: { app: rv-agent, rv/project: "__PROJECT__", rv/pr: "__PR__" }
+spec:
+  backoffLimit: 0
+  activeDeadlineSeconds: 5400
+  ttlSecondsAfterFinished: 172800
+  template:
+    metadata:
+      labels: { app: rv-agent, rv/project: "__PROJECT__", rv/pr: "__PR__" }
+    spec:
+      restartPolicy: Never
+      serviceAccountName: agent
+      priorityClassName: review-env
+      securityContext: { runAsNonRoot: true, runAsUser: 1000, runAsGroup: 1000, fsGroup: 1000 }
+      containers:
+        - name: agent
+          image: rv-agent:dev
+          imagePullPolicy: Never
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities: { drop: [ALL] }
+          command: ["/opt/agent/run_review.sh", "__PROJECT__", "__PR__"]
+          env:
+            - { name: RV_HOST, value: agent }
+            - { name: MODEL, value: "__MODEL__" }
+            # Its test pods go to review-agent-tests, where the admission policy allows only a swag-server style pod.
+            - { name: RV_NS, value: review-agent-tests }
+            - { name: HTTPS_PROXY, value: "http://egress-proxy.review-agent:3128" }
+            - { name: HTTP_PROXY, value: "http://egress-proxy.review-agent:3128" }
+            - { name: NO_PROXY, value: "10.43.0.1,localhost,127.0.0.1,kubernetes.default.svc" }
+            - name: __TOKEN_VAR__
+              valueFrom: { secretKeyRef: { name: agent-secrets, key: __TOKEN_VAR__, optional: true } }
+            - name: CLAUDE_CREDENTIALS_B64
+              valueFrom: { secretKeyRef: { name: agent-secrets, key: CLAUDE_CREDENTIALS_B64, optional: true } }
+            - name: CLAUDE_CODE_OAUTH_TOKEN
+              valueFrom: { secretKeyRef: { name: agent-secrets, key: CLAUDE_CODE_OAUTH_TOKEN, optional: true } }
+            - name: OPENCODE_API_KEY
+              valueFrom: { secretKeyRef: { name: agent-secrets, key: OPENCODE_API_KEY, optional: true } }
+            - name: NOTION_TOKEN
+              valueFrom: { secretKeyRef: { name: agent-secrets, key: NOTION_TOKEN, optional: true } }
+          resources:
+            requests: { cpu: 500m, memory: 1Gi }
+            limits: { memory: 4Gi }
+          volumeMounts:
+            - { name: data, mountPath: /Users/hiiamtrong/.pi/agent/review-pipeline, subPath: .pi/agent/review-pipeline }
+            - { name: data, mountPath: /Users/hiiamtrong/.pi/agent/sessions, subPath: .pi/agent/sessions }
+            - { name: data, mountPath: /Users/hiiamtrong/.pi/agent/memory, subPath: .pi/agent/memory }
+            # Claude Code's login, refreshed by the CLI itself: kept on the volume so a refresh survives the run instead of re-refreshing the same token every time.
+            - { name: data, mountPath: /Users/hiiamtrong/.claude, subPath: .claude }
+            - { name: data, mountPath: /Users/hiiamtrong/Works, subPath: Works }
+            - { name: projects, mountPath: /etc/review }
+            - { name: tmp, mountPath: /tmp }
+      volumes:
+        - { name: data, persistentVolumeClaim: { claimName: agent-data } }
+        - { name: projects, configMap: { name: projects } }
+        - { name: tmp, emptyDir: {} }

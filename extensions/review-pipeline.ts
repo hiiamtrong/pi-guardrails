@@ -338,7 +338,8 @@ export function readPolicy(rules: string[]): Policy {
       else if (key === "triggers" && value !== null && typeof value === "object" && !Array.isArray(value))
         policy.triggers = { ...policy.triggers, ...(value as Record<string, unknown>) };
       else if (key === "watchPaths" && typeof value === "string" && validPattern(value)) policy.watchPaths = value;
-      else if (key === "k3sHost" && typeof value === "string" && /^[\w.-]+@[\w.-]+$/.test(value)) policy.k3sHost = value;
+      // "local" means the caller already runs in the cluster (the review agent's pod), where rv_k3s.sh talks to kubectl directly.
+      else if (key === "k3sHost" && typeof value === "string" && (value === "local" || /^[\w.-]+@[\w.-]+$/.test(value))) policy.k3sHost = value;
       else throw new Error(`${file}: khóa "${key}" lạ hoặc giá trị sai kiểu`);
     }
   }

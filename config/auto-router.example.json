@@ -1,8 +1,31 @@
 {
-  "tiers": {
-    "light": ["opencode-go/glm-5.3-flash", "claude-bridge/claude-haiku-5-5"],
-    "standard": ["opencode-go/glm-5.3", "claude-bridge/claude-sonnet-5-5"],
-    "heavy": ["claude-bridge/claude-opus-5-5", "opencode-go/kimi-k3.1-pro"]
+  "router": {
+    "tiers": {
+      "light": ["opencode-go/glm-5.3-flash", "claude-bridge/claude-haiku-5-5"],
+      "standard": ["opencode-go/glm-5.3", "claude-bridge/claude-sonnet-5-5"],
+      "heavy": ["claude-bridge/claude-opus-5-5", "opencode-go/kimi-k3.1-pro"]
+    },
+    "vision": ["opencode-go/kimi-k3.1-pro", "opencode-go/glm-5.3-flash", "claude-bridge/claude-sonnet-5-5"]
   },
-  "vision": ["opencode-go/kimi-k3.1-pro", "opencode-go/glm-5.3-flash", "claude-bridge/claude-sonnet-5-5"]
+  "anthropic": {
+    "tiers": {
+      "light": ["claude-bridge/claude-haiku-5-5"],
+      "standard": ["claude-bridge/claude-sonnet-5-5"],
+      "heavy": ["claude-bridge/claude-opus-5-5"]
+    }
+  },
+  "openai": {
+    "tiers": {
+      "light": ["openai-codex/gpt-6-luna"],
+      "standard": ["openai-codex/gpt-6.1-terra"],
+      "heavy": ["openai-codex/gpt-6.1-sol"]
+    }
+  },
+  "opencode": {
+    "tiers": {
+      "light": ["opencode-go/glm-5.3-flash"],
+      "standard": ["opencode-go/glm-5.3"],
+      "heavy": ["opencode-go/kimi-k3.1-pro"]
+    }
+  }
 }

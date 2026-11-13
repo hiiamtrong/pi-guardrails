@@ -8,11 +8,18 @@ const dir = mkdtempSync(join(tmpdir(), "auto-router-"));
 process.env.PI_AUTO_ROUTER_CONFIG = join(dir, "none.json");
 const { default: ext, benchFor, classifyTier, loadConfig } = await import("../extensions/auto-router.ts");
 
-type Def = { route: (request: unknown, ctx: unknown) => Promise<{ model: { id: string }; state: any }> };
+type Def = {
+  id: string;
+  route: (request: unknown, ctx: unknown) => Promise<{ model: { id: string; provider: string }; state: any }>;
+};
 let def: Def;
+const defs: Record<string, Def> = {};
 const handlers: Record<string, (event: unknown) => void> = {};
 ext({
-  registerVirtualModel: (d: Def) => (def = d),
+  registerVirtualModel: (d: Def) => {
+    defs[d.id] = d;
+    if (d.id === "router") def = d;
+  },
   on: (event: string, handler: (event: unknown) => void) => (handlers[event] = handler),
 } as never);
 
@@ -203,12 +210,27 @@ test("image turn goes to the first heavy model that accepts images, next text tu
 });
 
 test("loadConfig: missing file gives defaults, bad shapes throw", () => {
-  assert.equal(loadConfig(join(dir, "none.json")).tiers.light[0], "claude-bridge/claude-haiku-5-5");
+  const defaults = loadConfig(join(dir, "none.json"));
+  assert.deepEqual([...defaults.routers.keys()], ["router", "anthropic"]);
+  assert.equal(defaults.routers.get("router")?.tiers.light[0], "claude-bridge/claude-haiku-5-5");
+  assert.deepEqual(defaults.routers.get("anthropic")?.tiers, {
+    light: ["claude-bridge/claude-haiku-5-5"],
+    standard: ["claude-bridge/claude-sonnet-5-5"],
+    heavy: ["claude-bridge/claude-opus-5-5"],
+  });
   const bad = join(dir, "bad.json");
   const cases: [string, RegExp][] = [
-    [JSON.stringify({ tiers: { standard: "ab" } }), /tiers\.standard/],
+    [JSON.stringify({ tiers: { standard: ["a/b"] } }), /router block/],
+    [JSON.stringify({ vision: ["a/b"] }), /router block/],
+    [JSON.stringify({ router: { tiers: { standard: "ab" } } }), /router\.tiers\.standard/],
+    [JSON.stringify({ router: { tiers: "ab" } }), /router\.tiers must be an object/],
+    [JSON.stringify({ router: { vision: "a/b" } }), /router\.vision/],
+    [JSON.stringify({ router: { visoin: ["a/b"] } }), /router has unknown key\(s\) visoin/],
+    [JSON.stringify({ router: { tiers: { heavy: ["a/b"] }, classifiers: ["c/d"] } }), /unknown key\(s\) classifiers/],
     [JSON.stringify({ classifiers: ["nocolon"] }), /classifiers/],
-    [JSON.stringify({ vision: "a/b" }), /vision/],
+    [JSON.stringify({ anthropic: "a/b" }), /anthropic must be an object/],
+    [JSON.stringify({ anthropic: { tiers: { light: "a/b" } } }), /anthropic\.tiers\.light/],
+    [JSON.stringify({ anthropic: { vision: "a/b" } }), /anthropic\.vision/],
     ["null", /JSON object/],
     ["{", /invalid/],
   ];
@@ -217,12 +239,10 @@ test("loadConfig: missing file gives defaults, bad shapes throw", () => {
     assert.throws(() => loadConfig(bad), pattern);
   }
   const ok = join(dir, "ok.json");
-  writeFileSync(ok, JSON.stringify({ tiers: { heavy: ["a/b"] }, classifiers: ["c/d"] }));
-  assert.deepEqual(loadConfig(ok), {
-    tiers: { ...loadConfig(join(dir, "none.json")).tiers, heavy: ["a/b"] },
-    classifiers: ["c/d"],
-    vision: [],
-  });
+  writeFileSync(ok, JSON.stringify({ router: { tiers: { heavy: ["a/b"] } }, classifiers: ["c/d"] }));
+  const config = loadConfig(ok);
+  assert.deepEqual(config.classifiers, ["c/d"]);
+  assert.deepEqual(config.routers.get("router")?.tiers, { ...defaults.routers.get("router")?.tiers, heavy: ["a/b"] });
 });
 
 test("no usable model: throws when no candidate has credentials, for user and direct requests", async () => {
@@ -315,9 +335,11 @@ test("a tier change re-picks even when the previous model is listed in both tier
   writeFileSync(
     config,
     JSON.stringify({
-      tiers: {
-        standard: ["opencode-go/kimi-k3.1-pro"],
-        heavy: ["claude-bridge/claude-opus-5-5", "opencode-go/kimi-k3.1-pro"],
+      router: {
+        tiers: {
+          standard: ["opencode-go/kimi-k3.1-pro"],
+          heavy: ["claude-bridge/claude-opus-5-5", "opencode-go/kimi-k3.1-pro"],
+        },
       },
     }),
   );
@@ -354,8 +376,8 @@ test("classifier: no user message returns the fallback instead of crashing", asy
 
 test("loadConfig: a __proto__ key in tiers does not leak into other objects", () => {
   const file = join(dir, "proto.json");
-  writeFileSync(file, '{"tiers":{"__proto__":{"light":["x/y"]}}}');
-  assert.equal(loadConfig(file).tiers.light[0], "claude-bridge/claude-haiku-5-5");
+  writeFileSync(file, '{"router":{"tiers":{"__proto__":{"light":["x/y"]}}}}');
+  assert.equal(loadConfig(file).routers.get("router")?.tiers.light[0], "claude-bridge/claude-haiku-5-5");
   assert.equal(({} as Record<string, unknown>).light, undefined);
 });
 
@@ -387,7 +409,7 @@ test("classifier: a configured provider that lacks the model, or an answer with 
 
 test("loadConfig: null values mean absent and give the defaults", () => {
   const file = join(dir, "nulls.json");
-  writeFileSync(file, '{"tiers":null,"classifiers":null,"vision":null}');
+  writeFileSync(file, '{"router":{"tiers":null,"vision":null},"anthropic":null,"classifiers":null}');
   assert.deepEqual(loadConfig(file), loadConfig(join(dir, "none.json")));
 });
 
@@ -444,4 +466,113 @@ test("a run that ends on a plan-exhaustion error resumes once on another model",
   turnError("opencode-go", "kimi-k3.1-pro", "Go usage limit exceeded");
   (handlers.turn_start as () => void)();
   assert.equal(settle({ outcome: "error" }), undefined);
+});
+
+test("a vision entry outside every tier still takes the image turn", async () => {
+  const config = join(dir, "vision-only.json");
+  writeFileSync(config, JSON.stringify({ router: { vision: ["opencode-go/kimi-k3.1-pro"] } }));
+  process.env.PI_AUTO_ROUTER_CONFIG = config;
+  try {
+    const image = [{ role: "user", content: [{ type: "image", data: "", mimeType: "image/png" }] }];
+    const r = await def.route(req({ reason: "user", messages: image }), makeCtx().ctx);
+    assert.equal(r.model.id, "kimi-k3.1-pro");
+  } finally {
+    process.env.PI_AUTO_ROUTER_CONFIG = join(dir, "none.json");
+  }
+});
+
+test("every top-level block registers its own auto/<key> router, and an empty one names itself", async () => {
+  const config = join(dir, "custom-routers.json");
+  writeFileSync(config, JSON.stringify({ openai: { tiers: { heavy: ["openai-codex/gpt-6.1-sol"] } } }));
+  process.env.PI_AUTO_ROUTER_CONFIG = config;
+  try {
+    const registered: string[] = [];
+    let openai: Def | undefined;
+    ext({
+      registerVirtualModel: (d: Def) => {
+        registered.push(d.id);
+        if (d.id === "openai") openai = d;
+      },
+      on: () => {},
+    } as never);
+    assert.deepEqual(registered, ["router", "anthropic", "openai"]);
+    assert.deepEqual(loadConfig(config).routers.get("openai")?.tiers.light, []);
+    await assert.rejects(openai!.route(req({ reason: "user" }), makeCtx().ctx), /no usable model in .*auto\/openai/);
+  } finally {
+    process.env.PI_AUTO_ROUTER_CONFIG = join(dir, "none.json");
+  }
+});
+
+test("a broken config file does not stop startup: router and anthropic register, the turn reports the error", async () => {
+  const config = join(dir, "broken.json");
+  writeFileSync(config, "{");
+  process.env.PI_AUTO_ROUTER_CONFIG = config;
+  try {
+    const registered: Def[] = [];
+    ext({ registerVirtualModel: (d: Def) => registered.push(d), on: () => {} } as never);
+    assert.deepEqual(registered.map((d) => d.id), ["router", "anthropic"]);
+    await assert.rejects(registered[0].route(req({ reason: "user" }), makeCtx().ctx), /invalid/);
+  } finally {
+    process.env.PI_AUTO_ROUTER_CONFIG = join(dir, "none.json");
+  }
+});
+
+const anthropic = () => defs.anthropic;
+const routeAnth = (o: Record<string, unknown>, made = makeCtx()) => anthropic().route(req(o), made.ctx);
+
+test("anthropic router: each tier picks a Claude model", async () => {
+  const cases: [string, string][] = [
+    ["light", "claude-haiku-5-5"],
+    ["standard", "claude-sonnet-5-5"],
+    ["heavy", "claude-opus-5-5"],
+  ];
+  for (const [tier, id] of cases) {
+    const made = makeCtx({ configured: ["typesafe"], probabilities: { [tier]: 1 } });
+    const r = await routeAnth({ reason: "user" }, made);
+    assert.equal(r.model.id, id);
+    assert.equal(r.model.provider, "claude-bridge");
+  }
+});
+
+test("anthropic router: a continuation on a model of another plan is re-picked inside its own tiers", async () => {
+  const state = { tier: "standard", model: "opencode-go/kimi-k3.1-pro" };
+  const r = await routeAnth({ reason: "continuation", state });
+  assert.equal(r.model.id, "claude-sonnet-5-5");
+  assert.notEqual(r.state, state);
+});
+
+test("anthropic router: a transient retry never sticks to a model of another plan", async () => {
+  const r = await routeAnth({
+    reason: "retry",
+    state: { tier: "standard", model: "opencode-go/kimi-k3.1-pro" },
+    failed: { model: kimi, message: { errorMessage: "fetch failed" } },
+  });
+  assert.equal(r.model.provider, "claude-bridge");
+});
+
+test("anthropic router: an image turn stays on Claude, and the default vision list keeps it off opus", async () => {
+  const image = [{ role: "user", content: [{ type: "image", data: "", mimeType: "image/png" }] }];
+  const r = await routeAnth({ reason: "user", messages: image });
+  assert.equal(r.model.provider, "claude-bridge");
+  assert.equal(r.model.id, "claude-sonnet-5-5");
+});
+
+test("anthropic router: its own tier lists override the shared ones", async () => {
+  const config = join(dir, "anthropic-tiers.json");
+  writeFileSync(
+    config,
+    JSON.stringify({ router: { tiers: { heavy: ["opencode-go/glm-5.3"] } }, anthropic: { tiers: { heavy: ["claude-bridge/claude-sonnet-5-5"] } } }),
+  );
+  process.env.PI_AUTO_ROUTER_CONFIG = config;
+  try {
+    const made = makeCtx({ configured: ["typesafe"], probabilities: { heavy: 1 } });
+    assert.equal((await routeAnth({ reason: "user" }, made)).model.id, "claude-sonnet-5-5");
+  } finally {
+    process.env.PI_AUTO_ROUTER_CONFIG = join(dir, "none.json");
+  }
+});
+
+test("anthropic router: throws, naming itself, when the Claude provider has no credentials", async () => {
+  const ctx = { modelRegistry: { ...makeCtx().ctx.modelRegistry, hasConfiguredAuth: () => false } };
+  await assert.rejects(anthropic().route(req({ reason: "user" }), ctx), /no usable model in .*auto\/anthropic/);
 });

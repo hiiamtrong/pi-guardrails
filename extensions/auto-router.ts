@@ -60,9 +60,22 @@ const DEFAULT_TIERS: Record<Tier, string[]> = {
   standard: ["claude-bridge/claude-sonnet-5-5", "opencode-go/kimi-k3.1-pro"],
   heavy: ["claude-bridge/claude-opus-5-5", "opencode-go/glm-5.3"],
 };
+// The Anthropic-only router keeps its own tiers, so a Claude plan never falls back to a model of another subscription.
+const DEFAULT_ANTHROPIC_TIERS: Record<Tier, string[]> = {
+  light: ["claude-bridge/claude-haiku-5-5"],
+  standard: ["claude-bridge/claude-sonnet-5-5"],
+  heavy: ["claude-bridge/claude-opus-5-5"],
+};
 const DEFAULT_CLASSIFIERS = ["typesafe/jev-latest", "openrouter/~typesafe/jev-latest", "opencode/jev-1.13-free"];
 
-type Config = { tiers: Record<Tier, string[]>; classifiers: string[]; vision: string[] };
+type Plan = { tiers: Record<Tier, string[]>; vision: string[] };
+type Config = { classifiers: string[]; routers: Map<string, Plan> };
+const EMPTY_TIERS: Record<Tier, string[]> = { light: [], standard: [], heavy: [] };
+// Every top-level block except classifiers is a router, auto/<key>; router and anthropic exist even when the file omits them.
+const DEFAULT_ROUTERS = new Map<string, Plan>([
+  ["router", { tiers: DEFAULT_TIERS, vision: [] }],
+  ["anthropic", { tiers: DEFAULT_ANTHROPIC_TIERS, vision: ["claude-bridge/claude-sonnet-5-5"] }],
+]);
 
 // Pi retries only transient errors; plan-exhaustion errors end the turn, so both lists are also checked at turn_end.
 const QUOTA_ERROR =
@@ -106,30 +119,41 @@ export function loadConfig(path = configPath()): Config {
   try {
     raw = readFileSync(path, "utf8");
   } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT")
-      return { tiers: DEFAULT_TIERS, classifiers: DEFAULT_CLASSIFIERS, vision: [] };
-    throw error;
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    raw = "{}";
   }
-  let parsed: { tiers?: Partial<Record<Tier, unknown>>; classifiers?: unknown; vision?: unknown };
+  let parsed: Record<string, unknown>;
   try {
     parsed = JSON.parse(raw);
   } catch (error) {
     throw new Error(`auto-router: invalid ${path}: ${(error as Error).message}`);
   }
   if (!parsed || typeof parsed !== "object") throw new Error(`auto-router: ${path} must be a JSON object`);
+  if (parsed.tiers !== undefined || parsed.vision !== undefined)
+    throw new Error(`auto-router: ${path} tiers and vision now go in a router block, e.g. "router": { "tiers": {...} }`);
   const refList = (key: string, value: unknown): string[] => {
     if (!Array.isArray(value) || !value.every((ref) => typeof ref === "string" && ref.includes("/"))) {
       throw new Error(`auto-router: ${path} ${key} must be a list of "provider/model" strings`);
     }
     return value;
   };
-  const tiers = { ...DEFAULT_TIERS, ...parsed.tiers };
-  for (const tier of TIERS) refList(`tiers.${tier}`, tiers[tier]);
-  return {
-    tiers: tiers as Record<Tier, string[]>,
-    classifiers: refList("classifiers", parsed.classifiers ?? DEFAULT_CLASSIFIERS),
-    vision: refList("vision", parsed.vision ?? []),
-  };
+  const routers = new Map(DEFAULT_ROUTERS);
+  for (const [id, block] of Object.entries(parsed)) {
+    if (id === "classifiers" || block == null) continue;
+    if (typeof block !== "object" || Array.isArray(block)) throw new Error(`auto-router: ${path} ${id} must be an object`);
+    const { tiers, vision } = block as { tiers?: Partial<Record<Tier, unknown>>; vision?: unknown };
+    const extra = Object.keys(block).filter((key) => key !== "tiers" && key !== "vision");
+    if (extra.length)
+      throw new Error(
+        `auto-router: ${path} ${id} has unknown key(s) ${extra.join(", ")}; a block holds tiers and vision only`,
+      );
+    if (tiers != null && (typeof tiers !== "object" || Array.isArray(tiers)))
+      throw new Error(`auto-router: ${path} ${id}.tiers must be an object`);
+    const merged = { ...(DEFAULT_ROUTERS.get(id)?.tiers ?? EMPTY_TIERS), ...tiers } as Record<Tier, string[]>;
+    for (const tier of TIERS) refList(`${id}.tiers.${tier}`, merged[tier]);
+    routers.set(id, { tiers: merged, vision: refList(`${id}.vision`, vision ?? []) });
+  }
+  return { classifiers: refList("classifiers", parsed.classifiers ?? DEFAULT_CLASSIFIERS), routers };
 }
 
 function textOf(message: Message): string {
@@ -227,76 +251,95 @@ export default function (pi: ExtensionAPI) {
     };
   });
 
-  pi.registerVirtualModel({
-    provider: "auto",
-    id: "router",
-    name: "Auto router",
-    thinkingLevels: ["low", "medium", "high", "xhigh"],
-    async route(request, ctx): Promise<Route> {
-      const { tiers, classifiers, vision } = loadConfig();
-      const usable = (ref: string) => {
-        const model = ctx.modelRegistry.find(...splitRef(ref));
-        return model &&
-          ctx.modelRegistry.hasConfiguredAuth(model) &&
-          (benched.get(ref) ?? 0) < Date.now() &&
-          (benched.get(model.provider) ?? 0) < Date.now()
-          ? model
-          : undefined;
-      };
-      const pick = (tier: Tier, skip?: string): Model => {
-        const near = [...TIERS].sort(
-          (a, b) => Math.abs(TIERS.indexOf(a) - TIERS.indexOf(tier)) - Math.abs(TIERS.indexOf(b) - TIERS.indexOf(tier)),
-        );
-        for (const name of near) {
-          for (const ref of tiers[name]) {
-            const model = ref !== skip ? usable(ref) : undefined;
-            if (model) return model;
+  const registerRouter = (id: string) =>
+    pi.registerVirtualModel({
+      provider: "auto",
+      id,
+      name: id === "router" ? "Auto router" : `Auto router (${id})`,
+      thinkingLevels: ["low", "medium", "high", "xhigh"],
+      async route(request, ctx): Promise<Route> {
+        const config = loadConfig();
+        const { tiers, vision } = config.routers.get(id) ?? { tiers: EMPTY_TIERS, vision: [] };
+        const { classifiers } = config;
+        // A router only reaches models of its own plan; a state or failed model of another plan is re-picked.
+        const belongs = (ref: string) => vision.includes(ref) || TIERS.some((tier) => tiers[tier].includes(ref));
+        const usable = (ref: string) => {
+          const model = belongs(ref) ? ctx.modelRegistry.find(...splitRef(ref)) : undefined;
+          return model &&
+            ctx.modelRegistry.hasConfiguredAuth(model) &&
+            (benched.get(ref) ?? 0) < Date.now() &&
+            (benched.get(model.provider) ?? 0) < Date.now()
+            ? model
+            : undefined;
+        };
+        const pick = (tier: Tier, skip?: string): Model => {
+          const near = [...TIERS].sort(
+            (a, b) =>
+              Math.abs(TIERS.indexOf(a) - TIERS.indexOf(tier)) - Math.abs(TIERS.indexOf(b) - TIERS.indexOf(tier)),
+          );
+          for (const name of near) {
+            for (const ref of tiers[name]) {
+              const model = ref !== skip ? usable(ref) : undefined;
+              if (model) return model;
+            }
           }
+          throw new Error(
+            `auto-router: no usable model in ${configPath()} auto/${id}; check /login, the model ids, and whether every model is benched after errors`,
+          );
+        };
+        const pickVision = (): Model | undefined =>
+          [...vision, ...tiers.heavy, ...tiers.standard, ...tiers.light]
+            .map(usable)
+            .find((model) => model?.input.includes("image"));
+        const tierOf = (ref: string): Tier | undefined => TIERS.find((tier) => tiers[tier].includes(ref));
+        const state = request.state;
+        const route = (model: Model, tier: Tier): Route => {
+          const ref = refOf(model);
+          // Pi appends a session entry for every new state object, so reuse the current one when nothing changed.
+          const next = state?.tier === tier && state.model === ref ? state : { tier, model: ref };
+          return { model, thinkingLevel: request.thinkingLevel, state: next };
+        };
+
+        if (request.reason === "direct") return { model: pick("light"), thinkingLevel: request.thinkingLevel };
+
+        if (request.reason === "retry" && request.failed) {
+          const failed = refOf(request.failed.model);
+          const tier = state?.tier ?? tierOf(failed) ?? "standard";
+          const transient = !bench(
+            request.failed.model.provider,
+            request.failed.model.id,
+            request.failed.message.errorMessage ?? "",
+          );
+          // Transient errors retry on the same model so the prompt cache and thinking signatures stay valid.
+          if (transient && belongs(failed)) return route(request.failed.model, tier);
+          return route(pick(tier, failed), tier);
         }
-        throw new Error(
-          `auto-router: no usable model in ${configPath()} tiers; check /login, the model ids, and whether every model is benched after errors`,
-        );
-      };
-      const pickVision = (): Model | undefined =>
-        [...vision, ...tiers.heavy, ...tiers.standard, ...tiers.light]
-          .map(usable)
-          .find((model) => model?.input.includes("image"));
-      const tierOf = (ref: string): Tier | undefined => TIERS.find((tier) => tiers[tier].includes(ref));
-      const state = request.state;
-      const route = (model: Model, tier: Tier): Route => {
-        const ref = refOf(model);
-        // Pi appends a session entry for every new state object, so reuse the current one when nothing changed.
-        const next = state?.tier === tier && state.model === ref ? state : { tier, model: ref };
-        return { model, thinkingLevel: request.thinkingLevel, state: next };
-      };
 
-      if (request.reason === "direct") return { model: pick("light"), thinkingLevel: request.thinkingLevel };
+        // Tool follow-ups keep the model of the turn so the prompt cache stays valid.
+        if (request.reason === "continuation" && state) {
+          return route(usable(state.model) ?? pick(state.tier), state.tier);
+        }
 
-      if (request.reason === "retry" && request.failed) {
-        const failed = refOf(request.failed.model);
-        const tier = state?.tier ?? tierOf(failed) ?? "standard";
-        // Transient errors retry on the same model so the prompt cache and thinking signatures stay valid.
-        if (!bench(request.failed.model.provider, request.failed.model.id, request.failed.message.errorMessage ?? ""))
-          return route(request.failed.model, tier);
-        return route(pick(tier, failed), tier);
-      }
+        if (lastUserHasImage(request.messages)) {
+          const model = pickVision();
+          if (model) return route(model, state?.tier ?? "standard");
+        }
+        const tier = await classifyTier(request, ctx, classifiers);
+        const previous = request.previous?.model;
+        const keep =
+          previous && (!state || state.tier === tier) && tiers[tier].includes(refOf(previous))
+            ? usable(refOf(previous))
+            : undefined;
+        return route(keep ?? pick(tier), tier);
+      },
+    });
 
-      // Tool follow-ups keep the model of the turn so the prompt cache stays valid.
-      if (request.reason === "continuation" && state) {
-        return route(usable(state.model) ?? pick(state.tier), state.tier);
-      }
-
-      if (lastUserHasImage(request.messages)) {
-        const model = pickVision();
-        if (model) return route(model, state?.tier ?? "standard");
-      }
-      const tier = await classifyTier(request, ctx, classifiers);
-      const previous = request.previous?.model;
-      const keep =
-        previous && (!state || state.tier === tier) && tiers[tier].includes(refOf(previous))
-          ? usable(refOf(previous))
-          : undefined;
-      return route(keep ?? pick(tier), tier);
-    },
-  });
+  let ids: string[];
+  // A broken file is reported on the next turn; startup must not fail on it.
+  try {
+    ids = [...loadConfig().routers.keys()];
+  } catch {
+    ids = [...DEFAULT_ROUTERS.keys()];
+  }
+  for (const id of ids) registerRouter(id);
 }

@@ -53,6 +53,10 @@ def classify(pr, reviews, inline, conversation, commits, me, acked=None):
     mine = [r for r in reviews if author(r).get('login') == me and r['state'] != 'PENDING' and (r['state'] != 'COMMENTED' or (r['body'] or '').strip())]
     last = max(mine, key=lambda r: r['submitted_at'], default=None)
     head = pr['head']['sha']
+    # A dismissed duplicate does not end my review while another of mine still stands on this head: the approve posted first is still in force.
+    if last and last['state'] == 'DISMISSED':
+        standing = [r for r in mine if r['state'] != 'DISMISSED' and r['commit_id'] == head]
+        last = max(standing, key=lambda r: r['submitted_at'], default=last)
     row = {'number': pr['number'], 'author': author(pr).get('login', 'ghost'), 'title': pr['title'], 'draft': pr['draft'],
            'state': last and last['state'], 'at': last and last['submitted_at'], 'behind': 0, 'human': 0, 'bots': 0}
     if not last:

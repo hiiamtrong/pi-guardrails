@@ -49,6 +49,14 @@ class Classify(unittest.TestCase):
     def test_a_dismissed_review_is_stale_even_on_the_head(self):
         self.assertEqual(board([review('DISMISSED', HEAD, '2026-01-01T00:00:00Z')])['bucket'], 'stale')
 
+    def test_a_dismissed_duplicate_leaves_the_approve_on_the_head_in_force(self):
+        row = board([review('APPROVED', HEAD, '2026-01-01T00:00:00Z'), review('DISMISSED', HEAD, '2026-01-02T00:00:00Z')])
+        self.assertEqual((row['bucket'], row['state']), ('done', 'APPROVED'))
+
+    def test_a_dismissed_approve_with_no_standing_review_on_the_head_is_still_stale(self):
+        row = board([review('APPROVED', OLD, '2026-01-01T00:00:00Z'), review('DISMISSED', HEAD, '2026-01-02T00:00:00Z')])
+        self.assertEqual(row['bucket'], 'stale')
+
     def test_a_force_pushed_away_commit_is_stale_with_unknown_distance(self):
         row = board([review('APPROVED', 'c' * 40, '2026-01-01T00:00:00Z')])
         self.assertEqual((row['bucket'], row['behind']), ('stale', None))

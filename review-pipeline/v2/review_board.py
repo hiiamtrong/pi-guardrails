@@ -1,7 +1,7 @@
-"""review_board.py [--repo OWNER/NAME] [--reviewer LOGIN] [--author-pattern REGEX] [--no-color]
+"""review_board.py [--repo OWNER/NAME] [--reviewer LOGIN] [--author-pattern REGEX] [--no-color] [--json]
 
 One terminal screen for "which PR needs me next": every open PR the reviewer has reviewed or was asked to review,
-grouped by the next action. Read-only on GitHub (GET and search only). A review is stale when the PR head moved since it
+grouped by the next action. Read-only on GitHub (GET only). A review is stale when the PR head moved since it
 (the repo dismisses approvals on push, so DISMISSED counts too); replies are counted after the reviewer's last review or
 after the last acknowledgement, whichever is later.
 
@@ -57,14 +57,16 @@ def classify(pr, reviews, inline, conversation, commits, me, acked=None):
     if last and last['state'] == 'DISMISSED':
         standing = [r for r in mine if r['state'] != 'DISMISSED' and r['commit_id'] == head]
         last = max(standing, key=lambda r: r['submitted_at'], default=last)
-    row = {'number': pr['number'], 'author': author(pr).get('login', 'ghost'), 'title': pr['title'], 'draft': pr['draft'],
-           'state': last and last['state'], 'at': last and last['submitted_at'], 'behind': 0, 'human': 0, 'bots': 0}
+    row = {'number': pr['number'], 'author': author(pr).get('login', 'ghost'), 'title': pr['title'], 'draft': pr['draft'], 'head': head,
+           'state': last and last['state'], 'at': last and last['submitted_at'], 'behind': 0, 'human': 0, 'bots': 0, 'reply_at': None}
     if not last:
         return {**row, 'bucket': 'unreviewed'}
     seen_until = max(last['submitted_at'], acked or '')
     newer = [x for x in others(reviews, inline, conversation, me) if stamp(x) > seen_until]
     row['bots'] = sum(author(x).get('type') == 'Bot' for x in newer)
     row['human'] = len(newer) - row['bots']
+    # The count falls back to 0 after an ack, so only the time tells auto_pick.py that a reply is a new one.
+    row['reply_at'] = max((stamp(x) for x in newer if author(x).get('type') != 'Bot'), default=None)
     shas = [c['sha'] for c in commits]
     # None = the reviewed commit is gone from the branch (force-push or rebase).
     row['behind'] = len(shas) - 1 - shas.index(last['commit_id']) if last['commit_id'] in shas else None
@@ -121,7 +123,11 @@ def gh(env, *args):
 
 
 def gh_list(env, endpoint):
-    return [json.loads(line) for line in gh(env, 'api', '--paginate', endpoint, '--jq', '.[]').splitlines()]
+    # gh can exit 0 with a warning or an HTML page on stdout; one unparseable line must read as "cannot read this" (an error row), not a traceback.
+    try:
+        return [json.loads(line) for line in gh(env, 'api', '--paginate', endpoint, '--jq', '.[]').splitlines() if line.strip()]
+    except ValueError as err:
+        raise RuntimeError(f'gh api {endpoint}: JSON lỗi ({err})') from err
 
 
 def fetch_replies(env, repo, number):
@@ -130,9 +136,18 @@ def fetch_replies(env, repo, number):
             gh_list(env, f'{base}/issues/{number}/comments?per_page=100'))
 
 
-def fetch(env, repo, number):
+def fetch(env, repo, number, reviews=None):
+    """reviews comes from the candidacy check when it already fetched them: the same list twice per PR per poll is waste."""
     base = f'repos/{repo}'
-    return (json.loads(gh(env, 'api', f'{base}/pulls/{number}')), *fetch_replies(env, repo, number),
+    if reviews is None:
+        reviews = gh_list(env, f'{base}/pulls/{number}/reviews?per_page=100')
+    try:
+        pr = json.loads(gh(env, 'api', f'{base}/pulls/{number}'))
+    except ValueError as err:
+        raise RuntimeError(f'gh api {base}/pulls/{number}: JSON lỗi ({err})') from err
+    return (pr, reviews,
+            gh_list(env, f'{base}/pulls/{number}/comments?per_page=100'),
+            gh_list(env, f'{base}/issues/{number}/comments?per_page=100'),
             gh_list(env, f'{base}/pulls/{number}/commits?per_page=100'))
 
 
@@ -170,10 +185,15 @@ def ack(env, repo, numbers, me, path=ACK_FILE):
         sys.exit(1)
 
 
-def load(env, repo, number, me, acks=None):
+def mine(reviews, me):
+    """Have I reviewed this PR? A PR I never touched and was not asked to review is not mine to track."""
+    return any(author(r).get('login') == me and r['state'] != 'PENDING' for r in reviews)
+
+
+def load(env, repo, number, me, acks=None, reviews=None):
     # One PR that cannot be read (deleted, timeout) must not blank the whole board.
     try:
-        return classify(*fetch(env, repo, number), me, (acks or {}).get(f'{repo}#{number}'))
+        return classify(*fetch(env, repo, number, reviews), me, (acks or {}).get(f'{repo}#{number}'))
     except RuntimeError as err:
         return {'number': number, 'error': str(err)}
 
@@ -184,6 +204,7 @@ def main():
     ap.add_argument('--reviewer')
     ap.add_argument('--author-pattern')
     ap.add_argument('--no-color', action='store_true')
+    ap.add_argument('--json', action='store_true', help='print the rows as JSON (for auto_pick.py) instead of the board')
     ap.add_argument('--ack', nargs='+', type=int, metavar='N', help='mark the replies on these PRs as read')
     args = ap.parse_args()
     env_file = pathlib.Path('reports/reviews/tools/.pipeline-env')
@@ -193,27 +214,52 @@ def main():
     if not (repo and me):
         sys.exit('thiếu REPO và REVIEWER: truyền --repo/--reviewer, hoặc chạy trong thư mục review đã có reports/reviews/tools/.pipeline-env')
     try:
-        env = {**os.environ, 'GH_TOKEN': gh(os.environ, 'auth', 'token', '-h', 'github.com', '-u', me).strip()}
+        # A pod has no gh login, only the token it was given.
+        env = {**os.environ, 'GH_TOKEN': os.environ.get('GH_TOKEN') or gh(os.environ, 'auth', 'token', '-h', 'github.com', '-u', me).strip()}
         if args.ack:
             return ack(env, repo, args.ack, me)
+        # One open-PR listing answers both questions. The search API used to answer them, but a fine-grained token, which is the only way to
+        # give the poller a read-only token on private repos, is often refused there (403), and every row is fetched anyway.
         found = {}
-        for flag in ('--reviewed-by', '--review-requested'):
-            for item in json.loads(gh(env, 'search', 'prs', '--repo', repo, '--state', 'open', '--limit', '100', flag, me, '--json', 'number,author')):
-                found[item['number']] = item['author']['login']
+        for item in gh_list(env, f'repos/{repo}/pulls?state=open&per_page=100'):
+            requested = {u['login'] for u in item['requested_reviewers']}
+            found[item['number']] = (author(item).get('login', 'ghost'), me in requested)
     except RuntimeError as err:
         sys.exit(str(err))
-    numbers = sorted(n for n, author in found.items() if not pattern or re.search(pattern, author))
+    # Reviewed or review-requested PRs, by author; the board then shows each one's bucket, which is where "already reviewed" shows too.
+    # The author filter runs first, so an author this reviewer never touches costs no request at all.
+    numbers, seen_reviews, failed = [], {}, []
+    for number, (login, requested) in sorted(found.items()):
+        if pattern and not re.search(pattern, login):
+            continue
+        if not requested:
+            try:
+                reviews = gh_list(env, f'repos/{repo}/pulls/{number}/reviews?per_page=100')
+            except RuntimeError as err:
+                # A PR that cannot be read must not look like a PR I never reviewed, or it leaves the board unannounced.
+                failed.append({'number': number, 'error': str(err)})
+                continue
+            if not mine(reviews, me):
+                continue
+            seen_reviews[number] = reviews
+        numbers.append(number)
     acks = read_acks()
     with concurrent.futures.ThreadPoolExecutor(8) as pool:
-        loaded = list(pool.map(lambda n: load(env, repo, n, me, acks), numbers))
+        loaded = list(pool.map(lambda n: load(env, repo, n, me, acks, seen_reviews.get(n)), numbers)) + failed
     rows = [r for r in loaded if 'error' not in r]
     now = datetime.datetime.now(datetime.UTC)
     header = f'{repo} · {me} · {now.astimezone():%d/%m %H:%M}'
-    print(render(rows, now, sys.stdout.isatty() and not args.no_color and 'NO_COLOR' not in os.environ,
-                 shutil.get_terminal_size((120, 20)).columns, header))
+    if args.json:
+        print(json.dumps(rows))
+    else:
+        print(render(rows, now, sys.stdout.isatty() and not args.no_color and 'NO_COLOR' not in os.environ,
+                     shutil.get_terminal_size((120, 20)).columns, header))
     for r in loaded:
         if 'error' in r:
             print(f'#{r["number"]}: không đọc được ({r["error"]})', file=sys.stderr)
+    # An empty list must mean "nothing to review", not "every PR failed to load".
+    if args.json and any('error' in r for r in loaded):
+        sys.exit(1)
 
 
 if __name__ == '__main__':

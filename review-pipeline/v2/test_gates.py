@@ -73,6 +73,16 @@ class DocsOnly(unittest.TestCase):
         code, _ = check_runs('', HEAD, changed=[])
         self.assertEqual(code, 1)
 
+    def test_a_pr_that_adds_no_test_is_not_asked_for_a_new_test_on_develop(self):
+        code, out = check_runs('', HEAD, changed=['swag/migration/r2/rehearsal.py'])
+        self.assertIn('PR không thêm hay đổi file test nào', out)
+        self.assertNotIn('RUNS: FAIL   new-tests-on-develop', out)
+
+    def test_a_pr_that_touches_a_test_still_proves_it_fails_on_develop(self):
+        code, out = check_runs('', HEAD, changed=['swag/migration/r2/rehearsal.py', 'tests/test_rehearsal.py'])
+        self.assertEqual(code, 1, out)
+        self.assertIn('RUNS: FAIL   new-tests-on-develop', out)
+
 
 class ParallelNotes(unittest.TestCase):
     def test_forty_notes_at_once_all_succeed_and_all_land(self):

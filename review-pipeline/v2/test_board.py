@@ -1,4 +1,8 @@
+import contextlib
 import datetime
+import io
+import json
+import os
 import pathlib
 import sys
 import tempfile
@@ -195,6 +199,67 @@ class Acknowledged(unittest.TestCase):
                 mock.patch.object(review_board, 'ack') as ack, mock.patch.object(review_board, 'fetch', side_effect=AssertionError('fetch is for the board')):
             review_board.main()
         self.assertEqual((calls, ack.call_args.args[1:]), (['auth'], ('o/r', [5, 6], ME)))
+
+    def test_a_row_carries_the_head_it_was_judged_on(self):
+        self.assertEqual(board()['head'], HEAD)
+
+    def test_a_row_carries_the_time_of_the_newest_reply_after_my_review(self):
+        self.assertIsNone(board()['reply_at'])
+        row = board([review('APPROVED', HEAD, '2026-01-01T00:00:00Z')],
+                    inline=[comment('author', '2026-01-02T00:00:00Z'), comment('author', '2026-01-04T00:00:00Z')], conversation=[comment('author', '2026-01-03T00:00:00Z')])
+        self.assertEqual(row['reply_at'], '2026-01-04T00:00:00Z')
+
+    def run_main(self, extra, env, pulls=None, row=None, on_load=None):
+        calls = []
+        pulls = pulls if pulls is not None else [{'number': 5, 'user': {'login': 'a'}, 'requested_reviewers': [{'login': ME}]}]
+
+        def gh(_, *args):
+            calls.append(args[0])
+            # gh_list reads one JSON object per line, the way `gh api --jq '.[]'` prints them
+            endpoint = ' '.join(args)
+            if 'pulls?' in endpoint:
+                return ''.join(json.dumps(p) + '\n' for p in pulls)
+            if '/reviews' in endpoint:
+                # PR 2 was reviewed by me before, so it belongs on the board
+                return json.dumps(review('APPROVED', HEAD, '2026-01-01T00:00:00Z')) + '\n' if 'pulls/2/' in endpoint else ''
+            return 'token\n'
+
+        row = row or {'number': 5, 'bucket': 'stale', 'head': HEAD}
+        argv = ['review_board.py', '--repo', 'o/r', '--reviewer', ME, *extra]
+        out = io.StringIO()
+        with mock.patch.object(sys, 'argv', argv), mock.patch.dict(os.environ, env), mock.patch.object(review_board, 'gh', gh), \
+                mock.patch.object(review_board, 'load', side_effect=on_load) if on_load else mock.patch.object(review_board, 'load', return_value=row), \
+                contextlib.redirect_stdout(out):
+            review_board.main()
+        return calls, out.getvalue()
+
+    def test_json_prints_the_rows_and_nothing_else(self):
+        _, out = self.run_main(['--json'], {})
+        self.assertEqual(json.loads(out), [{'number': 5, 'bucket': 'stale', 'head': HEAD}])
+
+    def test_the_pr_list_comes_from_the_open_pulls_never_from_search(self):
+        """A read-only fine-grained token, which is the only read-only token for a private repo, is often refused by the search API."""
+        pulls = [
+            {'number': 1, 'user': {'login': 'Sotatek-A'}, 'requested_reviewers': [{'login': ME}]},
+            {'number': 2, 'user': {'login': 'Sotatek-B'}, 'requested_reviewers': []},
+            {'number': 3, 'user': {'login': 'human'}, 'requested_reviewers': [{'login': ME}]},
+        ]
+        seen = []
+        on_load = lambda env, repo, n, me, acks, reviews=None: seen.append(n) or {'number': n, 'bucket': 'done'}
+        calls, _ = self.run_main(['--json', '--author-pattern', '^Sotatek-'], {}, pulls=pulls, on_load=on_load)
+        self.assertNotIn('search', calls)
+        self.assertEqual(seen, [1, 2])
+
+    def test_json_exits_1_when_a_pr_could_not_be_read(self):
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as stop:
+            self.run_main(['--json'], {}, row={'number': 5, 'error': 'gh api: HTTP 404'})
+        self.assertEqual(stop.exception.code, 1)
+
+    def test_a_token_in_the_environment_is_used_without_asking_gh_for_one(self):
+        calls, _ = self.run_main(['--json'], {'GH_TOKEN': 'from-env'})
+        self.assertNotIn('auth', calls)
+        calls, _ = self.run_main(['--json'], {'GH_TOKEN': ''})
+        self.assertIn('auth', calls)
 
     def test_a_missing_ack_file_is_an_empty_board_memory(self):
         self.assertEqual(review_board.read_acks(pathlib.Path('/nonexistent/ack.json')), {})

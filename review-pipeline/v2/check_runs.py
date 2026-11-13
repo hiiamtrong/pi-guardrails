@@ -25,7 +25,10 @@ if '--head' in args:
 changed = None
 if '--changed' in args:
     at = args.index('--changed')
-    changed = open(args[at + 1]).read().split()
+    try:
+        changed = open(args[at + 1]).read().split()
+    except OSError as err:
+        sys.exit(f'check_runs: không đọc được danh sách file đã đổi ({err})')
     del args[at:at + 2]
 # A diff of documents only has no test to run; any other file in it keeps every check below.
 if changed and all(re.search(r'\.(md|rst|txt)$', f) for f in changed):
@@ -33,7 +36,11 @@ if changed and all(re.search(r'\.(md|rst|txt)$', f) for f in changed):
     sys.exit(0)
 blocks, text = [], ''
 for path in args:
-    t = open(path).read()
+    try:
+        t = open(path).read()
+    except OSError as err:
+        say('FAIL', path.split('/')[-1], f'không đọc được file log ({err})')
+        continue
     text += t
     for m in re.finditer(r'^== (.*?) ==\n(.*?)(?=^== |\Z)', t, re.S | re.M):
         blocks.append((f'{path.split("/")[-1]}:{t[:m.start()].count(chr(10)) + 1}', m.group(1), m.group(2)))
@@ -61,6 +68,14 @@ if head:
     mine = [b for b in blocks if head in b[1]]
 m = re.search(r'only on trial: (\d+)', scope)
 say('PASS' if m else 'FAIL', 'trial-vs-develop', f'only on trial = {m.group(1)}' if m else f'không có khối trial trên head {head} kèm dòng "only on trial: N"' if head else 'không có dòng "only on trial: N" (trial với develop)')
+# A PR that adds no test has no new test to fail on develop; asking for that block would fail every such PR.
+# Names only: a PR that just edits tests/conftest.py adds no test, so it has no "new test fails on develop" to show.
+TEST_FILE = re.compile(r'(^|/)test_[^/]*\.py$|_test\.py$|\.(test|spec)\.[jt]sx?$')
 dev = [b for b in mine if re.search(r'(?i)on develop|develop code', b[1]) and re.search(r'\b[1-9]\d* failed', b[2])]
-say('PASS' if dev else 'FAIL', 'new-tests-on-develop', f'{dev[0][0]}' if dev else f'không có khối "test mới chạy trên develop" có failed > 0{f" trên head {head}" if head else ""}')
+if changed is not None and not [f for f in changed if TEST_FILE.search(f)]:
+    say('PASS', 'new-tests-on-develop', 'PR không thêm hay đổi file test nào: không có test mới để chạy trên develop')
+elif dev:
+    say('PASS', 'new-tests-on-develop', f'{dev[0][0]}')
+else:
+    say('FAIL', 'new-tests-on-develop', f'không có khối "test mới chạy trên develop" có failed > 0{f" trên head {head}" if head else ""}')
 sys.exit(1 if fails else 0)

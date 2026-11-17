@@ -1152,7 +1152,7 @@ function shellPushes(command: string): boolean {
   return isGitPush(command) || inlineRuntimeCodes(command).some(isGitPushRuntimeCode);
 }
 
-function shellWritesGithub(command: string): boolean {
+export function shellWritesGithub(command: string): boolean {
   const inlineWrite = inlineRuntimeCodes(command).some(
     (code) => isGithubRuntimeCode(code) && !hasOnlyReadOnlyGithubRuntimeCommands(code),
   );

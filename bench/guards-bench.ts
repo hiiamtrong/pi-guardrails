@@ -306,7 +306,17 @@ const identity = (event: Event, cwd: string) => identityHandler(event, { cwd });
 state("identity: unguarded repo blocks git commit", () => identity(bashEvent("git commit -m x"), unguarded)?.block === true);
 state("identity: guarded repo allows git commit", () => identity(bashEvent("git commit -m x"), guarded) === undefined);
 state("identity: guarded repo allows git push", () => identity(bashEvent("git push origin main"), guarded) === undefined);
-state("identity: guarded + matching account allows gh write", () => identity(bashEvent("gh pr create -t x -b y"), guarded) === undefined);
+// The keyring's active account is shared by every process, so only a token bound by the pi environment (or pinned in the command) vouches for the write.
+const withGhToken = <T>(run: () => T): T => {
+  process.env.GH_TOKEN = "bench-token";
+  try {
+    return run();
+  } finally {
+    delete process.env.GH_TOKEN;
+  }
+};
+state("identity: guarded + matching account blocks an unpinned gh write", () => identity(bashEvent("gh pr create -t x -b y"), guarded)?.block === true);
+state("identity: guarded + matching account allows a gh write when GH_TOKEN is in the environment", () => withGhToken(() => identity(bashEvent("gh pr create -t x -b y"), guarded)) === undefined);
 state("identity: guarded + wrong gh account blocks gh write", () => identity(bashEvent("gh pr create -t x -b y"), mismatch)?.block === true);
 state("identity: wrong gh account does not block a plain commit", () => identity(bashEvent("git commit -m x"), mismatch) === undefined);
 state("identity: config without a runner blocks", () => identity(bashEvent("git commit -m x"), noRunner)?.block === true);

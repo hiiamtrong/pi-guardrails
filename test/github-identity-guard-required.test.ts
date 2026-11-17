@@ -83,6 +83,20 @@ test("blocks GitHub writes without Git Identity Guard", () => {
   rmSync(repo, { recursive: true, force: true });
 });
 
+function withEnv<T>(vars: Record<string, string | undefined>, run: () => T): T {
+  const saved = Object.fromEntries(Object.keys(vars).map((key) => [key, process.env[key]]));
+  const apply = (values: Record<string, string | undefined>) => {
+    for (const [key, value] of Object.entries(values))
+      value === undefined ? delete process.env[key] : (process.env[key] = value);
+  };
+  apply(vars);
+  try {
+    return run();
+  } finally {
+    apply(saved);
+  }
+}
+
 test("names the action when the authenticated GitHub account is wrong", () => {
   const repo = mkdtempSync(join(tmpdir(), "github-identity-action-"));
   execFileSync("git", ["init", repo], { stdio: "ignore" });
@@ -104,9 +118,11 @@ test("names the action when the authenticated GitHub account is wrong", () => {
   ]);
   execFileSync("git", ["-C", repo, "config", "identity.guard.runner", runner]);
 
-  const result = createHandler()(
-    { toolName: "bash", input: { command: "gh issue lock 123" } },
-    { cwd: repo },
+  const result = withEnv({ GH_TOKEN: "pi-env-token" }, () =>
+    createHandler()(
+      { toolName: "bash", input: { command: "gh issue lock 123" } },
+      { cwd: repo },
+    ),
   );
   assert.match(result?.reason ?? "", /Action: gh issue lock\./);
   assert.match(result?.reason ?? "", /authenticated gh account/);
@@ -357,4 +373,198 @@ test("gh commands are still judged by the session directory", () => {
 test("commands without a guarded git write are not affected by target resolution", () => {
   const plain = makeRepo({ guarded: false });
   assert.equal(verdict("cd $REPO && ls", plain), undefined);
+});
+
+// A repo whose runner models the shared keyring: `active` is the machine-wide gh account, and a token in GH_TOKEN overrides it.
+// With `flipAfterCheck`, another process switches the account right after verify-gh answered, which is the incident's race.
+function makeSharedAuthRepo(options: { flipAfterCheck: boolean; active?: string }) {
+  const repo = makeRepo({ guarded: false });
+  const active = join(repo, "active-account");
+  const tokens = join(repo, "tokens");
+  mkdirSync(tokens);
+  for (const user of ["expected-user", "other-user"]) writeFileSync(join(tokens, user), `tok-${user}`);
+  writeFileSync(active, options.active ?? "expected-user");
+  const gh = join(repo, "gh");
+  writeFileSync(
+    gh,
+    `#!/bin/sh\n[ "$1 $2" = "auth token" ] || exit 1\nwhile [ $# -gt 0 ]; do\n  [ "$1" = -u ] && { cat "${tokens}/$2"; exit; }\n  shift\ndone\nexit 1\n`,
+    { mode: 0o755 },
+  );
+  const runner = join(repo, "guard");
+  writeFileSync(
+    runner,
+    `#!/bin/sh
+case "$1" in
+  find-gh) echo "${gh}" ;;
+  verify-gh)
+    who="$(cat "${active}")"
+    token="\${GH_TOKEN:-$GITHUB_TOKEN}"
+    [ -n "$token" ] && who="\${token#tok-}"
+    ${options.flipAfterCheck ? `echo other-user > "${active}"` : ":"}
+    [ "$who" = expected-user ] ;;
+esac
+`,
+    { mode: 0o755 },
+  );
+  for (const [key, value] of [
+    ["identity.guard.user", "expected-user"],
+    ["identity.guard.email", "expected@example.com"],
+    ["identity.guard.runner", runner],
+  ])
+    execFileSync("git", ["-C", repo, "config", key, value]);
+  return { repo, tokens };
+}
+const NO_TOKEN_ENV = { GH_TOKEN: undefined, GITHUB_TOKEN: undefined };
+const PIN = (user: string) => `export GH_TOKEN="$(gh auth token -h github.com -u ${user})"`;
+const WRITE = "gh api repos/swaglive/swag-server/pulls/1/reviews -X POST --input payload.json";
+const TOOLS = ["bash", "ctx_batch_execute", "ctx_execute"];
+
+test("a gh write that pins its own token is not judged by the keyring's active account", () => {
+  const { repo } = makeSharedAuthRepo({ flipAfterCheck: false, active: "other-user" });
+  for (const toolName of TOOLS) {
+    for (const command of [
+      `${PIN("expected-user")}; ${WRITE}`,
+      `${PIN("Expected-User")} && ${WRITE}`,
+      `${PIN("expected-user")}\n${WRITE}`,
+      `export GH_TOKEN=$(gh auth token --user=expected-user); ${WRITE}`,
+    ])
+      assert.equal(withEnv(NO_TOKEN_ENV, () => verdict(command, repo, toolName)), undefined, `${toolName}: ${command}`);
+  }
+});
+
+test("a gh write is not approved when the keyring account can change between the check and the write", () => {
+  const { repo } = makeSharedAuthRepo({ flipAfterCheck: true });
+  for (const toolName of TOOLS) {
+    const result = withEnv(NO_TOKEN_ENV, () => verdict(WRITE, repo, toolName));
+    assert.equal(result?.block, true, toolName);
+    assert.match(result?.reason ?? "", /export GH_TOKEN="\$\(gh auth token -h github\.com -u expected-user\)"/);
+  }
+});
+
+test("a pinned write stays bound to its account even if the keyring flips right after the check", () => {
+  const { repo } = makeSharedAuthRepo({ flipAfterCheck: true });
+  assert.equal(withEnv(NO_TOKEN_ENV, () => verdict(`${PIN("expected-user")}; ${WRITE}`, repo)), undefined);
+});
+
+test("refuses a pin that names another account, a missing token, or a later change of the token", () => {
+  const { repo, tokens } = makeSharedAuthRepo({ flipAfterCheck: false });
+  const blocked = (command: string, reason: RegExp) => {
+    const result = withEnv(NO_TOKEN_ENV, () => verdict(command, repo));
+    assert.equal(result?.block, true, command);
+    assert.match(result?.reason ?? "", reason, command);
+  };
+  blocked(`${PIN("other-user")}; ${WRITE}`, /pins the gh token of 'other-user'/);
+  blocked(`${PIN("expected-user")}; export GH_TOKEN=tok-other-user; ${WRITE}`, /sets or unsets GH_TOKEN/);
+  blocked(`${PIN("expected-user")}; unset GH_TOKEN; ${WRITE}`, /sets or unsets GH_TOKEN/);
+  blocked(`GH_TOKEN=tok-other-user ${WRITE}`, /sets or unsets GH_TOKEN/);
+  blocked(`GH_TOKEN="$(gh auth token -u expected-user)"; ${WRITE}`, /sets or unsets GH_TOKEN/);
+  blocked(`export GH_TOKEN="$(gh auth token -u "$REVIEWER")"; ${WRITE}`, /sets or unsets GH_TOKEN/);
+  rmSync(join(tokens, "expected-user"));
+  blocked(`${PIN("expected-user")}; ${WRITE}`, /missing or does not authenticate/);
+});
+
+test("every gh write in a batch needs its own pin", () => {
+  const { repo } = makeSharedAuthRepo({ flipAfterCheck: false });
+  const pinned = `${PIN("expected-user")}; ${WRITE}`;
+  const run = (commands: string[]) =>
+    withEnv(NO_TOKEN_ENV, () =>
+      createHandler()(
+        { toolName: "ctx_batch_execute", input: { commands: commands.map((command) => ({ command })) } },
+        { cwd: repo },
+      ),
+    );
+  assert.equal(run([pinned, "ls"]), undefined);
+  assert.equal(run([pinned, pinned]), undefined);
+  assert.equal(run([pinned, WRITE])?.block, true);
+});
+
+test("a GH_TOKEN in the pi environment binds unpinned writes, and is verified", () => {
+  const { repo } = makeSharedAuthRepo({ flipAfterCheck: true });
+  assert.equal(withEnv({ GH_TOKEN: "tok-expected-user" }, () => verdict(WRITE, repo)), undefined);
+  assert.equal(withEnv({ GH_TOKEN: undefined, GITHUB_TOKEN: "tok-expected-user" }, () => verdict(WRITE, repo)), undefined);
+  const wrong = withEnv({ GH_TOKEN: "tok-other-user" }, () => verdict(WRITE, repo));
+  assert.match(wrong?.reason ?? "", /authenticated gh account does not match/);
+  const code = { toolName: "ctx_execute", input: { language: "javascript", code: "execFileSync('gh', ['pr', 'comment', '1', '-b', 'x'])" } };
+  assert.equal(withEnv(NO_TOKEN_ENV, () => createHandler()(code, { cwd: repo }))?.block, true);
+  assert.equal(withEnv({ GH_TOKEN: "tok-expected-user" }, () => createHandler()(code, { cwd: repo })), undefined);
+});
+
+test("a pin without -u cannot borrow an environment token to reach the keyring", () => {
+  const { repo } = makeSharedAuthRepo({ flipAfterCheck: true });
+  const result = withEnv({ GH_TOKEN: "tok-expected-user" }, () =>
+    verdict(`export GH_TOKEN="$(gh auth token)"; ${WRITE}`, repo),
+  );
+  assert.equal(result?.block, true);
+  assert.match(result?.reason ?? "", /sets or unsets GH_TOKEN/);
+});
+
+test("text after the pin is not read as a token change, but a header is", () => {
+  const { repo } = makeSharedAuthRepo({ flipAfterCheck: false, active: "other-user" });
+  for (const command of [
+    `${PIN("expected-user")} # pin the reviewer token\n${WRITE}`,
+    `${PIN("expected-user")}\n${WRITE}`,
+    `${PIN("expected-user")}; gh pr comment 1 --body "do not set GH_TOKEN=x"`,
+    `${PIN("expected-user")}; gh pr comment 1 --body "run env FOO=1 -u"`,
+  ])
+    assert.equal(withEnv(NO_TOKEN_ENV, () => verdict(command, repo)), undefined, command);
+  const header = withEnv(NO_TOKEN_ENV, () =>
+    verdict(`${PIN("expected-user")}; gh api -X POST repos/o/r/pulls/1/reviews -H "Authorization: token other"`, repo),
+  );
+  assert.equal(header?.block, true);
+  assert.match(header?.reason ?? "", /Authorization header/);
+});
+
+test("a token rebound inside a subshell or brace group is still caught", () => {
+  const { repo } = makeSharedAuthRepo({ flipAfterCheck: false });
+  for (const command of [
+    `${PIN("expected-user")}; (GH_TOKEN=<redacted:assignment> ${WRITE})`,
+    `${PIN("expected-user")}; { GH_TOKEN=<redacted:assignment> ${WRITE}; }`,
+  ]) {
+    const result = withEnv(NO_TOKEN_ENV, () => verdict(command, repo));
+    assert.equal(result?.block, true, command);
+    assert.match(result?.reason ?? "", /sets or unsets GH_TOKEN/, command);
+  }
+});
+
+test("a quoted or env-wrapped assignment still rebinds the token", () => {
+  const { repo } = makeSharedAuthRepo({ flipAfterCheck: false });
+  for (const command of [
+    `${PIN("expected-user")}; export "GH_TOKEN=<redacted:assignment>"; ${WRITE}`,
+    `${PIN("expected-user")}; export 'GH_TOKEN=<redacted:assignment>'; ${WRITE}`,
+    `${PIN("expected-user")}; env "GH_TOKEN=<redacted:assignment>" ${WRITE}`,
+    `${PIN("expected-user")}; unset "GH_TOKEN"; ${WRITE}`,
+    `${PIN("expected-user")}; export "GH_TOKEN"; ${WRITE}`,
+  ]) {
+    const result = withEnv(NO_TOKEN_ENV, () => verdict(command, repo));
+    assert.equal(result?.block, true, command);
+    assert.match(result?.reason ?? "", /sets or unsets GH_TOKEN/, command);
+  }
+});
+
+// Every field of ToolInput is `unknown`, so the harness can deliver no input, no key, an empty value, or null. None of these
+// runs a write, so the guard must stay silent instead of blocking on something it cannot parse.
+test("empty, missing, and null command, code, and commands never block", () => {
+  const plain = makeRepo({ guarded: false });
+  const silent = (event: unknown) =>
+    (createHandler() as unknown as (
+      event: unknown,
+      ctx: { cwd: string },
+    ) => { block: boolean; reason: string } | undefined)(event, { cwd: plain });
+  for (const event of [
+    { toolName: "bash" },
+    { toolName: "bash", input: {} },
+    { toolName: "bash", input: { command: "" } },
+    { toolName: "bash", input: { command: null } },
+    { toolName: "bash", input: { command: [] } },
+    { toolName: "ctx_execute", input: {} },
+    { toolName: "ctx_execute", input: { code: "" } },
+    { toolName: "ctx_execute", input: { language: "shell", code: "" } },
+    { toolName: "ctx_batch_execute", input: { commands: [] } },
+    { toolName: "ctx_batch_execute", input: { commands: [{}] } },
+    { toolName: "ctx_batch_execute", input: { commands: [{ command: "" }] } },
+    { toolName: "ctx_batch_execute", input: { commands: [null] } },
+    { toolName: "ctx_batch_execute", input: { commands: "gh issue lock 1" } },
+    { toolName: "", input: {} },
+  ])
+    assert.equal(silent(event), undefined, JSON.stringify(event));
 });

@@ -6,6 +6,8 @@ import test from "node:test";
 import ext from "../extensions/whoami.ts";
 import { encodeProjectPath } from "../packages/claude-memory/memory.ts";
 
+const shortKey = (path: string) => path.replace(/\.md$/, ".short.md");
+
 type Files = { default?: string; project?: string };
 type Opts = { sub?: string; encodedLength?: number; projectIsDir?: boolean };
 
@@ -64,6 +66,13 @@ test("no files: does not throw and names both paths", async () => {
   assert.deepEqual(r.details.files, []);
 });
 
+test("a default.md holding only whitespace is present, not Missing", async () => {
+  const r = await run({ default: "  \n\t\n" });
+  assert.deepEqual(r.details.files, [r.defaultPath]);
+  assert.ok(!r.text.includes(`Missing: ${r.defaultPath}`));
+  assert.ok(r.text.includes(`Missing: ${r.projectPath}`));
+});
+
 test("cwd inside a subdirectory resolves to the repo root's file", async () => {
   const r = await run({ project: "Client: SWAG" }, { sub: "src/deep" });
   assert.equal(r.details.projectRoot, r.repo);
@@ -105,26 +114,120 @@ async function withEnv(fn: (c: { repo: string; dir: string; before: any; init: a
   }
 }
 
+function start(before: any, cwd: string) {
+  const event = { systemPromptOptions: { sections: {} as Record<string, string> } };
+  return { forced: before(event, { cwd }), sections: event.systemPromptOptions.sections };
+}
+
 test("system prompt is untouched when the project has no whoami file", () =>
   withEnv(async ({ repo, before }) => {
-    assert.equal(before({ systemPrompt: "base" }, { cwd: repo }), undefined);
+    const { forced, sections } = start(before, repo);
+    assert.equal(forced, undefined);
+    assert.deepEqual(sections, {});
   }));
 
-test("system prompt gets the hint when only the project file exists", () =>
+test("the hint goes into a section when only the project file exists, and the file text stays out", () =>
   withEnv(async ({ repo, dir, before, keyFile }) => {
     mkdirSync(dir, { recursive: true });
     writeFileSync(join(dir, keyFile), "Client: SWAG");
-    const prompt = before({ systemPrompt: "base" }, { cwd: repo }).systemPrompt as string;
-    assert.ok(prompt.startsWith("base"));
-    assert.ok(prompt.includes("`whoami` tool"));
-    assert.ok(!prompt.includes("Client: SWAG"));
+    const { forced, sections } = start(before, repo);
+    assert.equal(forced, undefined);
+    assert.ok(sections.whoami.includes("`whoami` tool"));
+    assert.equal(sections.whoami_short, undefined);
+    assert.ok(!JSON.stringify(sections).includes("Client: SWAG"));
   }));
 
-test("system prompt gets the hint when only default.md exists", () =>
+test("the hint goes into a section when only default.md exists", () =>
   withEnv(async ({ repo, dir, before }) => {
     mkdirSync(dir, { recursive: true });
     writeFileSync(join(dir, "default.md"), "Theo");
-    assert.ok(before({}, { cwd: repo }).systemPrompt.includes("`whoami` tool"));
+    const { forced, sections } = start(before, repo);
+    assert.equal(forced, undefined);
+    assert.ok(sections.whoami.includes("`whoami` tool"));
+  }));
+
+test("the default short becomes the whoami_short section, never the full default.md", () =>
+  withEnv(async ({ repo, dir, before }) => {
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, "default.short.md"), "Short: SWAG backend");
+    writeFileSync(join(dir, "default.md"), "Long: FULL DETAILS");
+    const { forced, sections } = start(before, repo);
+    assert.equal(forced, undefined);
+    assert.equal(sections.whoami_short, "Short: SWAG backend");
+    assert.ok(!JSON.stringify(sections).includes("FULL DETAILS"));
+  }));
+
+test("an empty default.short.md is treated as absent", () =>
+  withEnv(async ({ repo, dir, before }) => {
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, "default.short.md"), "\n");
+    const { forced, sections } = start(before, repo);
+    assert.equal(forced, undefined);
+    assert.deepEqual(sections, {});
+  }));
+
+test("a short file holding only a BOM counts as absent", () =>
+  withEnv(async ({ repo, dir, before }) => {
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, "default.short.md"), "\uFEFF");
+    const { forced, sections } = start(before, repo);
+    assert.equal(forced, undefined);
+    assert.deepEqual(sections, {});
+  }));
+
+test("a short file with a BOM and CRLF line endings keeps its text and drops the BOM", () =>
+  withEnv(async ({ repo, dir, before }) => {
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, "default.short.md"), "\uFEFF# Me\r\n- reviewer\r\n");
+    const { sections } = start(before, repo);
+    assert.equal(sections.whoami_short, "# Me\r\n- reviewer");
+  }));
+
+test("invalid UTF-8 in a short file still gives a section instead of failing the run", () =>
+  withEnv(async ({ repo, dir, before }) => {
+    mkdirSync(dir, { recursive: true });
+    // 0x80 is a stray continuation byte, which is not valid UTF-8 on its own
+    writeFileSync(join(dir, "default.short.md"), Buffer.from([0x80, ...Buffer.from("NoFormatter")]));
+    const { sections } = start(before, repo);
+    assert.ok(sections.whoami_short.includes("NoFormatter"));
+  }));
+
+test("a short file that cannot be read is skipped instead of failing the run", () =>
+  withEnv(async ({ repo, dir, before }) => {
+    mkdirSync(dir, { recursive: true });
+    // a directory named like the summary file makes readFileSync throw EISDIR
+    mkdirSync(join(dir, "default.short.md"));
+    writeFileSync(join(dir, "default.md"), "Theo");
+    const { forced, sections } = start(before, repo);
+    assert.equal(forced, undefined);
+    assert.ok(sections.whoami.includes("`whoami` tool"));
+    assert.equal(sections.whoami_short, undefined);
+  }));
+
+test("the project short file lands after the default short in one section", () =>
+  withEnv(async ({ repo, dir, before, keyFile }) => {
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, "default.short.md"), "Short: me");
+    writeFileSync(join(dir, shortKey(keyFile)), "Project: review only");
+    const { sections } = start(before, repo);
+    assert.equal(sections.whoami_short, "Short: me\n\nProject: review only");
+  }));
+
+test("a project short file alone is enough to inject the section", () =>
+  withEnv(async ({ repo, dir, before, keyFile }) => {
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, shortKey(keyFile)), "Project: review only");
+    const { sections } = start(before, repo);
+    assert.equal(sections.whoami_short, "Project: review only");
+  }));
+
+test("another project's short file stays out", () =>
+  withEnv(async ({ repo, dir, before, keyFile }) => {
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, shortKey(keyFile)), "current only");
+    writeFileSync(join(dir, shortKey("-Users-someone-else-other-repo.md")), "other project");
+    const { sections } = start(before, repo);
+    assert.equal(sections.whoami_short, "current only");
   }));
 
 test("whoami-init creates both private templates, then leaves edited files alone", () =>
@@ -133,6 +236,7 @@ test("whoami-init creates both private templates, then leaves edited files alone
     const ctx = { cwd: repo, ui: { notify: (m: string) => messages.push(m) } };
     await init("", ctx);
     assert.ok(messages[0].includes(join(dir, "default.md")) && messages[0].includes(join(dir, keyFile)));
+    assert.ok(messages[0].includes(join(dir, "default.short.md")));
     assert.equal(statSync(join(dir, keyFile)).mode & 0o777, 0o600);
     writeFileSync(join(dir, keyFile), "Client: SWAG");
     await init("", ctx);

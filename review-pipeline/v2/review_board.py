@@ -65,7 +65,7 @@ def classify(pr, reviews, inline, conversation, commits, me, acked=None):
     newer = [x for x in others(reviews, inline, conversation, me) if stamp(x) > seen_until]
     row['bots'] = sum(author(x).get('type') == 'Bot' for x in newer)
     row['human'] = len(newer) - row['bots']
-    # The count falls back to 0 after an ack, so only the time tells auto_pick.py that a reply is a new one.
+    # The count falls back to 0 after an ack, so only the time tells whether a reply is a new one.
     row['reply_at'] = max((stamp(x) for x in newer if author(x).get('type') != 'Bot'), default=None)
     shas = [c['sha'] for c in commits]
     # None = the reviewed commit is gone from the branch (force-push or rebase).
@@ -204,7 +204,7 @@ def main():
     ap.add_argument('--reviewer')
     ap.add_argument('--author-pattern')
     ap.add_argument('--no-color', action='store_true')
-    ap.add_argument('--json', action='store_true', help='print the rows as JSON (for auto_pick.py) instead of the board')
+    ap.add_argument('--json', action='store_true', help='print the rows as JSON instead of the board')
     ap.add_argument('--ack', nargs='+', type=int, metavar='N', help='mark the replies on these PRs as read')
     args = ap.parse_args()
     env_file = pathlib.Path('reports/reviews/tools/.pipeline-env')
@@ -218,8 +218,8 @@ def main():
         env = {**os.environ, 'GH_TOKEN': os.environ.get('GH_TOKEN') or gh(os.environ, 'auth', 'token', '-h', 'github.com', '-u', me).strip()}
         if args.ack:
             return ack(env, repo, args.ack, me)
-        # One open-PR listing answers both questions. The search API used to answer them, but a fine-grained token, which is the only way to
-        # give the poller a read-only token on private repos, is often refused there (403), and every row is fetched anyway.
+        # One open-PR listing answers both questions. The search API used to answer them, but a fine-grained token, which is the only read-only
+        # token for a private repo, is often refused there (403), and every row is fetched anyway.
         found = {}
         for item in gh_list(env, f'repos/{repo}/pulls?state=open&per_page=100'):
             requested = {u['login'] for u in item['requested_reviewers']}

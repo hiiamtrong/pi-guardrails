@@ -1,6 +1,9 @@
 # Post guard template. Instantiate by replacing __REPO__ (owner/name) __REVIEWER__ (GitHub login) __PR__ __DRAFT__ __DEV10__ __EVENT__ __FILES__ __DESC_SHA16__ and copy to /tmp/rv/post/<draft>-guard.sh.
 # __DESC_SHA16__ is `shasum -a 256 <description file> | cut -c1-16` of `gh api repos/<repo>/pulls/<N> --jq .body` (raw bytes: a description written on the web has CRLF line ends).
 # Needs <POST_DIR>/<draft>.review.json, .approved.sha256 and .seen written by `seen_from_table.py <draft>.md` (never `comments_seen.sh --ids`).
+# The POST below is a separate command that runs AFTER this script finishes, so the export here does not reach it: start that command with
+#   export GH_TOKEN="$(gh auth token -h github.com -u __REVIEWER__)"; gh api ... -X POST --input <payload>
+# or pi's identity guard blocks it (a gh write must pin its own token; the keyring's active account is shared with other sessions).
 # Stop cases to run before use: unseen comment, bot-only unseen comment, wrong event, description changed, other token, payload not the pin, the base branch on the watchlist, file list changed, API error, head moved.
 set -u
 POST_DIR=${POST_DIR:-/tmp/rv/post}; OUT=${OUT:-$POST_DIR}

@@ -442,6 +442,7 @@ export function kickoff(repo: string, reviewer: string, rules: string[], pr: str
     `Bước 06 và mọi lệnh gh trong pipeline đọc repo ${repo} qua biến REPO; khi cụ thể hoá post_guard.template.sh thì điền __REPO__ = ${repo} và __REVIEWER__ = ${reviewer}. Thư mục rule, ưu tiên từ trên xuống (file nào có ở cả hai thì lấy bản trên): ${rules.join(", ")}.`,
     ...resumeLines,
     "Làm lần lượt các bước 00 intake, 01 comments, 02 map, 03 verify, 04 outside-diff, 05 draft, 06 post, 07 after.",
+    `- Lệnh POST ở bước 06 là lệnh riêng, chạy sau post_guard.template.sh, nên phải tự mở đầu bằng \`export GH_TOKEN="$(gh auth token -h github.com -u ${reviewer})";\`: guard của pi chặn mọi lệnh gh ghi không pin token theo account (tài khoản active của keyring dùng chung với phiên khác), và export trong template không mang sang lệnh sau.` ,
     `- Mọi lần gọi review_step phải kèm pr=${pr}: phiên này có thể đang chạy review PR khác song song.`,
     `- Trước mỗi bước gọi review_step action=start step=<NN> pr=${pr}: tool trả hướng dẫn của bước đó, đọc kỹ rồi làm đúng.`,
     "- Khi chuyển sang việc khác trong bước, gọi review_step action=note với một dòng ngắn để UI hiện bạn đang làm gì.",

@@ -1,4 +1,4 @@
-# One unattended review. poll.sh and rvctl.sh fill the __NAME__ placeholders with sed and create it in the review-agent namespace.
+# One unattended review. rvctl.sh fills the __NAME__ placeholders with sed and creates it in the review-agent namespace.
 # Only this project's GitHub token is mapped in, so the agent never holds another account's token.
 apiVersion: batch/v1
 kind: Job

@@ -195,7 +195,7 @@ case "${1:-}" in
     echo "fetch: bản nháp và evidence của #$PR đã vào $dir/reports/reviews"
     ;;
   status)
-    kc get cronjobs,jobs -o wide
+    kc get jobs -o wide
     ;;
   *)
     echo "usage: rvctl.sh sync | secrets | memory-diff | review <project> <PR> [model] | fetch <project> <PR> [--force] | draft <url> | ask <url> <question> | post <url> --yes | status" >&2; exit 2 ;;

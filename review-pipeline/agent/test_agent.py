@@ -122,38 +122,6 @@ done
         (self.root / 'review').mkdir(exist_ok=True)
         return home
 
-    def test_poll_uses_the_readable_rows_and_forgets_a_job_it_could_not_create(self):
-        home = self.fixture()
-        state = home / '.pi/agent/review-pipeline/state'
-        state.mkdir()
-        (state / 'p.json').write_text('{}')
-        rows = [{'number': n, 'bucket': 'unreviewed', 'head': str(n), 'at': None, 'reply_at': None, 'draft': False} for n in (7, 8)]
-        (self.root / 'board.json').write_text(json.dumps(rows))
-        bin_ = self.root / 'bin'
-        bin_.mkdir()
-        (bin_ / 'python3.12').write_text(f'''#!/bin/bash
-if [[ "$*" == *review_board.py* ]]; then cat {self.root}/board.json; exit 1; fi
-exec {shutil.which('python3.12')} "$@"
-''')
-        (bin_ / 'kubectl').write_text(f'''#!/bin/bash
-cat >> {self.root}/jobs.yaml
-grep -q 'rv/pr: "8"' {self.root}/jobs.yaml && exit 1
-exit 0
-''')
-        for f in bin_.iterdir():
-            f.chmod(0o755)
-        result = run(['bash', str(HERE / 'poll.sh'), 'p'], env={
-            'PATH': f'{bin_}:{os.environ["PATH"]}', 'HOME': str(home), 'PROJECTS': str(home / '.pi/agent/review-pipeline/agent-projects.json'),
-            'ENGINE': str(HERE.parent), 'GH_TOKEN_THEO': 'token', 'SETTLE': '0', 'JOB_TEMPLATE': str(HERE / 'job.yaml'),
-        })
-        self.assertEqual(result.returncode, 1, result.stderr)
-        jobs = (self.root / 'jobs.yaml').read_text()
-        self.assertIn('rv/pr: "7"', jobs)
-        self.assertIn('rv/pr: "8"', jobs)
-        saved = json.loads((state / 'p.json').read_text())
-        self.assertIn('7', saved)
-        self.assertNotIn('8', saved)
-
     def fake_ssh(self, pod_home=None, jobs=(), pod_dir=None, local_dir=None):
         """Plays the node for one `ssh root@node <cmd>` call: kubectl runs the pod's side locally, with the pod's HOME and copy of the checkout."""
         bin_ = self.root / 'ssh-bin'

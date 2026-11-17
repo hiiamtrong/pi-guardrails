@@ -8,7 +8,7 @@ type ExtensionContext = { cwd: string; ui?: { notify?: (message: string, level?:
 type ExtensionApi = {
   on: (
     event: "before_agent_start",
-    handler: (event: { systemPrompt?: string }, ctx: ExtensionContext) => { systemPrompt: string } | undefined,
+    handler: (event: { systemPromptOptions: { sections: Record<string, string> } }, ctx: ExtensionContext) => void,
   ) => void;
   registerCommand: (
     name: string,
@@ -44,12 +44,11 @@ const PROJECT_TEMPLATE = `# This project
 - Conventions:
 `;
 
-// Say when to call the tool, not what it holds: the files can be long and change often.
-const HINT = `<whoami>
-The user's role, client, team and conventions for this project are kept in files you cannot see until you call the \`whoami\` tool.
+// Say when to call the tool, not what the full files hold: they can be long and change often.
+// The section key renders the wrapper, so this text carries no tags.
+const HINT = `The user's role, client, team and conventions are kept in full in files you cannot see until you call the \`whoami\` tool. A <whoami_short> block, when present, is only a summary.
 Call it before: writing a message, review, reply or report on the user's behalf; choosing a language, tone or format that depends on who the client is; or when the user asks who they are or what this project is.
-Skip it for tasks that do not depend on the user's role or client.
-</whoami>`;
+Skip it for tasks that do not depend on the user's role or client.`;
 
 function readOptional(path: string): string | undefined {
   try {
@@ -58,6 +57,16 @@ function readOptional(path: string): string | undefined {
     // Only an absent file is "Missing"; a permission error or a directory must not look like a file to create.
     if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
     throw error;
+  }
+}
+
+// A summary file is optional, so a directory or an unreadable file is skipped here.
+// Losing the hint for a whole run would be worse than losing the summary.
+function readShort(path: string): string | undefined {
+  try {
+    return readOptional(path);
+  } catch {
+    return undefined;
   }
 }
 
@@ -97,8 +106,13 @@ function createIfAbsent(path: string, template: string): boolean {
 
 export default function (pi: ExtensionApi): void {
   pi.on("before_agent_start", (event, ctx) => {
-    if (!whoamiPaths(ctx.cwd).paths.some(existsSync)) return undefined;
-    return { systemPrompt: `${event.systemPrompt ?? ""}\n\n${HINT}` };
+    const { paths } = whoamiPaths(ctx.cwd);
+    const present = paths.map((path) => readShort(path.replace(/\.md$/, ".short.md"))).filter((text): text is string => Boolean(text));
+    if (!present.length && !paths.some(existsSync)) return;
+    // Sections, not a returned systemPrompt: returning one sets forceSystemPrompt, which drops every
+    // section an extension loaded later adds (claude-memory writes sections.auto_memory).
+    event.systemPromptOptions.sections.whoami = HINT;
+    if (present.length) event.systemPromptOptions.sections.whoami_short = present.join("\n\n");
   });
 
   pi.registerCommand("whoami-init", {
@@ -111,7 +125,7 @@ export default function (pi: ExtensionApi): void {
       const message = created.length
         ? `Created, now fill them in:\n${created.join("\n")}`
         : `Nothing to create, both files exist:\n${paths.join("\n")}`;
-      ctx.ui?.notify?.(message, "info");
+      ctx.ui?.notify?.(`${message}\nOptional always-on summary: ${join(dir, "default.short.md")}`, "info");
     },
   });
 

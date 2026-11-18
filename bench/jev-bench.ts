@@ -38,7 +38,7 @@ globalThis.fetch = (async (url: string, init: RequestInit) => {
   }
 }) as typeof fetch;
 
-async function tracked<T>(run: () => Promise<T>) {
+async function tracked<T>(run: () => T) {
   const from = calls.length;
   const result = await run();
   return { result, made: calls.slice(from) };
@@ -68,14 +68,14 @@ async function benchCommentGuard() {
   writeFileSync(reviewer, "#!/bin/sh\necho DEFER\n");
   chmodSync(reviewer, 0o755);
   process.env.PI_COMMENT_REVIEWER_EXECUTABLE = reviewer;
-  let handler: Handler = () => undefined;
-  commentGuard({ on: (_event: string, h: Handler) => (handler = h) } as never);
+  const handlers: Record<string, Handler> = {};
+  commentGuard({ on: (event: string, h: Handler) => (handlers[event] = h) } as never);
 
   const from = calls.length;
-  const rows = [];
+  const rows: any[] = [];
   for (const c of cases) {
     const { result, made } = await tracked(() =>
-      handler({ toolName: "write", input: { path: c.path, content: text(c.change) } }, { cwd: here }),
+      handlers.tool_call({ toolName: "write", input: { path: c.path, content: text(c.change) } }, { cwd: here }),
     );
     const got =
       made.length === 0 ? "NO_REVIEW"
@@ -136,7 +136,7 @@ async function benchPonytail() {
   ponytailReview({ on: (event: string, h: Handler) => (handlers[event] = h), sendUserMessage: () => sent++ } as never);
 
   const from = calls.length;
-  const rows = [];
+  const rows: any[] = [];
   for (const c of cases) {
     for (const edit of c.edits)
       handlers.tool_call(
@@ -330,7 +330,7 @@ async function benchSecretGuard() {
   const handlers: Record<string, Handler> = {};
   secretGuard({ on: (event: string, h: Handler) => (handlers[event] = h) } as never);
   const from = calls.length;
-  const rows = [];
+  const rows: any[] = [];
   for (const c of cases) {
     const { result, made } = await tracked(() =>
       handlers.input({ text: c.text, source: "interactive" }, { ui: { notify: () => undefined } }),

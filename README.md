@@ -3,7 +3,7 @@
 A Pi package with twelve workflow and security extensions:
 
 - **`comment-guard`** reviews new code comments, suppressions, and Python future annotations before they are written.
-- **`ponytail-review-on-settle`** runs `/skill:ponytail-review` after a turn that edited code, unless the edits were trivial.
+- **`ponytail-review-on-settle`** runs `/skill:ponytail-review` after a turn that edited code in a git working tree, unless the edits were trivial or landed in scratch/report directories.
 - **`test-gaps-on-settle`** asks the agent to cover missing happy-path and abnormal cases after it writes or edits a test file.
 - **`github-write-confirm`** permits GitHub reads and requires confirmation for GitHub remote writes.
 - **`github-identity-guard-required`** blocks agent-initiated Git/GitHub writes until Git Identity Guard is installed in the current repository.
@@ -116,7 +116,7 @@ When a TypeSafe key is configured (see [Jev decisions](#jev-decisions)), Jev sco
 
 ## Ponytail review on settle
 
-`ponytail-review-on-settle` sends `/skill:ponytail-review` once a turn settles after editing code files. With Jev configured, it first sends each edit's `before`/`after` text and skips the review when Jev is at least 0.8 confident the edits only change wording, names, formatting, or literal values without adding or changing any logic, condition, operator, or control flow, and without flipping a boolean or default flag or lowering a security setting (hash cost, key size, token expiry, permission). Jev failures and changes over 60,000 characters always get reviewed.
+`ponytail-review-on-settle` sends `/skill:ponytail-review` once a turn settles after editing code files. Only code edits inside a git working tree count, and any repository counts, so work done in a second checkout or another repo is still reviewed while probe scripts in `reports/reviews/`, `evidence/`, `/tmp`, `node_modules`, `vendor`, and directories outside version control are not. The home directory is never treated as a repository, even when it is a dotfiles repo, so scratch files directly under it are not reviewed. The exception is the Pi agent directory (`~/.pi/agent`, or `PI_CODING_AGENT_DIR` when set), which is not a repository of its own but holds extensions that are edited by hand, so code there is reviewed. The review reply ends with a short recap of the answer given before it, so the answer is readable without scrolling up. With Jev configured, it first sends each edit's `before`/`after` text and skips the review when Jev is at least 0.8 confident the edits only change wording, names, formatting, or literal values without adding or changing any logic, condition, operator, or control flow, and without flipping a boolean or default flag or lowering a security setting (hash cost, key size, token expiry, permission). Jev failures and changes over 60,000 characters always get reviewed.
 
 ## Test gaps on settle
 

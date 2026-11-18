@@ -89,7 +89,8 @@ test("ponytail tracks an edit whose edits arrive as a JSON string", async () => 
     });
     handlers.tool_call({ toolName: "edit", input: { path: "src/a.ts", edits: JSON.stringify([{ oldText: "if (a) go();", newText: "if (a || b) go();" }]) } });
     await handlers.agent_settled({ aborted: false });
-    assert.deepEqual(sent, ["/skill:ponytail-review"]);
+    assert.match(sent[0], /^\/skill:ponytail-review /);
+    assert.equal(sent.length, 1);
 });
 
 function ponytailWith(trivial: number) {
@@ -126,7 +127,8 @@ test("null, empty and odd edit entries are ignored instead of throwing", async (
     const { run, handlers } = ponytailWith(0.1);
     handlers.tool_call({ toolName: "edit", input: { path: "src/a.ts", edits: [null, { oldText: "if (a) go();", newText: "if (a || b) go();" }] } });
     await handlers.agent_settled({ aborted: false });
-    assert.deepEqual(run.sent, ["/skill:ponytail-review"]);
+    assert.match(run.sent[0], /^\/skill:ponytail-review /);
+    assert.equal(run.sent.length, 1);
 });
 
 test("a file of exactly 1,000,000 bytes is compared, one byte more is not", () => {

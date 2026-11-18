@@ -1,10 +1,14 @@
+import { existsSync } from "node:fs";
+import { homedir } from "node:os";
+import { dirname, resolve } from "node:path";
+import { agentRoot } from "../packages/claude-memory/memory.ts";
 import { editsOf } from "./edits.ts";
 import { askNoul, MAX_STATE_CHARS } from "./jev.ts";
 
 type ExtensionAPI = {
   on: (
     event: "tool_call" | "agent_settled",
-    handler: (event: unknown, ctx: unknown) => unknown,
+    handler: (event: unknown, ctx?: unknown) => unknown,
   ) => void;
   sendUserMessage: (
     text: string,
@@ -20,13 +24,46 @@ type Edit = { path: string; before?: string; after: string };
 
 const CODE_FILE =
   /\.(?:c|cc|cpp|cs|cxx|go|h|hpp|hxx|java|js|jsx|mjs|php|py|rb|rs|sh|sql|swift|ts|tsx)$/i;
+// Probe scripts and dependency trees are not the change under review: the review
+// pipeline writes its probes into reports/reviews and /tmp.
+const SCRATCH_DIR =
+  /(?:^|\/)(?:node_modules|\.git|backups|coverage|evidence|reports\/reviews|tmp|vendor)\//;
+const RECAP =
+  "End your reply with a two or three line recap of the answer you gave before this review, so the user does not have to scroll up to read it again.";
 const TRIVIAL =
   "Each edit in `edits` only changes wording, names, formatting, or literal values between `before` and `after`, without adding or changing any logic, condition, operator, or control flow, and without flipping a boolean or default flag or lowering a security setting such as a hash cost, key size, token expiry, or permission";
 
-export function isReviewableEdit(event: ToolCallEvent): string | undefined {
+// Not `cwd`: a session opened in one repo still edits code in another checkout, and
+// that work needs the same review. The home directory is skipped because it can be a
+// dotfiles repo, which would make every scratch file under it look tracked.
+function insideGitTree(path: string): boolean {
+  for (let dir = dirname(path); ; dir = dirname(dir)) {
+    if (dir !== homedir() && existsSync(`${dir}/.git`)) return true;
+    if (dirname(dir) === dir) return false;
+  }
+}
+
+// The pi config holds extensions the user maintains, but it is not a repository of
+// its own and sits under the home directory that insideGitTree skips.
+function insidePiAgent(path: string): boolean {
+  return path.startsWith(`${agentRoot()}/`);
+}
+
+export function isReviewTarget(path: string, cwd: string): boolean {
+  const absolute = resolve(cwd, path);
+  return !SCRATCH_DIR.test(absolute) && (insidePiAgent(absolute) || insideGitTree(absolute));
+}
+
+// `cwd` resolves relative paths and is left out by callers that only know the
+// extension (benchmarks, tests), which keeps them on the extension-only check.
+export function isReviewableEdit(
+  event: ToolCallEvent,
+  cwd?: string,
+): string | undefined {
   if (event.toolName !== "write" && event.toolName !== "edit") return undefined;
   const path = event.input?.path;
   if (typeof path !== "string" || !CODE_FILE.test(path)) return undefined;
+  if (cwd && !isReviewTarget(path, cwd)) return undefined;
   return path;
 }
 
@@ -53,8 +90,11 @@ export async function isTrivial(edits: Edit[]): Promise<boolean> {
 export default function (pi: ExtensionAPI): void {
   const edits: Edit[] = [];
 
-  pi.on("tool_call", (event) => {
-    const path = isReviewableEdit(event as ToolCallEvent);
+  pi.on("tool_call", (event, ctx) => {
+    const path = isReviewableEdit(
+      event as ToolCallEvent,
+      (ctx as { cwd?: string } | undefined)?.cwd,
+    );
     if (path) edits.push(...toEdits(path, event as ToolCallEvent));
   });
 
@@ -65,7 +105,7 @@ export default function (pi: ExtensionAPI): void {
     if ((event as { aborted: boolean }).aborted || edits.length === 0) return;
     // The Jev call can outlast idle time, so a new user turn may already be streaming.
     if (!(await isTrivial(edits.splice(0))))
-      pi.sendUserMessage("/skill:ponytail-review", {
+      pi.sendUserMessage(`/skill:ponytail-review ${RECAP}`, {
         deliverAs: "followUp",
         expandPromptTemplates: true,
       });
